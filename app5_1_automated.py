@@ -937,6 +937,7 @@ def list_assignments(token: str, course_id: str):
 
 
 def list_turned_in_submissions(token: str, course_id: str, coursework_id: str):
+    # Classroom API v1 requires the "states" query parameter here.
     return classroom_list_all(
         token,
         f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
