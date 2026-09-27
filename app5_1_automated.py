@@ -866,6 +866,15 @@ def classroom_headers(token: str) -> dict:
 
 def classroom_request(method: str, url: str, token: str, **kwargs):
     """Call a Google API endpoint with a clear error message."""
+    # Compatibility guard: older callers may still use the legacy filter name.
+    # Google Classroom API v1 expects "states" for studentSubmissions.
+    params = kwargs.get("params")
+    if isinstance(params, dict) and "studentSubmissionStates" in params:
+        params = dict(params)
+        legacy_states = params.pop("studentSubmissionStates")
+        params.setdefault("states", legacy_states)
+        kwargs["params"] = params
+
     headers = kwargs.pop("headers", {})
     merged = classroom_headers(token)
     merged.update(headers)
