@@ -677,6 +677,18 @@ def get_classroom_oauth_config():
         return None
 
 
+def classroom_auth_status():
+    """Return OAuth configuration status and actionable setup problems."""
+    config = get_classroom_oauth_config()
+    if config:
+        return True, []
+    return False, [
+        "Check [auth.google] client_id and client_secret in Streamlit Secrets.",
+        "Check [auth] redirect_uri and cookie_secret in Streamlit Secrets.",
+        "Register the app root URL as an authorized redirect URI in Google Cloud.",
+    ]
+
+
 def classroom_auth_configured() -> bool:
     """Return True when credentials for the dedicated Google API OAuth flow exist."""
     return get_classroom_oauth_config() is not None
