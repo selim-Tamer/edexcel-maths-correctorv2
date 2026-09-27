@@ -1,0 +1,16 @@
+# Secrets and local credentials
+.env
+.streamlit/secrets.toml
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
