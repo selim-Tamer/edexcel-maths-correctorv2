@@ -2,8 +2,12 @@ import json
 import os
 import re
 import io
+import hmac
+import hashlib
+import secrets
 import tempfile
 import time
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -150,7 +154,12 @@ def upload_pdf(client, uploaded_file):
     try:
         remote_file = client.files.upload(file=tmp_path)
 
+        processing_deadline = time.monotonic() + 120
         while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() >= processing_deadline:
+                raise TimeoutError(
+                    f"Gemini file processing timed out for {uploaded_file.name}."
+                )
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
@@ -640,92 +649,200 @@ CLASSROOM_SCOPES = [
 ]
 
 
-def classroom_auth_status():
-    """
-    Check the secrets.toml settings needed for Google Classroom access.
-
-    Returns (configured, problems). `configured` is True only when login
-    AND the access token needed to actually call the Classroom/Drive APIs
-    are both set up correctly. `problems` lists everything missing or
-    misconfigured, so the UI can show something more useful than a plain
-    "not configured" message.
-    """
-    problems = []
-
+def get_classroom_oauth_config():
+    """Read the Google OAuth client settings from Streamlit secrets."""
     try:
-        auth = st.secrets.get("auth")
+        auth = st.secrets.get("auth", {})
+        google_auth = auth.get("google", {})
+        client_id = str(google_auth.get("client_id", "")).strip()
+        client_secret = str(google_auth.get("client_secret", "")).strip()
+        configured_redirect = str(auth.get("redirect_uri", "")).strip()
+        cookie_secret = str(auth.get("cookie_secret", "")).strip()
+        if not (client_id and client_secret and configured_redirect and cookie_secret):
+            return None
+
+        # Streamlit's /oauth2callback endpoint belongs to st.login(). This
+        # integration uses Google's OAuth authorization-code flow instead,
+        # returning to the app root with ?code=...&state=....
+        parts = urlsplit(configured_redirect)
+        redirect_uri = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        if not redirect_uri:
+            return None
+        return {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        }
     except Exception:
-        return False, ["Could not read st.secrets['auth']."]
-
-    if not auth:
-        return False, ["No [auth] section found in secrets.toml."]
-
-    # We call st.login("google"), so provider-specific settings live
-    # under [auth.google]. Shared settings live under [auth].
-    google_auth = auth.get("google")
-    if not google_auth:
-        problems.append("No [auth.google] section found in secrets.toml.")
-    else:
-        for key in ("client_id", "client_secret", "server_metadata_url"):
-            if not google_auth.get(key):
-                problems.append(f"[auth.google] is missing '{key}'.")
-
-        client_kwargs = google_auth.get("client_kwargs") or {}
-        try:
-            scope = str(client_kwargs.get("scope", ""))
-        except AttributeError:
-            scope = ""
-
-        for required_scope in (
-            "classroom.courses.readonly",
-            "classroom.coursework.students",
-            "drive.readonly",
-        ):
-            if required_scope not in scope:
-                problems.append(
-                    f"[auth.google].client_kwargs.scope is missing the "
-                    f"'{required_scope}' scope, so Classroom/Drive calls will fail "
-                    f"even after logging in successfully."
-                )
-
-    if not auth.get("redirect_uri"):
-        problems.append("[auth] is missing 'redirect_uri'.")
-
-    if not auth.get("cookie_secret"):
-        problems.append("[auth] is missing 'cookie_secret'.")
-
-    expose_tokens = auth.get("expose_tokens")
-    if not expose_tokens or "access" not in list(expose_tokens):
-        problems.append(
-            "[auth] is missing 'expose_tokens = [\"access\"]'. Without this, "
-            "st.user.tokens['access'] is always empty — login will appear to "
-            "succeed but every Classroom/Drive call will fail with "
-            "'no API access token is available'."
-        )
-
-    return (len(problems) == 0), problems
+        return None
 
 
 def classroom_auth_configured() -> bool:
-    """Return True when Streamlit Google OAuth is fully configured for Classroom."""
-    configured, _ = classroom_auth_status()
-    return configured
+    """Return True when credentials for the dedicated Google API OAuth flow exist."""
+    return get_classroom_oauth_config() is not None
 
 
 def google_logged_in() -> bool:
-    """Safely check Streamlit's Google OIDC session."""
+    """Whether this browser session has an authorized Classroom API token."""
+    return bool(st.session_state.get("classroom_access_token"))
+
+
+def build_classroom_authorization_url() -> str:
+    """Build the real Google OAuth authorization URL for Classroom/Drive APIs."""
+    config = get_classroom_oauth_config()
+    if not config:
+        raise RuntimeError("Google OAuth client settings are missing from Streamlit Secrets.")
+    # Sign state so validation still works after Google's full-page redirect,
+    # even if Streamlit creates a fresh websocket session on return.
+    state_payload = f"{int(time.time())}.{secrets.token_urlsafe(24)}"
+    state_signature = hmac.new(
+        str(st.secrets["auth"]["cookie_secret"]).encode("utf-8"),
+        state_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    state = f"{state_payload}.{state_signature}"
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "scope": " ".join(CLASSROOM_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def finish_classroom_oauth_callback() -> None:
+    """Exchange Google's authorization code, validating OAuth state first."""
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    oauth_error = st.query_params.get("error")
+    if oauth_error:
+        st.session_state["classroom_oauth_error"] = str(oauth_error)
+        st.query_params.clear()
+        return
+    if not code:
+        return
+
+    config = get_classroom_oauth_config()
     try:
-        return bool(st.user.is_logged_in)
+        state_parts = str(returned_state or "").split(".")
+        if len(state_parts) != 3:
+            raise ValueError("invalid state")
+        state_payload = ".".join(state_parts[:2])
+        timestamp = int(state_parts[0])
+        expected_signature = hmac.new(
+            str(st.secrets["auth"]["cookie_secret"]).encode("utf-8"),
+            state_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        state_is_valid = (
+            abs(time.time() - timestamp) <= 600
+            and hmac.compare_digest(expected_signature, state_parts[2])
+        )
     except Exception:
-        return False
+        state_is_valid = False
+    if not state_is_valid:
+        st.session_state["classroom_oauth_error"] = (
+            "Google sign-in state validation failed or expired. Please connect again."
+        )
+        st.query_params.clear()
+        return
+
+    config = get_classroom_oauth_config()
+    if not config:
+        st.session_state["classroom_oauth_error"] = "Google OAuth settings are missing."
+        st.query_params.clear()
+        return
+
+    try:
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": str(code),
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "redirect_uri": config["redirect_uri"],
+                "grant_type": "authorization_code",
+            },
+            timeout=30,
+        )
+        payload = response.json()
+        if response.status_code >= 400 or not payload.get("access_token"):
+            # Keep the error safe: never display tokens or client secrets.
+            st.session_state["classroom_oauth_error"] = (
+                "Google token exchange failed. Check the OAuth client and the "
+                "authorized redirect URI in Google Cloud. "
+                f"Details: {payload.get('error_description', payload.get('error', 'unknown error'))}"
+            )
+        else:
+            st.session_state["classroom_access_token"] = payload["access_token"]
+            st.session_state["classroom_token_expiry"] = time.time() + int(
+                payload.get("expires_in", 3600)
+            ) - 60
+            if payload.get("refresh_token"):
+                st.session_state["classroom_refresh_token"] = payload["refresh_token"]
+            st.session_state.pop("classroom_oauth_error", None)
+    except requests.RequestException:
+        st.session_state["classroom_oauth_error"] = (
+            "Could not contact Google's OAuth service. Please try again."
+        )
+    finally:
+        st.query_params.clear()
 
 
 def get_google_access_token() -> str:
-    """Return the OAuth access token exposed by Streamlit, never display it."""
-    try:
-        return str(st.user.tokens["access"])
-    except Exception:
+    """Return a valid Google API access token, refreshing it when possible."""
+    token = str(st.session_state.get("classroom_access_token", ""))
+    expiry = float(st.session_state.get("classroom_token_expiry", 0) or 0)
+    if token and time.time() < expiry:
+        return token
+
+    refresh_token = str(st.session_state.get("classroom_refresh_token", ""))
+    config = get_classroom_oauth_config()
+    if not refresh_token or not config:
         return ""
+
+    try:
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        payload = response.json()
+        if response.status_code >= 400 or not payload.get("access_token"):
+            st.session_state.pop("classroom_access_token", None)
+            return ""
+        token = payload["access_token"]
+        st.session_state["classroom_access_token"] = token
+        st.session_state["classroom_token_expiry"] = time.time() + int(
+            payload.get("expires_in", 3600)
+        ) - 60
+        return token
+    except requests.RequestException:
+        return ""
+
+
+def clear_classroom_auth() -> None:
+    """Remove Google API credentials from the current browser session."""
+    for key in (
+        "classroom_access_token", "classroom_refresh_token", "classroom_token_expiry",
+        "classroom_oauth_error",
+    ):
+        st.session_state.pop(key, None)
+
+
+
+
+# Handle a Google OAuth callback before drawing the page.
+finish_classroom_oauth_callback()
 
 
 def classroom_headers(token: str) -> dict:
@@ -761,31 +878,46 @@ def classroom_request(method: str, url: str, token: str, **kwargs):
     return response.json()
 
 
+def classroom_list_all(token: str, url: str, params: dict, response_key: str):
+    """Fetch every page of a Classroom list endpoint."""
+    items = []
+    page_token = None
+
+    while True:
+        page_params = dict(params)
+        if page_token:
+            page_params["pageToken"] = page_token
+
+        data = classroom_request("GET", url, token, params=page_params)
+        items.extend(data.get(response_key, []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            return items
+
+        # Defensive guard against a broken/repeating pagination token.
+        if len(items) > 10000:
+            raise RuntimeError(
+                f"Google Classroom returned more than 10,000 {response_key}; "
+                "stopping to avoid an unbounded request loop."
+            )
+
+
 def list_teacher_courses(token: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses",
+    return classroom_list_all(
         token,
-        params={
-            "teacherId": "me",
-            "courseStates": "ACTIVE",
-            "pageSize": 100,
-        },
+        f"{CLASSROOM_BASE}/courses",
+        {"teacherId": "me", "courseStates": "ACTIVE", "pageSize": 100},
+        "courses",
     )
-    return data.get("courses", [])
 
 
 def list_assignments(token: str, course_id: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork",
+    assignments = classroom_list_all(
         token,
-        params={
-            "courseWorkStates": "PUBLISHED",
-            "pageSize": 100,
-        },
+        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork",
+        {"courseWorkStates": "PUBLISHED", "pageSize": 100},
+        "courseWork",
     )
-    assignments = data.get("courseWork", [])
     return [
         item for item in assignments
         if item.get("workType") == "ASSIGNMENT"
@@ -793,16 +925,12 @@ def list_assignments(token: str, course_id: str):
 
 
 def list_turned_in_submissions(token: str, course_id: str, coursework_id: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
+    return classroom_list_all(
         token,
-        params={
-            "states": "TURNED_IN",
-            "pageSize": 100,
-        },
+        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
+        {"states": "TURNED_IN", "pageSize": 100},
+        "studentSubmissions",
     )
-    return data.get("studentSubmissions", [])
 
 
 def get_user_profile(token: str, user_id: str):
@@ -872,7 +1000,12 @@ def upload_bytes_to_gemini(client, data: bytes, filename: str):
     try:
         remote_file = client.files.upload(file=tmp_path)
 
+        processing_deadline = time.monotonic() + 120
         while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() >= processing_deadline:
+                raise TimeoutError(
+                    f"Gemini file processing timed out for '{filename}'."
+                )
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
@@ -1496,7 +1629,7 @@ with st.sidebar:
 
     remember_key = st.checkbox(
         "Remember this API key on this computer",
-        value=True,
+        value=False,
         help="After a successful test, save the key locally so you do not "
              "need to enter it every time.",
     )
@@ -1560,12 +1693,12 @@ with st.sidebar:
 # GOOGLE CLASSROOM
 # ============================================================
 
-with st.expander("🎓 Google Classroom — automatic marking & grade return", expanded=True):
+with st.expander("🎓 Google Classroom — automatic marking", expanded=True):
     st.markdown(
         """
         **Workflow:** connect your Google account → choose your class →
         choose an assignment → upload its mark scheme → find turned-in work →
-        mark automatically → save a Classroom draft grade or return it to the student.
+        mark automatically → review the suggested marks and enter the grade manually in Classroom.
         """
     )
 
@@ -1586,34 +1719,41 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
         with auth_col1:
             if google_logged_in():
-                email = getattr(st.user, "email", "")
-                name = getattr(st.user, "name", "")
-                st.success(
-                    f"✅ Google Classroom connected"
-                    + (f" — {name}" if name else "")
-                    + (f" ({email})" if email else "")
-                )
+                st.success("✅ Google Classroom connected")
+            oauth_error = st.session_state.pop("classroom_oauth_error", None)
+            if oauth_error:
+                st.error(str(oauth_error))
             else:
                 st.info(
                     "Connect your Google account to let MathsMark AI read your "
-                    "teacher Classroom submissions and write grades."
+                    "teacher Classroom submissions. Suggested grades are shown for "
+                    "you to review and enter manually."
                 )
 
         with auth_col2:
             if google_logged_in():
-                if st.button("Log out", use_container_width=True, key="classroom_logout"):
-                    st.logout()
+                if st.button("Disconnect", use_container_width=True, key="classroom_logout"):
+                    clear_classroom_auth()
+                    st.rerun()
             else:
-                if st.button("🔗 Connect Google Classroom", type="primary", use_container_width=True):
-                    st.login("google")
+                try:
+                    auth_url = build_classroom_authorization_url()
+                    st.link_button(
+                        "🔗 Connect Google Classroom",
+                        auth_url,
+                        type="primary",
+                        use_container_width=True,
+                    )
+                except Exception as auth_error:
+                    st.error(f"Could not start Google sign-in: {auth_error}")
 
         if google_logged_in():
             token = get_google_access_token()
 
             if not token:
-                st.error(
-                    "Google login succeeded, but no API access token is available. "
-                    "Make sure expose_tokens includes 'access' and reconnect."
+                st.warning(
+                    "Google API access needs to be renewed. Please disconnect and "
+                    "connect Google Classroom again."
                 )
             else:
                 try:
