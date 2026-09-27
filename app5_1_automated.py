@@ -1,11 +1,17 @@
 import json
 import os
 import re
+import io
+import hmac
+import hashlib
+import secrets
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import requests
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -43,20 +49,22 @@ st.markdown(
 )
 
 
-APP_VERSION = "2.3"
+APP_VERSION = "3.0.1"
 PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
+    # Pro tier is slower and more expensive than Flash, but runs on separate
+    # capacity — kept last, only used if every Flash model above is down.
+    "gemini-3.1-pro-preview",
 ]
 AUDIT_MODELS = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.1-pro-preview",
 ]
 GROUP_SIZE = 5
 
@@ -146,7 +154,12 @@ def upload_pdf(client, uploaded_file):
     try:
         remote_file = client.files.upload(file=tmp_path)
 
+        processing_deadline = time.monotonic() + 120
         while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() >= processing_deadline:
+                raise TimeoutError(
+                    f"Gemini file processing timed out for {uploaded_file.name}."
+                )
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
@@ -331,6 +344,251 @@ def make_group_rows(questions):
     return groups
 
 
+# ============================================================
+# REPORT RENDERING HELPERS
+# (defined here, above both the Classroom and manual-upload
+# flows, so either one can render/export a full student report)
+# ============================================================
+
+def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
+    info = result["paper_info"]
+    lines = [
+        f"# Pearson Edexcel IGCSE Maths Auto-Marker Report — {student_name}",
+        "",
+        f"Score: {totals['earned']} / {totals['available']}",
+        f"Percentage: {totals['percentage']:.2f}%",
+        f"Provisional percentage-band grade: {totals['provisional_grade']}",
+        f"Paper: {info['paper']}",
+        f"Session: {info['session']}",
+        "",
+        "## Overview",
+        result["overall_notes"]["summary"],
+        "",
+        "## Strengths",
+    ]
+    lines.extend(f"- {x}" for x in result["overall_notes"]["strengths"])
+    lines.append("")
+    lines.append("## Revision areas")
+    lines.extend(f"- {x}" for x in result["overall_notes"]["revision_areas"])
+    lines.append("")
+    lines.append("## Question breakdown")
+
+    for q in result["questions"]:
+        lines.extend(
+            [
+                "",
+                f"### Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']}",
+                f"Topic: {q['topic']}",
+                f"Loss reason: {q['loss_reason'] or 'None'}",
+                f"Correct method: {q['correct_method']}",
+                f"Full-mark solution: {q['full_mark_solution']}",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+def build_csv_rows(student_name: str, result: dict) -> list:
+    rows = []
+    for q in result["questions"]:
+        rows.append(
+            {
+                "Student": student_name,
+                "Question": q["question_number"],
+                "Awarded": q["awarded_marks"],
+                "Max": q["max_marks"],
+                "Percentage": (
+                    round(q["awarded_marks"] / q["max_marks"] * 100, 2)
+                    if q["max_marks"]
+                    else 0
+                ),
+                "Topic": q["topic"],
+                "Loss Reason": q["loss_reason"],
+                "Correct Method": q["correct_method"],
+            }
+        )
+    return rows
+
+
+def render_student_report(student_name, result, totals, groups, marking_model, audit_model):
+    """Render the full single-student report (metrics, notes, groups, per-question detail)."""
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Score", f"{totals['earned']} / {totals['available']}")
+    c2.metric("Percentage", f"{totals['percentage']:.2f}%")
+    c3.metric("Provisional band", f"Grade {totals['provisional_grade']}")
+    c4.metric("Questions marked", len(result["questions"]))
+
+    info = result["paper_info"]
+    st.caption(
+        f"Qualification: {info['qualification']}  |  "
+        f"Paper: {info['paper']}  |  "
+        f"Session: {info['session']}"
+    )
+    st.caption(f"Marker model: {marking_model}  |  Audit model: {audit_model}")
+
+    st.info(
+        "The score above is calculated directly from the question-level marks returned "
+        "by the marker. The Grade shown is only a provisional percentage band unless "
+        "official session-specific grade boundaries are supplied and applied."
+    )
+
+    if result["overall_notes"]["summary"]:
+        st.subheader("Chapter / topic mastery overview")
+        st.write(result["overall_notes"]["summary"])
+
+    strengths_col, revision_col = st.columns(2)
+
+    with strengths_col:
+        st.subheader("✅ Key strengths")
+        if result["overall_notes"]["strengths"]:
+            for item in result["overall_notes"]["strengths"]:
+                st.write(f"• {item}")
+        else:
+            st.write("No specific strengths were identified.")
+
+    with revision_col:
+        st.subheader("📚 Primary revision areas")
+        if result["overall_notes"]["revision_areas"]:
+            for item in result["overall_notes"]["revision_areas"]:
+                st.write(f"• {item}")
+        else:
+            st.write("No major revision areas were identified.")
+
+    if result["uncertainties"]:
+        st.subheader("⚠️ Marking uncertainties")
+        for item in result["uncertainties"]:
+            st.write(f"• {item}")
+
+    st.subheader("📊 Question groups")
+
+    for group in groups:
+        st.markdown(
+            f"**{group['group']}** — "
+            f"{group['earned']} / {group['available']} "
+            f"({group['percentage']:.2f}%)"
+        )
+
+        rows = []
+        for q in group["questions"]:
+            rows.append(
+                {
+                    "Question": q["question_number"],
+                    "Marks": f"{q['awarded_marks']} / {q['max_marks']}",
+                    "Topic": q["topic"],
+                    "Loss reason": q["loss_reason"] or "None",
+                }
+            )
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.subheader("📝 Question-by-question correction")
+
+    for q in result["questions"]:
+        with st.expander(
+            f"Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']} — {q['topic']}"
+        ):
+            st.markdown("**Student answer / visible working**")
+            st.write(q["student_answer"] or q["working_summary"] or "No readable answer extracted.")
+
+            st.markdown("**Mark loss**")
+            st.write(q["loss_reason"] or "No marks lost.")
+
+            if q["mark_breakdown"]:
+                breakdown_rows = []
+                for item in q["mark_breakdown"]:
+                    breakdown_rows.append(
+                        {
+                            "Mark": item["code"],
+                            "Awarded": "Yes" if item["awarded"] else "No",
+                            "Reason": item["reason"],
+                        }
+                    )
+
+                st.dataframe(pd.DataFrame(breakdown_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("**Correct method**")
+            st.write(q["correct_method"] or "Not provided.")
+
+            st.markdown("**Full-mark model solution**")
+            st.write(q["full_mark_solution"] or "Not provided.")
+
+    with st.expander("🔧 View machine-readable JSON"):
+        st.code(json.dumps(result, indent=2, ensure_ascii=False), language="json")
+
+
+def mark_one_submission(
+    client,
+    student_name: str,
+    student_file,
+    mark_scheme_file,
+    question_file,
+    audit_enabled: bool,
+):
+    """
+    Mark one student's already-uploaded file(s) and return a result dict.
+
+    Deliberately makes NO Streamlit calls (no st.write/st.warning/etc.) so it
+    is safe to run inside a worker thread via ThreadPoolExecutor — Streamlit
+    only supports UI calls from the main script thread. Callers should run
+    several of these concurrently to mark multiple students in parallel,
+    then report progress/results back in the main thread as futures complete.
+    """
+    raw_result, marking_model = grade_with_model(
+        client=client,
+        model_names=PRIMARY_MODELS,
+        student_file=student_file,
+        mark_scheme_file=mark_scheme_file,
+        question_file=question_file,
+        status_callback=None,
+    )
+
+    result = normalise_result(raw_result)
+    audit_model = "Not run"
+    audit_warning = None
+
+    if audit_enabled:
+        try:
+            audit_candidates = [
+                m for m in AUDIT_MODELS if m != marking_model
+            ] + [
+                m for m in PRIMARY_MODELS
+                if m != marking_model and m not in AUDIT_MODELS
+            ]
+
+            audited, audit_model = audit_result(
+                client=client,
+                result=result,
+                student_file=student_file,
+                mark_scheme_file=mark_scheme_file,
+                model_names=audit_candidates,
+                status_callback=None,
+            )
+            result = normalise_result(audited)
+        except Exception as audit_error:
+            audit_warning = str(audit_error)
+
+    earned, available, percentage = calculate_totals(result)
+    provisional_grade = percentage_band_grade(percentage)
+    groups = make_group_rows(result["questions"])
+
+    return {
+        "student_name": student_name,
+        "status": "Marked",
+        "error": None,
+        "audit_warning": audit_warning,
+        "result": result,
+        "totals": {
+            "earned": earned,
+            "available": available,
+            "percentage": percentage,
+            "provisional_grade": provisional_grade,
+        },
+        "groups": groups,
+        "marking_model": marking_model,
+        "audit_model": audit_model,
+    }
+
+
 def test_api_key(api_key: str):
     """
     Validate authentication before uploading PDFs.
@@ -374,6 +632,679 @@ def test_api_key(api_key: str):
             )
 
         return False, f"Gemini returned an authentication/setup error: {message}"
+
+
+
+# ============================================================
+# GOOGLE CLASSROOM INTEGRATION
+# ============================================================
+
+CLASSROOM_BASE = "https://classroom.googleapis.com/v1"
+DRIVE_BASE = "https://www.googleapis.com/drive/v3"
+
+CLASSROOM_SCOPES = [
+    "https://www.googleapis.com/auth/classroom.courses.readonly",
+    "https://www.googleapis.com/auth/classroom.coursework.students",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+
+def get_classroom_oauth_config():
+    """Read the Google OAuth client settings from Streamlit secrets."""
+    try:
+        auth = st.secrets.get("auth", {})
+        google_auth = auth.get("google", {})
+        client_id = str(google_auth.get("client_id", "")).strip()
+        client_secret = str(google_auth.get("client_secret", "")).strip()
+        configured_redirect = str(auth.get("redirect_uri", "")).strip()
+        cookie_secret = str(auth.get("cookie_secret", "")).strip()
+        if not (client_id and client_secret and configured_redirect and cookie_secret):
+            return None
+
+        # Streamlit's /oauth2callback endpoint belongs to st.login(). This
+        # integration uses Google's OAuth authorization-code flow instead,
+        # returning to the app root with ?code=...&state=....
+        parts = urlsplit(configured_redirect)
+        redirect_uri = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        if not redirect_uri:
+            return None
+        return {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri,
+        }
+    except Exception:
+        return None
+
+
+def classroom_auth_status():
+    """Return OAuth configuration status and actionable setup problems."""
+    config = get_classroom_oauth_config()
+    if config:
+        return True, []
+    return False, [
+        "Check [auth.google] client_id and client_secret in Streamlit Secrets.",
+        "Check [auth] redirect_uri and cookie_secret in Streamlit Secrets.",
+        "Register the app root URL as an authorized redirect URI in Google Cloud.",
+    ]
+
+
+def classroom_auth_configured() -> bool:
+    """Return True when credentials for the dedicated Google API OAuth flow exist."""
+    return get_classroom_oauth_config() is not None
+
+
+def google_logged_in() -> bool:
+    """Whether this browser session has an authorized Classroom API token."""
+    return bool(st.session_state.get("classroom_access_token"))
+
+
+def build_classroom_authorization_url() -> str:
+    """Build the real Google OAuth authorization URL for Classroom/Drive APIs."""
+    config = get_classroom_oauth_config()
+    if not config:
+        raise RuntimeError("Google OAuth client settings are missing from Streamlit Secrets.")
+    # Sign state so validation still works after Google's full-page redirect,
+    # even if Streamlit creates a fresh websocket session on return.
+    state_payload = f"{int(time.time())}.{secrets.token_urlsafe(24)}"
+    state_signature = hmac.new(
+        str(st.secrets["auth"]["cookie_secret"]).encode("utf-8"),
+        state_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    state = f"{state_payload}.{state_signature}"
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "scope": " ".join(CLASSROOM_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+
+def finish_classroom_oauth_callback() -> None:
+    """Exchange Google's authorization code, validating OAuth state first."""
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    oauth_error = st.query_params.get("error")
+    if oauth_error:
+        st.session_state["classroom_oauth_error"] = str(oauth_error)
+        st.query_params.clear()
+        return
+    if not code:
+        return
+
+    config = get_classroom_oauth_config()
+    try:
+        state_parts = str(returned_state or "").split(".")
+        if len(state_parts) != 3:
+            raise ValueError("invalid state")
+        state_payload = ".".join(state_parts[:2])
+        timestamp = int(state_parts[0])
+        expected_signature = hmac.new(
+            str(st.secrets["auth"]["cookie_secret"]).encode("utf-8"),
+            state_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        state_is_valid = (
+            abs(time.time() - timestamp) <= 600
+            and hmac.compare_digest(expected_signature, state_parts[2])
+        )
+    except Exception:
+        state_is_valid = False
+    if not state_is_valid:
+        st.session_state["classroom_oauth_error"] = (
+            "Google sign-in state validation failed or expired. Please connect again."
+        )
+        st.query_params.clear()
+        return
+
+    config = get_classroom_oauth_config()
+    if not config:
+        st.session_state["classroom_oauth_error"] = "Google OAuth settings are missing."
+        st.query_params.clear()
+        return
+
+    try:
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": str(code),
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "redirect_uri": config["redirect_uri"],
+                "grant_type": "authorization_code",
+            },
+            timeout=30,
+        )
+        payload = response.json()
+        if response.status_code >= 400 or not payload.get("access_token"):
+            # Keep the error safe: never display tokens or client secrets.
+            st.session_state["classroom_oauth_error"] = (
+                "Google token exchange failed. Check the OAuth client and the "
+                "authorized redirect URI in Google Cloud. "
+                f"Details: {payload.get('error_description', payload.get('error', 'unknown error'))}"
+            )
+        else:
+            st.session_state["classroom_access_token"] = payload["access_token"]
+            st.session_state["classroom_token_expiry"] = time.time() + int(
+                payload.get("expires_in", 3600)
+            ) - 60
+            if payload.get("refresh_token"):
+                st.session_state["classroom_refresh_token"] = payload["refresh_token"]
+            st.session_state.pop("classroom_oauth_error", None)
+    except requests.RequestException:
+        st.session_state["classroom_oauth_error"] = (
+            "Could not contact Google's OAuth service. Please try again."
+        )
+    finally:
+        st.query_params.clear()
+
+
+def get_google_access_token() -> str:
+    """Return a valid Google API access token, refreshing it when possible."""
+    token = str(st.session_state.get("classroom_access_token", ""))
+    expiry = float(st.session_state.get("classroom_token_expiry", 0) or 0)
+    if token and time.time() < expiry:
+        return token
+
+    refresh_token = str(st.session_state.get("classroom_refresh_token", ""))
+    config = get_classroom_oauth_config()
+    if not refresh_token or not config:
+        return ""
+
+    try:
+        response = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        payload = response.json()
+        if response.status_code >= 400 or not payload.get("access_token"):
+            st.session_state.pop("classroom_access_token", None)
+            return ""
+        token = payload["access_token"]
+        st.session_state["classroom_access_token"] = token
+        st.session_state["classroom_token_expiry"] = time.time() + int(
+            payload.get("expires_in", 3600)
+        ) - 60
+        return token
+    except requests.RequestException:
+        return ""
+
+
+def clear_classroom_auth() -> None:
+    """Remove Google API credentials from the current browser session."""
+    for key in (
+        "classroom_access_token", "classroom_refresh_token", "classroom_token_expiry",
+        "classroom_oauth_error",
+    ):
+        st.session_state.pop(key, None)
+
+
+
+
+# Handle a Google OAuth callback before drawing the page.
+finish_classroom_oauth_callback()
+
+
+def classroom_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+
+def classroom_request(method: str, url: str, token: str, **kwargs):
+    """Call a Google API endpoint with a clear error message."""
+    headers = kwargs.pop("headers", {})
+    merged = classroom_headers(token)
+    merged.update(headers)
+
+    response = requests.request(
+        method=method,
+        url=url,
+        headers=merged,
+        timeout=60,
+        **kwargs,
+    )
+
+    if response.status_code >= 400:
+        detail = response.text[:2000]
+        raise RuntimeError(
+            f"Google API error {response.status_code}: {detail}"
+        )
+
+    if not response.content:
+        return {}
+
+    return response.json()
+
+
+def classroom_list_all(token: str, url: str, params: dict, response_key: str):
+    """Fetch every page of a Classroom list endpoint."""
+    items = []
+    page_token = None
+
+    while True:
+        page_params = dict(params)
+        if page_token:
+            page_params["pageToken"] = page_token
+
+        data = classroom_request("GET", url, token, params=page_params)
+        items.extend(data.get(response_key, []))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            return items
+
+        # Defensive guard against a broken/repeating pagination token.
+        if len(items) > 10000:
+            raise RuntimeError(
+                f"Google Classroom returned more than 10,000 {response_key}; "
+                "stopping to avoid an unbounded request loop."
+            )
+
+
+def list_teacher_courses(token: str):
+    return classroom_list_all(
+        token,
+        f"{CLASSROOM_BASE}/courses",
+        {"teacherId": "me", "courseStates": "ACTIVE", "pageSize": 100},
+        "courses",
+    )
+
+
+def list_assignments(token: str, course_id: str):
+    assignments = classroom_list_all(
+        token,
+        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork",
+        {"courseWorkStates": "PUBLISHED", "pageSize": 100},
+        "courseWork",
+    )
+    return [
+        item for item in assignments
+        if item.get("workType") == "ASSIGNMENT"
+    ]
+
+
+def list_turned_in_submissions(token: str, course_id: str, coursework_id: str):
+    return classroom_list_all(
+        token,
+        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
+        {"states": "TURNED_IN", "pageSize": 100},
+        "studentSubmissions",
+    )
+
+
+def get_user_profile(token: str, user_id: str):
+    return classroom_request(
+        "GET",
+        f"{CLASSROOM_BASE}/userProfiles/{user_id}",
+        token,
+    )
+
+
+def download_drive_file(token: str, file_id: str):
+    """
+    Download a Drive attachment.
+    PDFs/images are downloaded directly. Google Docs are exported to PDF.
+    """
+    meta = classroom_request(
+        "GET",
+        f"{DRIVE_BASE}/files/{file_id}",
+        token,
+        params={"fields": "id,name,mimeType,capabilities"},
+    )
+
+    name = meta.get("name", f"drive_file_{file_id}")
+    mime = meta.get("mimeType", "application/octet-stream")
+
+    capabilities = meta.get("capabilities", {})
+    if capabilities and capabilities.get("canDownload") is False:
+        raise RuntimeError(f"Google Drive does not allow downloading '{name}'.")
+
+    if mime == "application/vnd.google-apps.document":
+        response = requests.get(
+            f"{DRIVE_BASE}/files/{file_id}/export",
+            headers=classroom_headers(token),
+            params={"mimeType": "application/pdf"},
+            timeout=60,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Could not export Google Doc '{name}' to PDF: "
+                f"{response.status_code} {response.text[:1000]}"
+            )
+        return name.rsplit(".", 1)[0] + ".pdf", response.content, "application/pdf"
+
+    response = requests.get(
+        f"{DRIVE_BASE}/files/{file_id}",
+        headers=classroom_headers(token),
+        params={"alt": "media"},
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Could not download '{name}': "
+            f"{response.status_code} {response.text[:1000]}"
+        )
+
+    return name, response.content, mime
+
+
+def upload_bytes_to_gemini(client, data: bytes, filename: str):
+    """Upload Classroom-downloaded content to Gemini as a temporary file."""
+    suffix = os.path.splitext(filename)[1].lower() or ".bin"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    try:
+        remote_file = client.files.upload(file=tmp_path)
+
+        processing_deadline = time.monotonic() + 120
+        while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() >= processing_deadline:
+                raise TimeoutError(
+                    f"Gemini file processing timed out for '{filename}'."
+                )
+            time.sleep(0.5)
+            remote_file = client.files.get(name=remote_file.name)
+
+        state_name = getattr(remote_file.state, "name", "")
+        if state_name and state_name not in {"ACTIVE", "SUCCEEDED"}:
+            raise RuntimeError(
+                f"Gemini could not finish processing '{filename}'. "
+                f"File state: {state_name}"
+            )
+
+        return remote_file
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def classroom_attachment_ids(submission: dict):
+    attachments = (
+        submission.get("assignmentSubmission", {})
+        .get("attachments", [])
+    )
+
+    ids = []
+    for attachment in attachments:
+        drive_file = attachment.get("driveFile")
+        if drive_file and drive_file.get("id"):
+            ids.append(drive_file["id"])
+
+    return ids
+
+
+def mark_one_classroom_submission(
+    token: str,
+    client,
+    submission: dict,
+    coursework: dict,
+    mark_scheme_remote,
+    audit_enabled: bool,
+):
+    """
+    Mark one Classroom submission's attachment(s) and return a result dict.
+    Never raises — any failure is captured in the returned dict's "status"/
+    "reason" fields instead, and makes no Streamlit calls, so it's safe to
+    run inside a worker thread via ThreadPoolExecutor.
+    """
+    submission_id = submission["id"]
+    student_id = submission.get("userId", "Unknown student")
+
+    try:
+        profile = get_user_profile(token, student_id)
+        student_name = profile.get("name", {}).get("fullName", student_id)
+    except Exception:
+        student_name = student_id
+
+    attachment_ids = classroom_attachment_ids(submission)
+
+    if not attachment_ids:
+        return {
+            "submission_id": submission_id,
+            "student": student_name,
+            "status": "Skipped",
+            "reason": "No Google Drive attachment found.",
+            "audit_warning": None,
+            "result": None,
+            "totals": None,
+            "groups": None,
+            "marking_model": None,
+            "audit_model": None,
+            "suggested_classroom_grade": None,
+        }
+
+    remote_students = []
+    try:
+        for file_id in attachment_ids:
+            filename, data, mime = download_drive_file(token, file_id)
+
+            # For now, safely accept PDFs and common images.
+            # Unsupported Drive types are skipped with an explanation.
+            supported = (
+                mime == "application/pdf"
+                or mime.startswith("image/")
+                or filename.lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp"))
+            )
+
+            if not supported:
+                raise RuntimeError(
+                    f"Unsupported submitted file type: {mime} ({filename})"
+                )
+
+            remote_students.append(upload_bytes_to_gemini(client, data, filename))
+
+        raw_result, marking_model = grade_with_model(
+            client=client,
+            model_names=PRIMARY_MODELS,
+            student_file=remote_students,
+            mark_scheme_file=mark_scheme_remote,
+            question_file=None,
+            status_callback=None,
+        )
+
+        result = normalise_result(raw_result)
+        audit_model = "Not run"
+        audit_warning = None
+
+        if audit_enabled:
+            audit_candidates = [
+                m for m in AUDIT_MODELS if m != marking_model
+            ] + [
+                m for m in PRIMARY_MODELS
+                if m != marking_model and m not in AUDIT_MODELS
+            ]
+
+            try:
+                audited, audit_model = audit_result(
+                    client=client,
+                    result=result,
+                    student_file=remote_students,
+                    mark_scheme_file=mark_scheme_remote,
+                    model_names=audit_candidates,
+                    status_callback=None,
+                )
+                result = normalise_result(audited)
+            except Exception as audit_error:
+                audit_warning = str(audit_error)
+
+        earned, available, percentage = calculate_totals(result)
+        provisional_grade = percentage_band_grade(percentage)
+        groups = make_group_rows(result["questions"])
+
+        max_points = coursework.get("maxPoints")
+        suggested_classroom_grade = None
+        if max_points and float(max_points) > 0 and available:
+            suggested_classroom_grade = round(
+                (earned / available) * float(max_points), 2
+            )
+
+        return {
+            "submission_id": submission_id,
+            "student": student_name,
+            "status": "Marked",
+            "reason": None,
+            "audit_warning": audit_warning,
+            "score": f"{earned}/{available}",
+            "percentage": f"{percentage:.2f}%",
+            "suggested_classroom_grade": suggested_classroom_grade,
+            "marking_model": marking_model,
+            "audit_model": audit_model,
+            "questions": len(result["questions"]),
+            "result": result,
+            "totals": {
+                "earned": earned,
+                "available": available,
+                "percentage": percentage,
+                "provisional_grade": provisional_grade,
+            },
+            "groups": groups,
+        }
+
+    except Exception as mark_error:
+        return {
+            "submission_id": submission_id,
+            "student": student_name,
+            "status": "Failed",
+            "reason": str(mark_error),
+            "audit_warning": None,
+            "result": None,
+            "totals": None,
+            "groups": None,
+            "marking_model": None,
+            "audit_model": None,
+            "suggested_classroom_grade": None,
+        }
+
+    finally:
+        for remote in remote_students:
+            try:
+                client.files.delete(name=remote.name)
+            except Exception:
+                pass
+
+
+def run_classroom_marking_job(
+    token: str,
+    client,
+    course_id: str,
+    coursework: dict,
+    mark_scheme_upload,
+    audit_enabled: bool,
+    already_processed_ids: set,
+):
+    """
+    Find TURNED_IN submissions not yet processed this session and mark their
+    attachments. This does NOT write grades back to Classroom: the Classroom
+    API only allows an app to modify (grade) courseWork that the SAME OAuth
+    project created, so any attempt to write a draft/assigned grade to an
+    assignment created in the Classroom web UI fails with a 403
+    ProjectPermissionDenied error. Scores are surfaced in the UI/report
+    instead, for the teacher to enter into the gradebook.
+
+    Submissions are marked one at a time, in order — never two submissions'
+    Gemini calls in flight simultaneously — so this is slower than running
+    everyone in parallel, but it's predictable and keeps request volume low.
+
+    `already_processed_ids` is a set of submission IDs already handled in
+    this session; the caller is responsible for persisting/updating it
+    (there is no Classroom-side signal we can use instead, since we never
+    set a grade).
+    """
+    submissions = list_turned_in_submissions(
+        token,
+        course_id,
+        coursework["id"],
+    )
+
+    pending = [
+        s for s in submissions
+        if s.get("state") == "TURNED_IN"
+        and s["id"] not in already_processed_ids
+    ]
+
+    if not pending:
+        return {
+            "pending": 0,
+            "processed": [],
+            "message": "No new turned-in submissions found.",
+        }
+
+    mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
+    processed = []
+
+    try:
+        completed_count = 0
+
+        for submission in pending:
+            completed_count += 1
+
+            row = mark_one_classroom_submission(
+                token,
+                client,
+                submission,
+                coursework,
+                mark_scheme_remote,
+                audit_enabled,
+            )
+
+            if row.get("audit_warning"):
+                st.warning(
+                    f"Audit failed for submission {row['submission_id']}; "
+                    f"the first-pass result was kept. {row['audit_warning']}"
+                )
+
+            if row["status"] == "Marked":
+                st.write(
+                    f"✅ [{completed_count}/{len(pending)}] Finished marking "
+                    f"**{row['student']}** — {row['score']} ({row['percentage']})"
+                )
+            elif row["status"] == "Skipped":
+                st.write(
+                    f"⏭️ [{completed_count}/{len(pending)}] Skipped "
+                    f"**{row['student']}** — {row['reason']}"
+                )
+            else:
+                st.write(
+                    f"⚠️ [{completed_count}/{len(pending)}] Failed to mark "
+                    f"**{row['student']}** — {row['reason']}"
+                )
+
+            processed.append(row)
+
+            # Skipped/Marked are considered handled; a Failed submission
+            # (e.g. a transient Gemini error) is retried on the next check.
+            if row["status"] in ("Marked", "Skipped"):
+                already_processed_ids.add(row["submission_id"])
+
+        return {
+            "pending": len(pending),
+            "processed": processed,
+            "message": f"Processed {len(processed)} submission(s).",
+        }
+
+    finally:
+        try:
+            client.files.delete(name=mark_scheme_remote.name)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -516,12 +1447,14 @@ def grade_with_model(
     """
     Try several current Gemini models automatically.
 
-    503/high-demand errors are temporary model availability problems, so
-    the marker moves to the next compatible model rather than failing the
-    entire homework run.
+    student_file may be one Gemini file or a list of Gemini files. Lists are
+    useful for Google Classroom submissions containing multiple pages/files.
     """
     prompt = """
-Mark the student's work in the uploaded PDF against the uploaded mark scheme.
+Mark the student's work in the uploaded file(s) against the uploaded mark scheme.
+
+The student file(s) may contain multiple pages/files belonging to one submission.
+Treat them as ONE student's complete submission.
 
 The files are:
 - Student submission: the actual work to mark.
@@ -539,13 +1472,18 @@ Before returning:
 - provide a full-mark solution,
 - flag any unreadable or genuinely ambiguous evidence.
 
-Do not calculate the final total as a free-form narrative. The application will calculate it from your individual question marks.
+Do not calculate the final total as a free-form narrative. The application will calculate it from the individual question marks.
 """
 
-    contents = [student_file, mark_scheme_file]
+    if isinstance(student_file, (list, tuple)):
+        student_files = list(student_file)
+    else:
+        student_files = [student_file]
+
+    contents_base = list(student_files) + [mark_scheme_file]
     if question_file is not None:
-        contents.append(question_file)
-    contents.append(prompt)
+        contents_base.append(question_file)
+    contents_base.append(prompt)
 
     errors = []
 
@@ -560,7 +1498,7 @@ Do not calculate the final total as a free-form narrative. The application will 
 
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=contents,
+                    contents=contents_base,
                     config=types.GenerateContentConfig(
                         system_instruction=MARKING_SYSTEM,
                         response_mime_type="application/json",
@@ -576,17 +1514,15 @@ Do not calculate the final total as a free-form narrative. The application will 
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
 
-                # Retry temporary availability/quota errors once.
                 if is_temporary_model_error(exc) and attempt == 0:
                     time.sleep(2)
                     continue
 
-                # For model-specific availability errors, continue to the next model.
                 break
 
     raise RuntimeError(
         "All configured Gemini models failed. "
-        + " | ".join(errors[-8:])
+        + " | ".join(errors)
     )
 
 
@@ -599,15 +1535,14 @@ def audit_result(
     status_callback=None,
 ):
     """
-    Independent second pass. It uses a different model where possible and
-    falls back automatically if that model is overloaded.
+    Independent second pass. Supports multiple student files/pages.
     """
     audit_prompt = f"""
 You are performing a second-pass audit of an automated mathematics marking report.
 
-Compare the report below against the actual student submission and the official
-mark scheme. Correct any question-level marks that are not supported by the
-mark scheme. Pay particular attention to:
+Compare the report below against the actual student submission file(s) and the
+official mark scheme. Correct any question-level marks that are not supported
+by the mark scheme. Pay particular attention to:
 - M/A/B mark logic
 - ECF/follow-through
 - ISW
@@ -626,7 +1561,12 @@ FIRST-PASS REPORT:
 {json.dumps(result, ensure_ascii=False)}
 """
 
-    contents = [student_file, mark_scheme_file, audit_prompt]
+    if isinstance(student_file, (list, tuple)):
+        student_files = list(student_file)
+    else:
+        student_files = [student_file]
+
+    contents = student_files + [mark_scheme_file, audit_prompt]
     errors = []
 
     for model_name in model_names:
@@ -662,7 +1602,7 @@ FIRST-PASS REPORT:
 
                 break
 
-    raise RuntimeError("Audit models failed. " + " | ".join(errors[-8:]))
+    raise RuntimeError("Audit models failed. " + " | ".join(errors))
 
 
 # ============================================================
@@ -679,17 +1619,29 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     saved_key = get_saved_api_key()
-    api_key = st.text_input(
-        "Gemini API key",
-        value=saved_key,
-        type="password",
-        help="Use a current Gemini API key from Google AI Studio. "
-             "The app can remember a working key locally in a .env file.",
-    ).strip()
+
+    cloud_key_configured = False
+    try:
+        cloud_key_configured = bool(st.secrets.get("GEMINI_API_KEY", ""))
+    except Exception:
+        cloud_key_configured = False
+
+    if cloud_key_configured:
+        api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
+        st.success("🔐 Gemini API key loaded from Streamlit Secrets")
+        st.caption("The API key is hidden from app users.")
+    else:
+        api_key = st.text_input(
+            "Gemini API key",
+            value=saved_key,
+            type="password",
+            help="For local use, enter a Gemini API key. For Community Cloud, "
+                 "put GEMINI_API_KEY in Streamlit Secrets instead.",
+        ).strip()
 
     remember_key = st.checkbox(
         "Remember this API key on this computer",
-        value=True,
+        value=False,
         help="After a successful test, save the key locally so you do not "
              "need to enter it every time.",
     )
@@ -699,7 +1651,7 @@ with st.sidebar:
         if ok:
             st.success(message)
 
-            if remember_key:
+            if remember_key and not cloud_key_configured:
                 if save_api_key_locally(api_key):
                     st.success("✅ API key saved. You will not need to enter it next time.")
                 else:
@@ -716,8 +1668,8 @@ with st.sidebar:
         st.caption("No API key loaded.")
 
     st.caption(f"App version: {APP_VERSION}")
-    st.caption("Automatic model fallback: ON")
-    st.caption("Models tried from newest to fallback")
+    st.caption("Automatic Gemini model fallback: ON")
+    st.caption("Google Classroom integration: available when configured")
 
     audit_enabled = st.checkbox(
         "Run second-pass marking audit",
@@ -748,17 +1700,339 @@ with st.sidebar:
         "PROVISIONAL percentage-band grade rather than pretending it is an official Pearson grade."
     )
 
+
+# ============================================================
+# GOOGLE CLASSROOM
+# ============================================================
+
+with st.expander("🎓 Google Classroom — automatic marking", expanded=True):
+    st.markdown(
+        """
+        **Workflow:** connect your Google account → choose your class →
+        choose an assignment → upload its mark scheme → find turned-in work →
+        mark automatically → review the suggested marks and enter the grade manually in Classroom.
+        """
+    )
+
+    classroom_ok, classroom_problems = classroom_auth_status()
+
+    if not classroom_ok:
+        st.warning(
+            "Google Classroom is not fully configured yet. Fix the following "
+            "in your Streamlit secrets, then restart the app:"
+        )
+        for problem in classroom_problems:
+            st.caption(f"• {problem}")
+        st.caption(
+            "The normal PDF marker below will still work with GEMINI_API_KEY."
+        )
+    else:
+        auth_col1, auth_col2 = st.columns([3, 1])
+
+        with auth_col1:
+            if google_logged_in():
+                st.success("✅ Google Classroom connected")
+            oauth_error = st.session_state.pop("classroom_oauth_error", None)
+            if oauth_error:
+                st.error(str(oauth_error))
+            else:
+                st.info(
+                    "Connect your Google account to let MathsMark AI read your "
+                    "teacher Classroom submissions. Suggested grades are shown for "
+                    "you to review and enter manually."
+                )
+
+        with auth_col2:
+            if google_logged_in():
+                if st.button("Disconnect", use_container_width=True, key="classroom_logout"):
+                    clear_classroom_auth()
+                    st.rerun()
+            else:
+                try:
+                    auth_url = build_classroom_authorization_url()
+                    st.link_button(
+                        "🔗 Connect Google Classroom",
+                        auth_url,
+                        type="primary",
+                        use_container_width=True,
+                    )
+                except Exception as auth_error:
+                    st.error(f"Could not start Google sign-in: {auth_error}")
+
+        if google_logged_in():
+            token = get_google_access_token()
+
+            if not token:
+                st.warning(
+                    "Google API access needs to be renewed. Please disconnect and "
+                    "connect Google Classroom again."
+                )
+            else:
+                try:
+                    courses = list_teacher_courses(token)
+
+                    if not courses:
+                        st.warning(
+                            "No active Google Classroom courses where this account "
+                            "is a teacher were returned."
+                        )
+                    else:
+                        course_labels = {
+                            c["id"]: f"{c.get('name', 'Unnamed course')} "
+                                      f"({c.get('section', '').strip()})".strip()
+                            for c in courses
+                        }
+
+                        selected_course_id = st.selectbox(
+                            "1. Choose your class",
+                            options=list(course_labels.keys()),
+                            format_func=lambda x: course_labels[x],
+                            key="classroom_course_id",
+                        )
+
+                        assignments = list_assignments(
+                            token,
+                            selected_course_id,
+                        )
+
+                        if not assignments:
+                            st.warning(
+                                "No published assignments were found in this class."
+                            )
+                            selected_course = None
+                        else:
+                            assignment_labels = {
+                                a["id"]: (
+                                    f"{a.get('title', 'Untitled assignment')} "
+                                    f"— {a.get('maxPoints', 0)} points"
+                                )
+                                for a in assignments
+                            }
+
+                            selected_assignment_id = st.selectbox(
+                                "2. Choose the assignment",
+                                options=list(assignment_labels.keys()),
+                                format_func=lambda x: assignment_labels[x],
+                                key="classroom_assignment_id",
+                            )
+                            selected_course = next(
+                                c for c in courses if c["id"] == selected_course_id
+                            )
+                            selected_assignment = next(
+                                a for a in assignments if a["id"] == selected_assignment_id
+                            )
+
+                        if selected_course is not None:
+                            ms_upload = st.file_uploader(
+                                "3. Upload the official mark scheme PDF for this assignment",
+                                type=["pdf"],
+                                key="classroom_mark_scheme",
+                            )
+
+                            st.caption(
+                                "Note: this tool cannot write grades into Classroom's gradebook — "
+                                "Google's Classroom API only lets an app grade coursework that the "
+                                "same app created, and these assignments were created in the "
+                                "Classroom website. Marks are shown below for you to enter manually."
+                            )
+
+                            auto_col1, auto_col2 = st.columns(2)
+
+                            with auto_col1:
+                                classroom_audit = st.checkbox(
+                                    "Second-pass audit",
+                                    value=True,
+                                    key="classroom_audit",
+                                )
+
+                            with auto_col2:
+                                auto_poll = st.checkbox(
+                                    "Auto-check every 60 seconds while this page is open",
+                                    value=False,
+                                    key="classroom_auto_poll",
+                                )
+
+                            process_now = st.button(
+                                "🚀 Check and mark new submissions",
+                                type="primary",
+                                use_container_width=True,
+                                disabled=not bool(ms_upload),
+                                key="classroom_process_now",
+                            )
+
+                            job_request = process_now
+
+                            # Submissions this app has already marked this session. There's no
+                            # Classroom-side "already graded" signal to rely on any more (we
+                            # never write a grade), so this session-only set is what prevents
+                            # re-marking the same submission on every check.
+                            processed_ids = st.session_state.setdefault(
+                                "classroom_processed_ids", set()
+                            )
+
+                            # Automatic polling while the active Streamlit session remains open.
+                            if auto_poll and hasattr(st, "fragment"):
+                                @st.fragment(run_every="60s")
+                                def classroom_auto_runner():
+                                    st.caption("🔄 Auto-check is active — checking for new turned-in work.")
+                                    try:
+                                        poll_client = genai.Client(api_key=api_key)
+
+                                        poll_result = run_classroom_marking_job(
+                                            token=token,
+                                            client=poll_client,
+                                            course_id=selected_course_id,
+                                            coursework=selected_assignment,
+                                            mark_scheme_upload=ms_upload,
+                                            audit_enabled=classroom_audit,
+                                            already_processed_ids=processed_ids,
+                                        )
+
+                                        if poll_result["processed"]:
+                                            st.success(
+                                                f"✅ Auto-check processed "
+                                                f"{len(poll_result['processed'])} new submission(s)."
+                                            )
+                                            st.session_state["classroom_last_result"] = poll_result
+                                        else:
+                                            st.caption(poll_result["message"])
+                                    except Exception as auto_error:
+                                        st.error(
+                                            "Automatic Classroom check failed: "
+                                            f"{auto_error}"
+                                        )
+
+                                classroom_auto_runner()
+
+                            if job_request:
+                                if not api_key:
+                                    st.error(
+                                        "GEMINI_API_KEY is not configured. Add it to "
+                                        "Streamlit Secrets before running Classroom marking."
+                                    )
+                                else:
+                                    try:
+                                        classroom_client = genai.Client(api_key=api_key)
+
+                                        with st.status(
+                                            "Processing new Google Classroom submissions...",
+                                            expanded=True,
+                                        ) as classroom_status:
+                                            result = run_classroom_marking_job(
+                                                token=token,
+                                                client=classroom_client,
+                                                course_id=selected_course_id,
+                                                coursework=selected_assignment,
+                                                mark_scheme_upload=ms_upload,
+                                                audit_enabled=classroom_audit,
+                                                already_processed_ids=processed_ids,
+                                            )
+
+                                            classroom_status.update(
+                                                label="✅ Classroom processing complete",
+                                                state="complete",
+                                                expanded=False,
+                                            )
+
+                                        st.session_state["classroom_last_result"] = result
+
+                                    except Exception as classroom_error:
+                                        message = str(classroom_error)
+                                        if "401" in message:
+                                            st.error(
+                                                "Google authorization expired or was revoked. "
+                                                "Log out and reconnect Google Classroom."
+                                            )
+                                        elif "403" in message:
+                                            st.error(
+                                                "Google denied Classroom/Drive access. "
+                                                "Check the OAuth scopes, Google Cloud APIs, "
+                                                "and that this account is a teacher in the selected class."
+                                            )
+                                        else:
+                                            st.error(
+                                                f"Classroom marking failed: {message}"
+                                            )
+
+                                        with st.expander("Technical error details"):
+                                            st.code(message)
+
+                            # Render the most recent batch (persists across reruns, e.g. from
+                            # expanding a report below, without re-hitting the Classroom API).
+                            last_result = st.session_state.get("classroom_last_result")
+
+                            if last_result and last_result["processed"]:
+                                processed_rows = last_result["processed"]
+
+                                st.subheader("📬 Classroom processing result")
+
+                                summary_rows = []
+                                for row in processed_rows:
+                                    summary_rows.append(
+                                        {
+                                            "Student": row["student"],
+                                            "Status": row["status"],
+                                            "Score": row.get("score", "—"),
+                                            "Percentage": row.get("percentage", "—"),
+                                            "Suggested Classroom grade": (
+                                                row["suggested_classroom_grade"]
+                                                if row.get("suggested_classroom_grade") is not None
+                                                else "—"
+                                            ),
+                                            "Note": row.get("reason") or "",
+                                        }
+                                    )
+
+                                st.dataframe(
+                                    pd.DataFrame(summary_rows),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                                st.info(
+                                    "Scores are not written to Classroom. Enter the score or "
+                                    "'Suggested Classroom grade' shown above into the gradebook "
+                                    "yourself for each student."
+                                )
+
+                                marked_rows = [r for r in processed_rows if r["status"] == "Marked"]
+
+                                if marked_rows:
+                                    st.subheader("🧑‍🎓 Individual student reports")
+
+                                    for row in marked_rows:
+                                        with st.expander(
+                                            f"{row['student']} — {row['score']} ({row['percentage']})"
+                                        ):
+                                            render_student_report(
+                                                row["student"],
+                                                row["result"],
+                                                row["totals"],
+                                                row["groups"],
+                                                row["marking_model"],
+                                                row["audit_model"],
+                                            )
+                            elif last_result:
+                                st.info(last_result["message"])
+
+                except Exception as classroom_load_error:
+                    st.error(
+                        f"Could not load Google Classroom data: {classroom_load_error}"
+                    )
+
 st.subheader("📁 Upload files")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.markdown("### 1. Student submission")
-    student_pdf = st.file_uploader(
-        "Student PDF",
+    st.markdown("### 1. Student submission(s)")
+    student_pdfs = st.file_uploader(
+        "Student PDF(s)",
         type=["pdf"],
+        accept_multiple_files=True,
         key="student_pdf_uploader",
-        help="Include all student pages, including workings and diagrams.",
+        help="Upload one PDF per student. Include all pages, workings and diagrams. "
+             "Every student here is marked against the same mark scheme below.",
     )
 
 with col2:
@@ -790,10 +2064,13 @@ with col4:
         help="Optional. This is needed for a genuine session-specific 1–9 boundary result.",
     )
 
-ready = bool(student_pdf and mark_scheme_pdf and api_key)
+ready = bool(student_pdfs and mark_scheme_pdf and api_key)
 
 if not ready:
-    st.warning("Upload the student PDF, mark scheme PDF, and enter/define a Gemini API key to start.")
+    st.warning(
+        "Upload at least one student PDF, the mark scheme PDF, and enter/define "
+        "a Gemini API key to start."
+    )
 
 if st.button(
     "🚀 Mark Homework Automatically",
@@ -803,23 +2080,25 @@ if st.button(
 ):
     client = None
     uploaded_remote_files = []
+    batch_results = []
 
     try:
         client = genai.Client(api_key=api_key)
 
         with st.status("Preparing automatic marking...", expanded=True) as status:
-            st.write("⚡ Uploading PDFs to Gemini...")
+            st.write(
+                f"⚡ Uploading mark scheme, question paper (if any), and "
+                f"{len(student_pdfs)} student PDF(s) to Gemini..."
+            )
 
-            upload_jobs = {}
-            files_to_upload = {
-                "student": student_pdf,
-                "mark_scheme": mark_scheme_pdf,
-            }
-
+            files_to_upload = {"mark_scheme": mark_scheme_pdf}
             if question_pdf:
                 files_to_upload["question"] = question_pdf
+            for i, sp in enumerate(student_pdfs):
+                files_to_upload[f"student_{i}"] = sp
 
-            with ThreadPoolExecutor(max_workers=len(files_to_upload)) as executor:
+            upload_jobs = {}
+            with ThreadPoolExecutor(max_workers=min(8, len(files_to_upload))) as executor:
                 futures = {
                     name: executor.submit(upload_pdf, client, upload)
                     for name, upload in files_to_upload.items()
@@ -829,61 +2108,79 @@ if st.button(
                     upload_jobs[name] = future.result()
                     uploaded_remote_files.append(upload_jobs[name])
 
-            st.write("🧠 First-pass marking against the official mark scheme...")
+            mark_scheme_remote = upload_jobs["mark_scheme"]
+            question_remote = upload_jobs.get("question")
 
-            raw_result, marking_model = grade_with_model(
-                client=client,
-                model_names=PRIMARY_MODELS,
-                student_file=upload_jobs["student"],
-                mark_scheme_file=upload_jobs["mark_scheme"],
-                question_file=upload_jobs.get("question"),
-                status_callback=st.write,
+            # Mark every student CONCURRENTLY instead of one at a time — the
+            # Gemini calls are independent per student, so this is the single
+            # biggest lever for wall-clock speed on a batch. Worker threads
+            # never touch Streamlit directly (see mark_one_submission); this
+            # main thread reports progress as each one finishes.
+            max_workers = min(4, len(student_pdfs))
+            st.write(
+                f"🧠 Marking {len(student_pdfs)} student(s) with up to "
+                f"{max_workers} running at once..."
             )
 
-            result = normalise_result(raw_result)
-            st.session_state["last_marking_model"] = marking_model
+            with ThreadPoolExecutor(max_workers=max_workers) as marking_executor:
+                marking_futures = {
+                    marking_executor.submit(
+                        mark_one_submission,
+                        client,
+                        sp.name,
+                        upload_jobs[f"student_{i}"],
+                        mark_scheme_remote,
+                        question_remote,
+                        audit_enabled,
+                    ): sp.name
+                    for i, sp in enumerate(student_pdfs)
+                }
 
-            if audit_enabled:
-                st.write("🔎 Running an independent second-pass marking audit...")
-                try:
-                    audit_candidates = [
-                        m for m in AUDIT_MODELS if m != marking_model
-                    ] + [m for m in PRIMARY_MODELS if m != marking_model and m not in AUDIT_MODELS]
+                completed = 0
+                for future in as_completed(marking_futures):
+                    sp_name = marking_futures[future]
+                    completed += 1
 
-                    audited, audit_model = audit_result(
-                        client=client,
-                        result=result,
-                        student_file=upload_jobs["student"],
-                        mark_scheme_file=upload_jobs["mark_scheme"],
-                        model_names=audit_candidates,
-                        status_callback=st.write,
-                    )
-                    result = normalise_result(audited)
-                    st.session_state["last_audit_model"] = audit_model
-                except Exception as audit_error:
-                    st.warning(
-                        f"Second-pass audit could not be completed, so the first-pass "
-                        f"marking was kept. Reason: {audit_error}"
-                    )
+                    try:
+                        row = future.result()
 
-            earned, available, percentage = calculate_totals(result)
-            provisional_grade = percentage_band_grade(percentage)
-            groups = make_group_rows(result["questions"])
+                        if row.get("audit_warning"):
+                            st.warning(
+                                f"Second-pass audit could not be completed for "
+                                f"{sp_name}, so the first-pass marking was kept. "
+                                f"Reason: {row['audit_warning']}"
+                            )
+
+                        batch_results.append(row)
+                        st.write(
+                            f"✅ [{completed}/{len(student_pdfs)}] Marked {sp_name}"
+                        )
+
+                    except Exception as student_error:
+                        st.warning(
+                            f"⚠️ [{completed}/{len(student_pdfs)}] Marking failed "
+                            f"for {sp_name}: {student_error}"
+                        )
+                        batch_results.append(
+                            {
+                                "student_name": sp_name,
+                                "status": "Failed",
+                                "error": str(student_error),
+                                "result": None,
+                                "totals": None,
+                                "groups": None,
+                                "marking_model": None,
+                                "audit_model": None,
+                            }
+                        )
 
             # Store for download/re-render.
-            st.session_state["last_result"] = result
-            st.session_state["last_totals"] = {
-                "earned": earned,
-                "available": available,
-                "percentage": percentage,
-                "provisional_grade": provisional_grade,
-            }
-            st.session_state["last_groups"] = groups
-            st.session_state["last_student_name"] = student_pdf.name
+            st.session_state["last_batch_results"] = batch_results
             st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
 
+            marked_count = sum(1 for r in batch_results if r["status"] == "Marked")
             status.update(
-                label="✅ Marking complete",
+                label=f"✅ Marking complete — {marked_count}/{len(student_pdfs)} student(s) marked",
                 state="complete",
                 expanded=False,
             )
@@ -903,7 +2200,7 @@ if st.button(
             )
         elif "403" in message or "permission" in message.lower() or "forbidden" in message.lower():
             st.error(
-                "The key is being refused by the Gemini project. Check the key's "
+                "The Gemini project is refusing the key. Check the key's "
                 "project/restrictions and that the Gemini API is enabled."
             )
         elif "429" in message or "quota" in message.lower():
@@ -926,227 +2223,118 @@ if st.button(
                     pass
 
 
-# ============================================================
-# REPORT RENDERING
-# ============================================================
 
-if "last_result" in st.session_state:
-    result = st.session_state["last_result"]
-    totals = st.session_state["last_totals"]
-    groups = st.session_state["last_groups"]
+if "last_batch_results" in st.session_state:
+    batch_results = st.session_state["last_batch_results"]
+    marked_results = [r for r in batch_results if r["status"] == "Marked"]
 
     st.divider()
-    st.header("🏆 Performance Summary")
+    st.header("🏫 Class summary")
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Score",
-        f"{totals['earned']} / {totals['available']}",
-    )
-    c2.metric(
-        "Percentage",
-        f"{totals['percentage']:.2f}%",
-    )
-    c3.metric(
-        "Provisional band",
-        f"Grade {totals['provisional_grade']}",
-    )
-    c4.metric(
-        "Questions marked",
-        len(result["questions"]),
-    )
-
-    info = result["paper_info"]
-    st.caption(
-        f"Qualification: {info['qualification']}  |  "
-        f"Paper: {info['paper']}  |  "
-        f"Session: {info['session']}"
-    )
-
-    marking_model = st.session_state.get("last_marking_model", "Unknown")
-    audit_model = st.session_state.get("last_audit_model", "Not run")
-    st.caption(
-        f"Marker model: {marking_model}  |  Audit model: {audit_model}"
-    )
-
-    st.info(
-        "The score above is calculated directly from the question-level marks returned "
-        "by the marker. The Grade shown is only a provisional percentage band unless "
-        "official session-specific grade boundaries are supplied and applied."
-    )
-
-    if result["overall_notes"]["summary"]:
-        st.subheader("Chapter / topic mastery overview")
-        st.write(result["overall_notes"]["summary"])
-
-    strengths_col, revision_col = st.columns(2)
-
-    with strengths_col:
-        st.subheader("✅ Key strengths")
-        if result["overall_notes"]["strengths"]:
-            for item in result["overall_notes"]["strengths"]:
-                st.write(f"• {item}")
-        else:
-            st.write("No specific strengths were identified.")
-
-    with revision_col:
-        st.subheader("📚 Primary revision areas")
-        if result["overall_notes"]["revision_areas"]:
-            for item in result["overall_notes"]["revision_areas"]:
-                st.write(f"• {item}")
-        else:
-            st.write("No major revision areas were identified.")
-
-    if result["uncertainties"]:
-        st.subheader("⚠️ Marking uncertainties")
-        for item in result["uncertainties"]:
-            st.write(f"• {item}")
-
-    # Group summary
-    st.header("📊 Question groups")
-
-    for group in groups:
-        st.markdown(
-            f"**{group['group']}** — "
-            f"{group['earned']} / {group['available']} "
-            f"({group['percentage']:.2f}%)"
-        )
-
-        rows = []
-        for q in group["questions"]:
-            rows.append(
+    summary_rows = []
+    for r in batch_results:
+        if r["status"] == "Marked":
+            summary_rows.append(
                 {
-                    "Question": q["question_number"],
-                    "Marks": f"{q['awarded_marks']} / {q['max_marks']}",
-                    "Topic": q["topic"],
-                    "Loss reason": q["loss_reason"] or "None",
+                    "Student": r["student_name"],
+                    "Score": f"{r['totals']['earned']} / {r['totals']['available']}",
+                    "Percentage": f"{r['totals']['percentage']:.2f}%",
+                    "Provisional grade": r["totals"]["provisional_grade"],
+                    "Status": "✅ Marked",
+                }
+            )
+        else:
+            summary_rows.append(
+                {
+                    "Student": r["student_name"],
+                    "Score": "—",
+                    "Percentage": "—",
+                    "Provisional grade": "—",
+                    "Status": f"❌ Failed: {r['error']}",
                 }
             )
 
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=True,
-            hide_index=True,
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    if len(batch_results) > len(marked_results):
+        st.warning(
+            f"{len(batch_results) - len(marked_results)} of {len(batch_results)} "
+            f"student PDF(s) could not be marked. See the Status column above and "
+            f"the individual report below for details."
         )
 
-    # Full question-by-question report
-    st.header("📝 Question-by-question correction")
+    # ------------------------------------------------------------
+    # Combined downloads across the whole class
+    # ------------------------------------------------------------
+    if marked_results:
+        st.header("⬇️ Export (whole class)")
 
-    for q in result["questions"]:
-        with st.expander(
-            f"Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']} — {q['topic']}"
-        ):
-            st.markdown(f"**Student answer / visible working**")
-            st.write(q["student_answer"] or q["working_summary"] or "No readable answer extracted.")
+        csv_rows = []
+        for r in marked_results:
+            csv_rows.extend(build_csv_rows(r["student_name"], r["result"]))
+        csv_data = pd.DataFrame(csv_rows).to_csv(index=False)
 
-            st.markdown(f"**Mark loss**")
-            st.write(q["loss_reason"] or "No marks lost.")
+        combined_report = "\n\n---\n\n".join(
+            build_markdown_report(r["student_name"], r["result"], r["totals"])
+            for r in marked_results
+        )
 
-            if q["mark_breakdown"]:
-                breakdown_rows = []
-                for item in q["mark_breakdown"]:
-                    breakdown_rows.append(
-                        {
-                            "Mark": item["code"],
-                            "Awarded": "Yes" if item["awarded"] else "No",
-                            "Reason": item["reason"],
-                        }
-                    )
+        col_a, col_b = st.columns(2)
 
-                st.dataframe(
-                    pd.DataFrame(breakdown_rows),
-                    use_container_width=True,
-                    hide_index=True,
+        with col_a:
+            st.download_button(
+                "📄 Download combined Markdown report",
+                data=combined_report,
+                file_name="igcse_maths_marking_report_class.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
+        with col_b:
+            st.download_button(
+                "📊 Download combined question marks CSV",
+                data=csv_data,
+                file_name="igcse_maths_question_marks_class.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    # ------------------------------------------------------------
+    # Individual per-student reports
+    # ------------------------------------------------------------
+    st.header("🧑‍🎓 Individual student reports")
+
+    for idx, r in enumerate(batch_results):
+        label = r["student_name"]
+        if r["status"] == "Marked":
+            label += (
+                f" — {r['totals']['earned']}/{r['totals']['available']} "
+                f"({r['totals']['percentage']:.2f}%)"
+            )
+        else:
+            label += " — ❌ Failed"
+
+        with st.expander(label, expanded=(len(batch_results) == 1)):
+            if r["status"] == "Marked":
+                render_student_report(
+                    r["student_name"],
+                    r["result"],
+                    r["totals"],
+                    r["groups"],
+                    r["marking_model"],
+                    r["audit_model"],
                 )
 
-            st.markdown("**Correct method**")
-            st.write(q["correct_method"] or "Not provided.")
-
-            st.markdown("**Full-mark model solution**")
-            st.write(q["full_mark_solution"] or "Not provided.")
-
-    # Downloads
-    st.header("⬇️ Export")
-
-    report_lines = [
-        "# Pearson Edexcel IGCSE Maths Auto-Marker Report",
-        "",
-        f"Score: {totals['earned']} / {totals['available']}",
-        f"Percentage: {totals['percentage']:.2f}%",
-        f"Provisional percentage-band grade: {totals['provisional_grade']}",
-        f"Paper: {info['paper']}",
-        f"Session: {info['session']}",
-        "",
-        "## Overview",
-        result["overall_notes"]["summary"],
-        "",
-        "## Strengths",
-    ]
-
-    report_lines.extend(f"- {x}" for x in result["overall_notes"]["strengths"])
-    report_lines.append("")
-    report_lines.append("## Revision areas")
-    report_lines.extend(f"- {x}" for x in result["overall_notes"]["revision_areas"])
-    report_lines.append("")
-    report_lines.append("## Question breakdown")
-
-    for q in result["questions"]:
-        report_lines.extend(
-            [
-                "",
-                f"### Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']}",
-                f"Topic: {q['topic']}",
-                f"Loss reason: {q['loss_reason'] or 'None'}",
-                f"Correct method: {q['correct_method']}",
-                f"Full-mark solution: {q['full_mark_solution']}",
-            ]
-        )
-
-    report_text = "\n".join(report_lines)
-
-    csv_rows = []
-    for q in result["questions"]:
-        csv_rows.append(
-            {
-                "Question": q["question_number"],
-                "Awarded": q["awarded_marks"],
-                "Max": q["max_marks"],
-                "Percentage": (
-                    round(q["awarded_marks"] / q["max_marks"] * 100, 2)
-                    if q["max_marks"]
-                    else 0
-                ),
-                "Topic": q["topic"],
-                "Loss Reason": q["loss_reason"],
-                "Correct Method": q["correct_method"],
-            }
-        )
-
-    csv_data = pd.DataFrame(csv_rows).to_csv(index=False)
-
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.download_button(
-            "📄 Download Markdown report",
-            data=report_text,
-            file_name="igcse_maths_marking_report.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
-
-    with col_b:
-        st.download_button(
-            "📊 Download question marks CSV",
-            data=csv_data,
-            file_name="igcse_maths_question_marks.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    with st.expander("🔧 View machine-readable JSON"):
-        st.code(json.dumps(result, indent=2, ensure_ascii=False), language="json")
+                st.download_button(
+                    "📄 Download this student's Markdown report",
+                    data=build_markdown_report(r["student_name"], r["result"], r["totals"]),
+                    file_name=f"igcse_maths_report_{r['student_name']}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                    key=f"dl_md_{idx}_{r['student_name']}",
+                )
+            else:
+                st.error(f"Marking failed for this student: {r['error']}")
 
 st.divider()
 st.caption(
