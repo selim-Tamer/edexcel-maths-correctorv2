@@ -951,10 +951,11 @@ def mark_one_classroom_submission(
     """
     submission_id = submission["id"]
     student_id = submission.get("userId", "Unknown student")
+    student_name = student_id
 
     def report_stage(stage):
         if progress_queue is not None:
-            progress_queue.put((submission_id, stage))
+            progress_queue.put((submission_id, student_name, stage))
 
     report_stage("Looking up student profile")
     try:
@@ -963,6 +964,7 @@ def mark_one_classroom_submission(
     except Exception:
         student_name = student_id
 
+    report_stage("Preparing submission")
     attachment_ids = classroom_attachment_ids(submission)
 
     if not attachment_ids:
@@ -1147,6 +1149,10 @@ def run_classroom_marking_job(
         )
         progress_queue = Queue()
         stage_by_submission = {}
+        student_name_by_submission = {
+            submission["id"]: submission.get("userId", "Looking up student name...")
+            for submission in pending
+        }
         progress_area = st.empty()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1173,14 +1179,15 @@ def run_classroom_marking_job(
 
                 while True:
                     try:
-                        submission_id, stage = progress_queue.get_nowait()
+                        submission_id, student_name, stage = progress_queue.get_nowait()
+                        student_name_by_submission[submission_id] = student_name
                         stage_by_submission[submission_id] = stage
                     except Empty:
                         break
 
                 if stage_by_submission:
                     progress_lines = [
-                        f"- **{futures[future]['id']}**: "
+                        f"- **{student_name_by_submission.get(futures[future]['id'], 'Unknown student')}**: "
                         f"{stage_by_submission.get(futures[future]['id'], 'Starting')}"
                         for future in futures
                         if future in remaining or future in done
