@@ -1193,53 +1193,53 @@ def run_classroom_marking_job(
                     completed_count += 1
                     submission = futures[future]
 
-                try:
-                    row = future.result()
-                except Exception as worker_error:
-                    # Keep one unexpected worker failure from aborting the batch.
-                    row = {
-                        "submission_id": submission["id"],
-                        "student": submission.get("userId", "Unknown student"),
-                        "status": "Failed",
-                        "reason": str(worker_error),
-                        "audit_warning": None,
-                        "result": None,
-                        "totals": None,
-                        "groups": None,
-                        "marking_model": None,
-                        "audit_model": None,
-                        "suggested_classroom_grade": None,
-                    }
-
-                if row.get("audit_warning"):
-                    st.warning(
-                        f"Audit failed for submission {row['submission_id']}; "
-                        f"the first-pass result was kept. {row['audit_warning']}"
-                    )
-
-                stage_by_submission[submission["id"]] = f"Finished: {row['status']}"
-                if row["status"] == "Marked":
-                    st.write(
-                        f"✅ [{completed_count}/{len(pending)}] Finished marking "
-                        f"**{row['student']}** — {row['score']} ({row['percentage']})"
-                    )
-                elif row["status"] == "Skipped":
-                    st.write(
-                        f"⏭️ [{completed_count}/{len(pending)}] Skipped "
-                        f"**{row['student']}** — {row['reason']}"
-                    )
-                else:
-                    st.write(
-                        f"⚠️ [{completed_count}/{len(pending)}] Failed to mark "
-                        f"**{row['student']}** — {row['reason']}"
-                    )
-
-                processed.append(row)
-
-                # Marked/Skipped are handled; Failed submissions remain retryable.
-                if row["status"] in ("Marked", "Skipped"):
-                    already_processed_ids.add(row["submission_id"])
-
+                    try:
+                        row = future.result()
+                    except Exception as worker_error:
+                        # Keep one unexpected worker failure from aborting the batch.
+                        row = {
+                            "submission_id": submission["id"],
+                            "student": submission.get("userId", "Unknown student"),
+                            "status": "Failed",
+                            "reason": str(worker_error),
+                            "audit_warning": None,
+                            "result": None,
+                            "totals": None,
+                            "groups": None,
+                            "marking_model": None,
+                            "audit_model": None,
+                            "suggested_classroom_grade": None,
+                        }
+    
+                    if row.get("audit_warning"):
+                        st.warning(
+                            f"Audit failed for submission {row['submission_id']}; "
+                            f"the first-pass result was kept. {row['audit_warning']}"
+                        )
+    
+                    stage_by_submission[submission["id"]] = f"Finished: {row['status']}"
+                    if row["status"] == "Marked":
+                        st.write(
+                            f"✅ [{completed_count}/{len(pending)}] Finished marking "
+                            f"**{row['student']}** — {row['score']} ({row['percentage']})"
+                        )
+                    elif row["status"] == "Skipped":
+                        st.write(
+                            f"⏭️ [{completed_count}/{len(pending)}] Skipped "
+                            f"**{row['student']}** — {row['reason']}"
+                        )
+                    else:
+                        st.write(
+                            f"⚠️ [{completed_count}/{len(pending)}] Failed to mark "
+                            f"**{row['student']}** — {row['reason']}"
+                        )
+    
+                    processed.append(row)
+    
+                    # Marked/Skipped are handled; Failed submissions remain retryable.
+                    if row["status"] in ("Marked", "Skipped"):
+                        already_processed_ids.add(row["submission_id"])
+    
         return {
             "pending": len(pending),
             "processed": processed,
