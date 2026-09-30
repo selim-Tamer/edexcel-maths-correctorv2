@@ -1392,11 +1392,25 @@ def is_temporary_model_error(exc: Exception) -> bool:
 def is_daily_quota_exhausted_error(exc: Exception) -> bool:
     """Detect quota errors that will not recover by retrying the same model."""
     message = str(exc).lower()
+    # Gemini reports daily free-tier quota IDs explicitly. Do not treat every
+    # 429 as a daily limit: some 429s are per-minute and may recover shortly.
     return (
         "perday" in message
         or "per day" in message
         or "limit: 0" in message
         or "limit: 0," in message
+        or "perdayperprojectpermodel-freetier" in message
+        or "generatecontentinputtokenspermodelperday-freetier" in message
+    )
+
+
+def is_quota_error(exc: Exception) -> bool:
+    """Detect quota exhaustion, including minute-level limits."""
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "resource_exhausted" in message
+        or "quota exceeded" in message
     )
 
 
@@ -1488,6 +1502,15 @@ Do not calculate the final total as a free-form narrative. The application will 
                         )
                     break
 
+                # A 429 caused by a short-window quota should not trigger a
+                # retry against the same model; move to the next candidate.
+                if is_quota_error(exc):
+                    if status_callback:
+                        status_callback(
+                            f"⏭️ Skipping {model_name}: Gemini quota limit reached"
+                        )
+                    break
+
                 if is_temporary_model_error(exc) and attempt == 0:
                     time.sleep(2)
                     continue
@@ -1575,6 +1598,13 @@ FIRST-PASS REPORT:
                     if status_callback:
                         status_callback(
                             f"⏭️ Skipping audit model {model_name}: daily quota exhausted"
+                        )
+                    break
+
+                if is_quota_error(exc):
+                    if status_callback:
+                        status_callback(
+                            f"⏭️ Skipping audit model {model_name}: Gemini quota limit reached"
                         )
                     break
 
