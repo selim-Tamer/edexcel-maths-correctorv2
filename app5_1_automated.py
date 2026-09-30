@@ -1389,6 +1389,17 @@ def is_temporary_model_error(exc: Exception) -> bool:
     )
 
 
+def is_daily_quota_exhausted_error(exc: Exception) -> bool:
+    """Detect quota errors that will not recover by retrying the same model."""
+    message = str(exc).lower()
+    return (
+        "perday" in message
+        or "per day" in message
+        or "limit: 0" in message
+        or "limit: 0," in message
+    )
+
+
 def grade_with_model(
     client,
     model_names,
@@ -1466,6 +1477,16 @@ Do not calculate the final total as a free-form narrative. The application will 
 
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
+
+                # Daily free-tier quota exhaustion will not be fixed by waiting
+                # a couple of seconds or retrying this same model. Skip straight
+                # to the next candidate to avoid wasting time.
+                if is_daily_quota_exhausted_error(exc):
+                    if status_callback:
+                        status_callback(
+                            f"⏭️ Skipping {model_name}: daily quota exhausted"
+                        )
+                    break
 
                 if is_temporary_model_error(exc) and attempt == 0:
                     time.sleep(2)
