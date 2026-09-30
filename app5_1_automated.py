@@ -150,7 +150,14 @@ def upload_pdf(client, uploaded_file):
     try:
         remote_file = client.files.upload(file=tmp_path)
 
+        upload_wait_started = time.monotonic()
+        upload_timeout_seconds = 180
         while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() - upload_wait_started > upload_timeout_seconds:
+                raise TimeoutError(
+                    f"Gemini file processing timed out after "
+                    f"{upload_timeout_seconds} seconds for {uploaded_file.name}."
+                )
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
@@ -882,7 +889,14 @@ def upload_bytes_to_gemini(client, data: bytes, filename: str):
     try:
         remote_file = client.files.upload(file=tmp_path)
 
+        upload_wait_started = time.monotonic()
+        upload_timeout_seconds = 180
         while getattr(remote_file.state, "name", "") == "PROCESSING":
+            if time.monotonic() - upload_wait_started > upload_timeout_seconds:
+                raise TimeoutError(
+                    f"Gemini file processing timed out after "
+                    f"{upload_timeout_seconds} seconds for '{filename}'."
+                )
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
