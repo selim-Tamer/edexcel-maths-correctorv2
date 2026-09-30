@@ -1570,6 +1570,14 @@ FIRST-PASS REPORT:
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
 
+                # A daily quota cannot be fixed by retrying the same model.
+                if is_daily_quota_exhausted_error(exc):
+                    if status_callback:
+                        status_callback(
+                            f"⏭️ Skipping audit model {model_name}: daily quota exhausted"
+                        )
+                    break
+
                 if is_temporary_model_error(exc) and attempt == 0:
                     time.sleep(2)
                     continue
