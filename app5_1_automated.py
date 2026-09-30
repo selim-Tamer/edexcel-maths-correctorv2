@@ -597,7 +597,10 @@ def test_api_key(api_key: str):
         return False, "No API key was entered."
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=120_000),
+        )
         models = list(client.models.list())
         if not models:
             return True, "API key accepted, but no models were returned."
@@ -1772,7 +1775,10 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                 def classroom_auto_runner():
                                     st.caption("🔄 Auto-check is active — checking for new turned-in work.")
                                     try:
-                                        poll_client = genai.Client(api_key=api_key)
+                                        poll_client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=120_000),
+        )
 
                                         poll_result = run_classroom_marking_job(
                                             token=token,
@@ -1808,7 +1814,10 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                     )
                                 else:
                                     try:
-                                        classroom_client = genai.Client(api_key=api_key)
+                                        classroom_client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=120_000),
+        )
 
                                         with st.status(
                                             "Processing new Google Classroom submissions...",
@@ -1979,7 +1988,10 @@ if st.button(
     batch_results = []
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=120_000),
+        )
 
         with st.status("Preparing automatic marking...", expanded=True) as status:
             st.write(
