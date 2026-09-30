@@ -46,22 +46,18 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.1"
+APP_VERSION = "3.0.2"
 PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
-    # Pro tier is slower and more expensive than Flash, but runs on separate
-    # capacity — kept last, only used if every Flash model above is down.
-    "gemini-3.1-pro-preview",
 ]
 AUDIT_MODELS = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
-    "gemini-3.1-pro-preview",
 ]
 GROUP_SIZE = 5
 
