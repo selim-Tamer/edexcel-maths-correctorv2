@@ -1079,19 +1079,15 @@ def run_classroom_marking_job(
     Find TURNED_IN submissions not yet processed this session and mark their
     attachments. This does NOT write grades back to Classroom: the Classroom
     API only allows an app to modify (grade) courseWork that the SAME OAuth
-    project created, so any attempt to write a draft/assigned grade to an
-    assignment created in the Classroom web UI fails with a 403
-    ProjectPermissionDenied error. Scores are surfaced in the UI/report
-    instead, for the teacher to enter into the gradebook.
+    project created, so scores are surfaced in the UI/report for the teacher
+    to enter into the gradebook.
 
-    Submissions are marked one at a time, in order — never two submissions'
-    Gemini calls in flight simultaneously — so this is slower than running
-    everyone in parallel, but it's predictable and keeps request volume low.
+    Mark up to two submissions concurrently. This improves throughput while
+    keeping Gemini request volume conservative. Streamlit UI updates happen
+    only on the main thread as each worker finishes.
 
     `already_processed_ids` is a set of submission IDs already handled in
-    this session; the caller is responsible for persisting/updating it
-    (there is no Classroom-side signal we can use instead, since we never
-    set a grade).
+    this session; the caller is responsible for persisting/updating it.
     """
     submissions = list_turned_in_submissions(
         token,
@@ -1116,48 +1112,76 @@ def run_classroom_marking_job(
     processed = []
 
     try:
-        completed_count = 0
+        max_workers = min(2, len(pending))
+        st.write(
+            f"⚡ Marking {len(pending)} pending submission(s), "
+            f"with up to {max_workers} running at once..."
+        )
 
-        for submission in pending:
-            completed_count += 1
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    mark_one_classroom_submission,
+                    token,
+                    client,
+                    submission,
+                    coursework,
+                    mark_scheme_remote,
+                    audit_enabled,
+                ): submission
+                for submission in pending
+            }
 
-            row = mark_one_classroom_submission(
-                token,
-                client,
-                submission,
-                coursework,
-                mark_scheme_remote,
-                audit_enabled,
-            )
+            completed_count = 0
+            for future in as_completed(futures):
+                completed_count += 1
+                submission = futures[future]
 
-            if row.get("audit_warning"):
-                st.warning(
-                    f"Audit failed for submission {row['submission_id']}; "
-                    f"the first-pass result was kept. {row['audit_warning']}"
-                )
+                try:
+                    row = future.result()
+                except Exception as worker_error:
+                    # Keep one unexpected worker failure from aborting the batch.
+                    row = {
+                        "submission_id": submission["id"],
+                        "student": submission.get("userId", "Unknown student"),
+                        "status": "Failed",
+                        "reason": str(worker_error),
+                        "audit_warning": None,
+                        "result": None,
+                        "totals": None,
+                        "groups": None,
+                        "marking_model": None,
+                        "audit_model": None,
+                        "suggested_classroom_grade": None,
+                    }
 
-            if row["status"] == "Marked":
-                st.write(
-                    f"✅ [{completed_count}/{len(pending)}] Finished marking "
-                    f"**{row['student']}** — {row['score']} ({row['percentage']})"
-                )
-            elif row["status"] == "Skipped":
-                st.write(
-                    f"⏭️ [{completed_count}/{len(pending)}] Skipped "
-                    f"**{row['student']}** — {row['reason']}"
-                )
-            else:
-                st.write(
-                    f"⚠️ [{completed_count}/{len(pending)}] Failed to mark "
-                    f"**{row['student']}** — {row['reason']}"
-                )
+                if row.get("audit_warning"):
+                    st.warning(
+                        f"Audit failed for submission {row['submission_id']}; "
+                        f"the first-pass result was kept. {row['audit_warning']}"
+                    )
 
-            processed.append(row)
+                if row["status"] == "Marked":
+                    st.write(
+                        f"✅ [{completed_count}/{len(pending)}] Finished marking "
+                        f"**{row['student']}** — {row['score']} ({row['percentage']})"
+                    )
+                elif row["status"] == "Skipped":
+                    st.write(
+                        f"⏭️ [{completed_count}/{len(pending)}] Skipped "
+                        f"**{row['student']}** — {row['reason']}"
+                    )
+                else:
+                    st.write(
+                        f"⚠️ [{completed_count}/{len(pending)}] Failed to mark "
+                        f"**{row['student']}** — {row['reason']}"
+                    )
 
-            # Skipped/Marked are considered handled; a Failed submission
-            # (e.g. a transient Gemini error) is retried on the next check.
-            if row["status"] in ("Marked", "Skipped"):
-                already_processed_ids.add(row["submission_id"])
+                processed.append(row)
+
+                # Marked/Skipped are handled; Failed submissions remain retryable.
+                if row["status"] in ("Marked", "Skipped"):
+                    already_processed_ids.add(row["submission_id"])
 
         return {
             "pending": len(pending),
