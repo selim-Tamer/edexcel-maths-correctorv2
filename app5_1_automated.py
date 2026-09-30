@@ -4,7 +4,8 @@ import re
 import io
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from queue import Queue, Empty
 
 import pandas as pd
 import requests
@@ -940,6 +941,7 @@ def mark_one_classroom_submission(
     coursework: dict,
     mark_scheme_remote,
     audit_enabled: bool,
+    progress_queue=None,
 ):
     """
     Mark one Classroom submission's attachment(s) and return a result dict.
@@ -950,6 +952,11 @@ def mark_one_classroom_submission(
     submission_id = submission["id"]
     student_id = submission.get("userId", "Unknown student")
 
+    def report_stage(stage):
+        if progress_queue is not None:
+            progress_queue.put((submission_id, stage))
+
+    report_stage("Looking up student profile")
     try:
         profile = get_user_profile(token, student_id)
         student_name = profile.get("name", {}).get("fullName", student_id)
@@ -975,7 +982,8 @@ def mark_one_classroom_submission(
 
     remote_students = []
     try:
-        for file_id in attachment_ids:
+        for file_index, file_id in enumerate(attachment_ids, start=1):
+            report_stage(f"Downloading attachment {file_index}/{len(attachment_ids)} from Google Drive")
             filename, data, mime = download_drive_file(token, file_id)
 
             # For now, safely accept PDFs and common images.
@@ -991,15 +999,17 @@ def mark_one_classroom_submission(
                     f"Unsupported submitted file type: {mime} ({filename})"
                 )
 
+            report_stage(f"Uploading {filename} to Gemini")
             remote_students.append(upload_bytes_to_gemini(client, data, filename))
 
+        report_stage("Waiting for Gemini to mark the submission")
         raw_result, marking_model = grade_with_model(
             client=client,
             model_names=PRIMARY_MODELS,
             student_file=remote_students,
             mark_scheme_file=mark_scheme_remote,
             question_file=None,
-            status_callback=None,
+            status_callback=report_stage,
         )
 
         result = normalise_result(raw_result)
@@ -1076,6 +1086,7 @@ def mark_one_classroom_submission(
         }
 
     finally:
+        report_stage("Cleaning up temporary Gemini files")
         for remote in remote_students:
             try:
                 client.files.delete(name=remote.name)
@@ -1134,6 +1145,9 @@ def run_classroom_marking_job(
             f"⚡ Marking {len(pending)} pending submission(s), "
             f"with up to {max_workers} running at once..."
         )
+        progress_queue = Queue()
+        stage_by_submission = {}
+        progress_area = st.empty()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -1145,14 +1159,39 @@ def run_classroom_marking_job(
                     coursework,
                     mark_scheme_remote,
                     audit_enabled,
+                    progress_queue,
                 ): submission
                 for submission in pending
             }
 
             completed_count = 0
-            for future in as_completed(futures):
-                completed_count += 1
-                submission = futures[future]
+            remaining = set(futures)
+            while remaining:
+                done, remaining = wait(
+                    remaining, timeout=1, return_when=FIRST_COMPLETED
+                )
+
+                while True:
+                    try:
+                        submission_id, stage = progress_queue.get_nowait()
+                        stage_by_submission[submission_id] = stage
+                    except Empty:
+                        break
+
+                if stage_by_submission:
+                    progress_lines = [
+                        f"- **{futures[future]['id']}**: "
+                        f"{stage_by_submission.get(futures[future]['id'], 'Starting')}"
+                        for future in futures
+                        if future in remaining or future in done
+                    ]
+                    progress_area.markdown(
+                        " **Current Classroom marking stages**\n" + "\n".join(progress_lines)
+                    )
+
+                for future in done:
+                    completed_count += 1
+                    submission = futures[future]
 
                 try:
                     row = future.result()
@@ -1178,6 +1217,7 @@ def run_classroom_marking_job(
                         f"the first-pass result was kept. {row['audit_warning']}"
                     )
 
+                stage_by_submission[submission["id"]] = f"Finished: {row['status']}"
                 if row["status"] == "Marked":
                     st.write(
                         f"✅ [{completed_count}/{len(pending)}] Finished marking "
