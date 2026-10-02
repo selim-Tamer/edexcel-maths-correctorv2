@@ -2,6 +2,7 @@ import json
 import os
 import re
 import io
+import random
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
@@ -46,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.0.3"
 PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -1528,14 +1529,33 @@ def audit_result(
     status_callback=None,
 ):
     """
-    Independent second pass. Supports multiple student files/pages.
+    Independently audit up to 10 randomly selected questions, then merge
+    those audited questions back into the complete first-pass result.
+    Supports multiple student files/pages.
     """
+    all_questions = result.get("questions", [])
+    if len(all_questions) > 10:
+        selected_questions = random.sample(all_questions, 10)
+    else:
+        selected_questions = list(all_questions)
+
+    selected_numbers = {str(q.get("question_number", "")).strip() for q in selected_questions}
+    audit_input = dict(result)
+    audit_input["questions"] = selected_questions
+
     audit_prompt = f"""
 You are performing a second-pass audit of an automated mathematics marking report.
 
-Compare the report below against the actual student submission file(s) and the
-official mark scheme. Correct any question-level marks that are not supported
-by the mark scheme. Pay particular attention to:
+IMPORTANT SCOPE LIMIT:
+Audit ONLY the questions listed in the FIRST-PASS REPORT below. This report
+contains a random sample of up to 10 questions, not the whole paper. Do not
+attempt to audit, add, or invent any other questions. Return the corrected
+JSON in the requested schema, with the questions array containing only these
+provided questions.
+
+Compare these selected questions against the actual student submission file(s)
+and the official mark scheme. Correct question-level marks that are not
+supported by the mark scheme. Pay particular attention to:
 - M/A/B mark logic
 - ECF/follow-through
 - ISW
@@ -1548,10 +1568,9 @@ by the mark scheme. Pay particular attention to:
 
 Do NOT change a mark merely because another valid method exists.
 Do NOT invent evidence that is not visible.
-Return the COMPLETE corrected JSON in exactly the requested schema.
 
-FIRST-PASS REPORT:
-{json.dumps(result, ensure_ascii=False)}
+FIRST-PASS REPORT (SELECTED QUESTIONS ONLY):
+{json.dumps(audit_input, ensure_ascii=False)}
 """
 
     if isinstance(student_file, (list, tuple)):
@@ -1567,7 +1586,7 @@ FIRST-PASS REPORT:
             try:
                 if status_callback:
                     status_callback(
-                        f"🔎 Auditing with {model_name}"
+                        f"🔎 Auditing {len(selected_questions)} random question(s) with {model_name}"
                         + (f" (attempt {attempt + 1}/2)" if attempt else "")
                     )
 
@@ -1582,7 +1601,23 @@ FIRST-PASS REPORT:
                 )
 
                 if response and response.text:
-                    return extract_json(response.text), model_name
+                    audited_subset = extract_json(response.text)
+                    audited_questions = audited_subset.get("questions", [])
+                    audited_by_number = {
+                        str(q.get("question_number", "")).strip(): q
+                        for q in audited_questions
+                        if isinstance(q, dict)
+                        and str(q.get("question_number", "")).strip() in selected_numbers
+                    }
+
+                    merged_result = dict(result)
+                    merged_result["questions"] = [
+                        audited_by_number.get(
+                            str(q.get("question_number", "")).strip(), q
+                        )
+                        for q in all_questions
+                    ]
+                    return merged_result, model_name
 
                 raise RuntimeError(f"{model_name} returned an empty response.")
 
