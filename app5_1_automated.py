@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.3"
+APP_VERSION = "3.0.4"
 PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -1139,10 +1139,10 @@ def run_classroom_marking_job(
     processed = []
 
     try:
-        max_workers = min(2, len(pending))
+        max_workers = 1
         st.write(
             f"⚡ Marking {len(pending)} pending submission(s), "
-            f"with up to {max_workers} running at once..."
+            "one student at a time..."
         )
         progress_queue = Queue()
         stage_by_submission = {}
@@ -2156,15 +2156,11 @@ if st.button(
             mark_scheme_remote = upload_jobs["mark_scheme"]
             question_remote = upload_jobs.get("question")
 
-            # Mark every student CONCURRENTLY instead of one at a time — the
-            # Gemini calls are independent per student, so this is the single
-            # biggest lever for wall-clock speed on a batch. Worker threads
-            # never touch Streamlit directly (see mark_one_submission); this
-            # main thread reports progress as each one finishes.
-            max_workers = min(4, len(student_pdfs))
+            # Process student marking jobs sequentially to keep Gemini request
+            # volume conservative and avoid multiple students being marked at once.
+            max_workers = 1
             st.write(
-                f"🧠 Marking {len(student_pdfs)} student(s) with up to "
-                f"{max_workers} running at once..."
+                f"🧠 Marking {len(student_pdfs)} student(s), one student at a time..."
             )
 
             with ThreadPoolExecutor(max_workers=max_workers) as marking_executor:
