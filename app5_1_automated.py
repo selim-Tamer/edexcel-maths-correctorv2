@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.4"
+APP_VERSION = "3.0.5"
 PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -1146,6 +1146,7 @@ def run_classroom_marking_job(
         )
         progress_queue = Queue()
         stage_by_submission = {}
+        stage_history_by_submission = {}
         student_name_by_submission = {
             submission["id"]: submission.get("userId", "Looking up student name...")
             for submission in pending
@@ -1179,19 +1180,39 @@ def run_classroom_marking_job(
                         submission_id, student_name, stage = progress_queue.get_nowait()
                         student_name_by_submission[submission_id] = student_name
                         stage_by_submission[submission_id] = stage
+                        history = stage_history_by_submission.setdefault(submission_id, [])
+                        if not history or history[-1] != stage:
+                            history.append(stage)
                     except Empty:
                         break
 
                 if stage_by_submission:
-                    progress_lines = [
-                        f"- **{student_name_by_submission.get(futures[future]['id'], 'Unknown student')}**: "
-                        f"{stage_by_submission.get(futures[future]['id'], 'Starting')}"
-                        for future in futures
-                        if future in remaining or future in done
-                    ]
-                    progress_area.markdown(
-                        " **Current Classroom marking stages**\n" + "\n".join(progress_lines)
-                    )
+                    with progress_area.container():
+                        st.markdown("**Current Classroom marking stages**")
+                        for future in futures:
+                            if future not in remaining and future not in done:
+                                continue
+                            submission_id = futures[future]["id"]
+                            student_name = student_name_by_submission.get(
+                                submission_id, "Unknown student"
+                            )
+                            current_stage = stage_by_submission.get(
+                                submission_id, "Starting"
+                            )
+                            with st.expander(
+                                f"{student_name} — {current_stage}",
+                                expanded=False,
+                            ):
+                                history = stage_history_by_submission.get(
+                                    submission_id, []
+                                )
+                                if history:
+                                    st.markdown("**Process so far**")
+                                    for step_number, step in enumerate(history, start=1):
+                                        prefix = "➡️ " if step == current_stage else "✓ "
+                                        st.write(f"{prefix}{step_number}. {step}")
+                                else:
+                                    st.write(current_stage)
 
                 for future in done:
                     completed_count += 1
