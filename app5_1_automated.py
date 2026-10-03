@@ -47,11 +47,12 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
 PRIMARY_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-2.5-flash",
@@ -59,6 +60,7 @@ PRIMARY_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 AUDIT_MODELS = [
+    "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-2.5-flash",
@@ -1522,6 +1524,17 @@ def is_daily_quota_exhausted_error(exc: Exception) -> bool:
     )
 
 
+_QUOTA_BLOCKED_UNTIL = {}
+
+
+def model_on_quota_cooldown(model_name: str) -> bool:
+    blocked_until = _QUOTA_BLOCKED_UNTIL.get(model_name, 0)
+    if blocked_until <= time.monotonic():
+        _QUOTA_BLOCKED_UNTIL.pop(model_name, None)
+        return False
+    return True
+
+
 def is_quota_error(exc: Exception) -> bool:
     """Detect quota exhaustion, including minute-level limits."""
     message = str(exc).lower()
@@ -1586,7 +1599,9 @@ Do not calculate the final total as a free-form narrative. The application will 
     errors = []
 
     for model_name in model_names:
-        for attempt in range(2):
+        if model_on_quota_cooldown(model_name):
+            continue
+        for attempt in range(1):
             try:
                 if status_callback:
                     status_callback(
@@ -1611,6 +1626,10 @@ Do not calculate the final total as a free-form narrative. The application will 
 
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
+
+                if is_quota_error(exc):
+                    cooldown_seconds = 21600 if is_daily_quota_exhausted_error(exc) else 90
+                    _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + cooldown_seconds
 
                 # Daily free-tier quota exhaustion will not be fixed by waiting
                 # a couple of seconds or retrying this same model. Skip straight
@@ -1721,7 +1740,9 @@ FIRST-PASS REPORT (SELECTED QUESTIONS ONLY):
     errors = []
 
     for model_name in model_names:
-        for attempt in range(2):
+        if model_on_quota_cooldown(model_name):
+            continue
+        for attempt in range(1):
             try:
                 if status_callback:
                     status_callback(
@@ -1762,6 +1783,10 @@ FIRST-PASS REPORT (SELECTED QUESTIONS ONLY):
 
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
+
+                if is_quota_error(exc):
+                    cooldown_seconds = 21600 if is_daily_quota_exhausted_error(exc) else 90
+                    _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + cooldown_seconds
 
                 # A daily quota cannot be fixed by retrying the same model.
                 if is_daily_quota_exhausted_error(exc):
