@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.6"
+APP_VERSION = "3.1.0"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -258,6 +258,12 @@ def normalise_result(data: dict) -> dict:
                 "mark_breakdown": cleaned_breakdown,
                 "correct_method": str(q.get("correct_method", "")).strip(),
                 "full_mark_solution": str(q.get("full_mark_solution", "")).strip(),
+                "confidence": (
+                    str(q.get("confidence", "Medium")).strip().title()
+                    if str(q.get("confidence", "Medium")).strip().title()
+                    in {"High", "Medium", "Low"}
+                    else "Medium"
+                ),
             }
         )
 
@@ -411,7 +417,68 @@ def build_csv_rows(student_name: str, result: dict) -> list:
     return rows
 
 
-def render_student_report(student_name, result, totals, groups, marking_model, audit_model):
+def apply_teacher_overrides(student_key: str, result: dict) -> bool:
+    """Apply session-only teacher mark overrides to a result."""
+    overrides = st.session_state.get("teacher_overrides", {}).get(student_key, {})
+    changed = False
+    for q in result.get("questions", []):
+        key = str(q.get("question_number", ""))
+        if key in overrides:
+            new_mark = clamp_mark(overrides[key], q["max_marks"])
+            if q["awarded_marks"] != new_mark:
+                q["awarded_marks"] = new_mark
+                changed = True
+    return changed
+
+
+def render_teacher_override_controls(student_key: str, result: dict):
+    """Allow a teacher to override one question mark for the current session."""
+    st.subheader("🧑‍🏫 Teacher mark override")
+    st.caption("Overrides are session-only and are never presented as official Pearson marks.")
+    questions = result.get("questions", [])
+    if not questions:
+        return
+
+    labels = {
+        str(q["question_number"]): (
+            f"Question {q['question_number']} — "
+            f"{q['awarded_marks']} / {q['max_marks']}"
+        )
+        for q in questions
+    }
+    selected = st.selectbox(
+        "Question to override",
+        list(labels.keys()),
+        format_func=lambda x: labels[x],
+        key=f"override_q_{student_key}",
+    )
+    q = next(q for q in questions if str(q["question_number"]) == selected)
+    new_mark = st.number_input(
+        "Teacher-awarded marks",
+        min_value=0,
+        max_value=int(q["max_marks"]),
+        value=int(q["awarded_marks"]),
+        step=1,
+        key=f"override_mark_{student_key}_{selected}",
+    )
+    reason = st.text_input(
+        "Reason (optional)",
+        key=f"override_reason_{student_key}_{selected}",
+    )
+    if st.button(
+        "Apply override",
+        key=f"apply_override_{student_key}_{selected}",
+        use_container_width=True,
+    ):
+        overrides = st.session_state.setdefault("teacher_overrides", {})
+        student_overrides = overrides.setdefault(student_key, {})
+        student_overrides[selected] = int(new_mark)
+        reasons = st.session_state.setdefault("teacher_override_reasons", {})
+        reasons.setdefault(student_key, {})[selected] = reason
+        st.rerun()
+
+
+def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None):
     """Render the full single-student report (metrics, notes, groups, per-question detail)."""
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Score", f"{totals['earned']} / {totals['available']}")
@@ -426,6 +493,20 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         f"Session: {info['session']}"
     )
     st.caption(f"Marker model: {marking_model}  |  Audit model: {audit_model}")
+    st.success(
+        "💬 Student feedback: "
+        + (
+            result["overall_notes"]["summary"]
+            if result["overall_notes"]["summary"]
+            else "Keep practising the questions identified in the revision areas below."
+        )
+    )
+    if student_key:
+        apply_teacher_overrides(student_key, result)
+        render_teacher_override_controls(student_key, result)
+        earned, available, percentage = calculate_totals(result)
+        totals["earned"], totals["available"], totals["percentage"] = earned, available, percentage
+        totals["provisional_grade"] = percentage_band_grade(percentage)
 
     st.info(
         "The score above is calculated directly from the question-level marks returned "
@@ -476,6 +557,7 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
                     "Question": q["question_number"],
                     "Marks": f"{q['awarded_marks']} / {q['max_marks']}",
                     "Topic": q["topic"],
+                    "Confidence": q.get("confidence", "Medium"),
                     "Loss reason": q["loss_reason"] or "None",
                 }
             )
@@ -488,6 +570,13 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         with st.expander(
             f"Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']} — {q['topic']}"
         ):
+            confidence = q.get("confidence", "Medium")
+            if confidence == "Low":
+                st.warning("🔴 Low-confidence marking — review this question manually, especially if handwriting or diagrams are unclear.")
+            elif confidence == "Medium":
+                st.info("🟡 Medium-confidence marking — worth checking if this affects the final grade.")
+            else:
+                st.caption("🟢 High-confidence marking")
             st.markdown("**Student answer / visible working**")
             st.write(q["student_answer"] or q["working_summary"] or "No readable answer extracted.")
 
@@ -1317,7 +1406,10 @@ CORE RULES
 13. Return one entry for every identifiable question in the student submission.
 14. For each lost mark, explain the precise mathematical/mark-scheme reason.
 15. Give a correct full-mark solution that a student can study.
-16. Keep the output factual and concise. Do not give a fake "official" grade.
+16. Give each question a confidence label: High, Medium, or Low. Use Low when
+    handwriting/diagrams are unclear, the evidence is ambiguous, the question
+    match is uncertain, or the awarded mark is unusually difficult to justify.
+17. Keep the output factual and concise. Do not give a fake "official" grade.
 
 VERY IMPORTANT
 The application's Python code will calculate the total score and percentage.
@@ -1364,6 +1456,7 @@ OUTPUT_SCHEMA = {
                     },
                     "correct_method": {"type": "string"},
                     "full_mark_solution": {"type": "string"},
+                    "confidence": {"type": "string"},
                 },
                 "required": [
                     "question_number",
@@ -1376,6 +1469,7 @@ OUTPUT_SCHEMA = {
                     "mark_breakdown",
                     "correct_method",
                     "full_mark_solution",
+                    "confidence",
                 ],
             },
         },
@@ -1471,7 +1565,9 @@ Before returning:
 - record M/A/B-style evidence where available,
 - explain lost marks,
 - provide a full-mark solution,
-- flag any unreadable or genuinely ambiguous evidence.
+- flag any unreadable or genuinely ambiguous evidence,
+- inspect handwriting, diagrams, graphs, annotations, and page orientation carefully,
+- if image quality prevents reliable marking, mark the question confidence as Low rather than guessing.
 
 Do not calculate the final total as a free-form narrative. The application will calculate it from the individual question marks.
 """
@@ -1560,10 +1656,26 @@ def audit_result(
     Supports multiple student files/pages.
     """
     all_questions = result.get("questions", [])
-    if len(all_questions) > 10:
-        selected_questions = random.sample(all_questions, 10)
+    # Intelligent audit: prioritise questions most likely to contain a marking
+    # error, then fill the remaining slots with a random sample.
+    high_priority = [
+        q for q in all_questions
+        if q.get("confidence") == "Low"
+        or (
+            0 < int(q.get("awarded_marks", 0) or 0)
+            < int(q.get("max_marks", 0) or 0)
+        )
+        or bool(q.get("loss_reason"))
+    ]
+    priority_ids = {id(q) for q in high_priority}
+    if len(high_priority) >= 10:
+        selected_questions = random.sample(high_priority, 10)
     else:
-        selected_questions = list(all_questions)
+        remaining_pool = [q for q in all_questions if id(q) not in priority_ids]
+        fill_count = min(10 - len(high_priority), len(remaining_pool))
+        selected_questions = high_priority + (
+            random.sample(remaining_pool, fill_count) if fill_count else []
+        )
 
     selected_numbers = {str(q.get("question_number", "")).strip() for q in selected_questions}
     audit_input = dict(result)
@@ -2079,6 +2191,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 row["groups"],
                                                 row["marking_model"],
                                                 row["audit_model"],
+                                                student_key=f"classroom_{row['student']}",
                                             )
                             elif last_result:
                                 st.info(last_result["message"])
@@ -2190,22 +2303,46 @@ if st.button(
             )
 
             with ThreadPoolExecutor(max_workers=max_workers) as marking_executor:
-                marking_futures = {
-                    marking_executor.submit(
-                        mark_one_submission,
-                        client,
-                        sp.name,
-                        upload_jobs[f"student_{i}"],
-                        mark_scheme_remote,
-                        question_remote,
-                        audit_enabled,
-                    ): sp.name
-                    for i, sp in enumerate(student_pdfs)
-                }
+                marking_futures = {}
+                cached_rows = []
+                cache = st.session_state.setdefault("marking_cache", {})
+                mark_scheme_sig = __import__("hashlib").sha256(
+                    mark_scheme_pdf.getvalue()
+                ).hexdigest()
+                question_sig = (
+                    __import__("hashlib").sha256(question_pdf.getvalue()).hexdigest()
+                    if question_pdf else "none"
+                )
+                for i, sp in enumerate(student_pdfs):
+                    cache_key = (
+                        f"{sp.name}|{__import__('hashlib').sha256(sp.getvalue()).hexdigest()}"
+                        f"|{mark_scheme_sig}|{question_sig}|audit={audit_enabled}"
+                    )
+                    if cache_key in cache:
+                        cached_rows.append(cache[cache_key])
+                    else:
+                        future = marking_executor.submit(
+                            mark_one_submission,
+                            client,
+                            sp.name,
+                            upload_jobs[f"student_{i}"],
+                            mark_scheme_remote,
+                            question_remote,
+                            audit_enabled,
+                        )
+                        marking_futures[future] = (sp.name, cache_key)
 
                 completed = 0
+                for cached in cached_rows:
+                    batch_results.append(cached)
+                    completed += 1
+                    st.write(
+                        f"⚡ [{completed}/{len(student_pdfs)}] Reused cached result for "
+                        f"**{cached['student_name']}** — no new AI marking needed"
+                    )
+
                 for future in as_completed(marking_futures):
-                    sp_name = marking_futures[future]
+                    sp_name, cache_key = marking_futures[future]
                     completed += 1
 
                     try:
@@ -2219,6 +2356,7 @@ if st.button(
                             )
 
                         batch_results.append(row)
+                        st.session_state.setdefault("marking_cache", {})[cache_key] = row
                         st.write(
                             f"✅ [{completed}/{len(student_pdfs)}] Marked {sp_name}"
                         )
@@ -2390,6 +2528,7 @@ if "last_batch_results" in st.session_state:
                     r["groups"],
                     r["marking_model"],
                     r["audit_model"],
+                    student_key=f"manual_{idx}_{r['student_name']}",
                 )
 
                 st.download_button(
