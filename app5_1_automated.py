@@ -47,18 +47,23 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.0.5"
+APP_VERSION = "3.0.6"
+# Stable Gemini API models with large context windows.
+# Multiple fallbacks are kept so a temporary quota/unavailability issue
+# on one model does not stop a student's marking run.
 PRIMARY_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
 ]
 AUDIT_MODELS = [
-    "gemini-3.7-flash",
     "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
 ]
 GROUP_SIZE = 5
 
