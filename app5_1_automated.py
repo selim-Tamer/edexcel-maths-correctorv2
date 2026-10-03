@@ -5,7 +5,7 @@ import io
 import random
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
 import pandas as pd
@@ -507,6 +507,7 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         earned, available, percentage = calculate_totals(result)
         totals["earned"], totals["available"], totals["percentage"] = earned, available, percentage
         totals["provisional_grade"] = percentage_band_grade(percentage)
+        groups = make_group_rows(result["questions"])
 
     st.info(
         "The score above is calculated directly from the question-level marks returned "
