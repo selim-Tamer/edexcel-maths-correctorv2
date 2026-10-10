@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -376,6 +376,10 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
     lines.append("## Revision areas")
     lines.extend(f"- {x}" for x in result["overall_notes"]["revision_areas"])
     lines.append("")
+    if result.get("validation_warnings"):
+        lines.append("## Mark-scheme validation warnings — teacher review required")
+        lines.extend(f"- {x}" for x in result["validation_warnings"])
+        lines.append("")
     lines.append("## Question breakdown")
 
     for q in result["questions"]:
@@ -501,7 +505,7 @@ def classroom_grade_details(row, rounding_places=2):
     medium = sum(str(q.get("confidence", "")).lower() == "medium" for q in questions)
     audit_failure = bool(row.get("audit_warning"))
     incomplete = bool(selected and len(questions) != len(row.get("selected_questions") or []))
-    requires_review = low > 0 or medium > 0 or audit_failure or incomplete
+    requires_review = low > 0 or medium > 0 or audit_failure or incomplete or bool(row["result"].get("validation_warnings"))
     approval = st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
     return {
         "score": f"{earned}/{possible}",
@@ -579,6 +583,11 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         else:
             st.write("No major revision areas were identified.")
 
+    if result.get("validation_warnings"):
+        st.error("Mark-scheme validation needs teacher review; displayed grade is provisional.")
+        for warning in result["validation_warnings"]:
+            st.write(f"• {warning}")
+
     if result["uncertainties"]:
         st.subheader("⚠️ Marking uncertainties")
         for item in result["uncertainties"]:
@@ -650,6 +659,91 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
 
 
+def extract_scheme_maxima(client, mark_scheme_file):
+    """One shared extraction of main homework-question totals, for review only."""
+    schema = {
+        "type": "object",
+        "properties": {"questions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "question_number": {"type": "string"},
+                "max_marks": {"type": "integer"},
+            },
+            "required": ["question_number", "max_marks"],
+        }}},
+        "required": ["questions"],
+    }
+    prompt = (
+        "From this official homework mark scheme, extract the TOTAL maximum marks "
+        "for EACH MAIN HOMEWORK question (sum all parts). Use the worksheet's "
+        "outer numbered items, NOT the embedded past-paper question identifiers. "
+        "Only report clear, supported values. Omit uncertain entries. JSON only."
+    )
+    errors = []
+    for model in PRIMARY_MODELS:
+        if model_on_quota_cooldown(model):
+            continue
+        try:
+            response = client.models.generate_content(
+                model=model, contents=[mark_scheme_file, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", response_schema=schema
+                ),
+            )
+            maxima, conflicts = {}, set()
+            for q in extract_json(response.text).get("questions", []):
+                number = str(q.get("question_number", "")).strip()
+                try:
+                    maximum = int(q["max_marks"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                if not number or maximum <= 0:
+                    continue
+                if number in maxima and maximum != maxima[number]:
+                    conflicts.add(number)
+                maxima[number] = maximum
+            for number in conflicts:
+                maxima.pop(number, None)
+            if not maxima:
+                raise ValueError("No readable question maximum marks.")
+            return maxima, None
+        except Exception as exc:
+            remember_model_failure(model, exc)
+            errors.append(f"{model}: {exc}")
+    return {}, "Unable to extract mark-scheme totals; teacher verification required."
+
+
+def check_question_marks(result, scheme_maxima=None, selected_questions=None, reference_warning=None):
+    """Flag discrepancies, never silently overwrite marks or claim verification."""
+    warnings = []
+    if reference_warning:
+        warnings.append(reference_warning)
+    if not scheme_maxima:
+        warnings.append("Question maximum marks could not be independently checked.")
+    seen = set()
+    for q in result.get("questions", []):
+        number = str(q.get("question_number", "")).strip()
+        if number in seen:
+            warnings.append(f"Duplicate question {number} in AI output.")
+        seen.add(number)
+        if scheme_maxima:
+            if number not in scheme_maxima:
+                warnings.append(f"Question {number}: mark-scheme maximum not verified.")
+            elif int(q.get("max_marks", 0)) != scheme_maxima[number]:
+                warnings.append(
+                    f"Question {number}: AI maximum {q['max_marks']} vs "
+                    f"mark-scheme reference {scheme_maxima[number]}. "
+                    "Teacher must verify the question's marks and maximum."
+                )
+                q["confidence"] = "Low"
+    if selected_questions is not None:
+        for number in selected_questions:
+            if str(number).strip() not in seen:
+                warnings.append(f"Selected question {number} is missing from the AI result.")
+    result["validation_warnings"] = warnings
+    return result
+
+
 def select_spread_questions(question_numbers, count):
     """Stratified sampling across the complete ordered homework, shared by a batch."""
     numbers = list(dict.fromkeys(str(x).strip() for x in question_numbers if str(x).strip()))
@@ -714,6 +808,8 @@ def mark_one_submission(
     question_file,
     audit_enabled: bool,
     selected_questions=None,
+    scheme_maxima=None,
+    scheme_warning=None,
 ):
     """
     Mark one student's already-uploaded file(s) and return a result dict.
@@ -767,6 +863,7 @@ def mark_one_submission(
         except Exception as audit_error:
             audit_warning = str(audit_error)
 
+    result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
     earned, available, percentage = calculate_totals(result)
     provisional_grade = percentage_band_grade(percentage)
     groups = make_group_rows(result["questions"])
@@ -1145,6 +1242,8 @@ def mark_one_classroom_submission(
     progress_queue=None,
     selected_questions=None,
     homework_question_count=None,
+    scheme_maxima=None,
+    scheme_warning=None,
 ):
     """
     Mark one Classroom submission's attachment(s) and return a result dict.
@@ -1251,6 +1350,7 @@ def mark_one_classroom_submission(
             except Exception as audit_error:
                 audit_warning = str(audit_error)
 
+        result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
         earned, available, percentage = calculate_totals(result)
         provisional_grade = percentage_band_grade(percentage)
         groups = make_group_rows(result["questions"])
@@ -1354,6 +1454,9 @@ def run_classroom_marking_job(
 
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
     processed = []
+    scheme_maxima, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+    if scheme_warning:
+        st.warning(scheme_warning)
     selected_questions = None
     homework_question_count = None
     if random_count is not None:
@@ -1397,6 +1500,8 @@ def run_classroom_marking_job(
                     progress_queue,
                     selected_questions,
                     homework_question_count,
+                    scheme_maxima,
+                    scheme_warning,
                 ): submission
                 for submission in pending
             }
@@ -2296,12 +2401,13 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 f"**Current suggested grade:** {details['display_grade']} "
                                                 f"/ {row.get('classroom_max_points') or '—'}"
                                             )
-                                            if details["low"] or details["medium"] or details["audit_failure"] or details["incomplete"]:
+                                            if details["low"] or details["medium"] or details["audit_failure"] or details["incomplete"] or row["result"].get("validation_warnings"):
                                                 st.warning(
                                                     f"Teacher review advised: {details['low']} Low-confidence, "
                                                     f"{details['medium']} Medium-confidence questions."
                                                     + (" The audit did not complete." if details["audit_failure"] else "")
                                                     + (" Not all selected questions were found." if details["incomplete"] else "")
+                                                    + (" Question maximum marks need verification." if row["result"].get("validation_warnings") else "")
                                                 )
                                             if row.get("selected_questions") is not None:
                                                 st.caption(
@@ -2423,6 +2529,9 @@ if st.button(
 
             mark_scheme_remote = upload_jobs["mark_scheme"]
             question_remote = upload_jobs.get("question")
+            scheme_maxima, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+            if scheme_warning:
+                st.warning(scheme_warning)
             selected_questions = None
             if random_question_count is not None:
                 numbers = discover_question_numbers(client, mark_scheme_remote, question_remote)
@@ -2464,6 +2573,8 @@ if st.button(
                             question_remote,
                             audit_enabled,
                             selected_questions,
+                            scheme_maxima,
+                            scheme_warning,
                         )
                         marking_futures[future] = (sp.name, cache_key)
 
