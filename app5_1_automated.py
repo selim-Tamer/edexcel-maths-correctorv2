@@ -824,7 +824,7 @@ def _arithmetic_equals_issues(explanation):
     operand = r"-?\d+(?:\.\d+)?"
     expr = operand + r"(?:\s*[+*/×÷xX-]\s*" + operand + r")*"
     trailing = re.compile(r"(" + expr + r")\s*$")
-    leading = re.compile(r"^\s*(" + expr + r")(?![\d.])")
+    leading = re.compile(r"^\s*(" + expr + r")(?=$|[\s,;.)])")
     pieces = explanation.split("=")
     issues = []
     for i in range(len(pieces) - 1):
