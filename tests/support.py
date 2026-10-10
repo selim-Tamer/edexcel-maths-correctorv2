@@ -84,6 +84,7 @@ def model_question(case, variant):
         "full_mark_solution": case["answer"],
         "scheme_answer_evidence": case["answer"],
         "confidence": "High",
+        "loss_reason": "" if variant == "correct" else "Criterion not demonstrated",
         "mark_breakdown": [
             {"code": step["code"], "awarded": index < sample["expected_marks"],
              "reason": sample["working"] if index < sample["expected_marks"]

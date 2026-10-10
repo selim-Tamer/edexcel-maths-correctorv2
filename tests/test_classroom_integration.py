@@ -28,6 +28,21 @@ class ClassroomTests(unittest.TestCase):
                 self.assertEqual(request.call_args.kwargs["params"]["pageToken"], "page-two")
                 self.assertTrue(all(c.kwargs["method"] == "GET" for c in request.call_args_list))
 
+    def test_repeated_page_token_fails_instead_of_looping(self):
+        self.f["requests"].request = Mock(return_value=response(
+            {"courses": [], "nextPageToken": "repeat"}))
+        with self.assertRaisesRegex(RuntimeError, "pagination token"):
+            self.f["list_teacher_courses"]("dummy")
+        self.assertEqual(self.f["requests"].request.call_count, 2)
+
+    def test_later_page_permission_error_does_not_return_partial_listing(self):
+        self.f["requests"].request = Mock(side_effect=[
+            response({"courses": [{"id": "1"}], "nextPageToken": "two"}),
+            response(status=403)])
+        with self.assertRaisesRegex(RuntimeError, "403"):
+            self.f["list_teacher_courses"]("dummy")
+        self.assertEqual(self.f["requests"].request.call_count, 2)
+
     def test_assignment_filter_and_submission_states(self):
         request = Mock(return_value=response({"courseWork": [
             {"id": "1", "workType": "ASSIGNMENT"}, {"id": "2", "workType": "SHORT_ANSWER_QUESTION"}]}))
