@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.3.0"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -473,7 +473,48 @@ def render_teacher_override_controls(student_key: str, result: dict):
         student_overrides[selected] = int(new_mark)
         reasons = st.session_state.setdefault("teacher_override_reasons", {})
         reasons.setdefault(student_key, {})[selected] = reason
+        if student_key.startswith("classroom_"):
+            st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
         st.rerun()
+
+
+def classroom_grade_details(row, rounding_places=2):
+    """Current suggested grade and review flags; no extra AI API calls."""
+    student_key = f"classroom_{row['submission_id']}"
+    overrides = st.session_state.get("teacher_overrides", {}).get(student_key, {})
+    questions = row["result"]["questions"]
+    earned = sum(
+        clamp_mark(overrides.get(str(q["question_number"]), q["awarded_marks"]), q["max_marks"])
+        for q in questions
+    )
+    possible = sum(q["max_marks"] for q in questions)
+    percentage = 100.0 * earned / possible if possible else 0.0
+    points = row.get("classroom_max_points")
+    proposed = ((earned / possible) * float(points)) if possible and points is not None and float(points) > 0 else None
+    original = row.get("suggested_classroom_grade")
+    total_questions = row.get("homework_question_count")
+    selected = row.get("selected_questions") is not None
+    low = sum(str(q.get("confidence", "")).lower() == "low" for q in questions)
+    medium = sum(str(q.get("confidence", "")).lower() == "medium" for q in questions)
+    audit_failure = bool(row.get("audit_warning"))
+    incomplete = bool(selected and len(questions) != len(row.get("selected_questions") or []))
+    requires_review = low > 0 or medium > 0 or audit_failure or incomplete
+    approval = st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
+    return {
+        "score": f"{earned}/{possible}",
+        "percentage": f"{percentage:.2f}%",
+        "display_grade": f"{proposed:.{rounding_places}f}" if proposed is not None else "—",
+        "ai_grade": f"{original:.{rounding_places}f}" if original is not None else "—",
+        "approved": approval,
+        "approval_status": "Teacher approved" if approval else "Pending review",
+        "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
+        "reliability": "Review recommended" if requires_review else "No confidence flags",
+        "low": low,
+        "medium": medium,
+        "audit_failure": audit_failure,
+        "incomplete": incomplete,
+        "has_overrides": bool(overrides),
+    }
 
 
 def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None):
@@ -1100,6 +1141,7 @@ def mark_one_classroom_submission(
     audit_enabled: bool,
     progress_queue=None,
     selected_questions=None,
+    homework_question_count=None,
 ):
     """
     Mark one Classroom submission's attachment(s) and return a result dict.
@@ -1226,6 +1268,9 @@ def mark_one_classroom_submission(
             "score": f"{earned}/{available}",
             "percentage": f"{percentage:.2f}%",
             "suggested_classroom_grade": suggested_classroom_grade,
+            "classroom_max_points": max_points,
+            "selected_questions": list(selected_questions) if selected_questions is not None else None,
+            "homework_question_count": homework_question_count,
             "marking_model": marking_model,
             "audit_model": audit_model,
             "questions": len(result["questions"]),
@@ -1309,9 +1354,11 @@ def run_classroom_marking_job(
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
     processed = []
     selected_questions = None
+    homework_question_count = None
     if random_count is not None:
         try:
             numbers = discover_question_numbers(client, mark_scheme_remote)
+            homework_question_count = len(numbers)
             selected_questions = select_spread_questions(numbers, random_count)
             st.info("Random questions (same for all students): " + ", ".join(selected_questions))
         except Exception:
@@ -1348,6 +1395,7 @@ def run_classroom_marking_job(
                     audit_enabled,
                     progress_queue,
                     selected_questions,
+                    homework_question_count,
                 ): submission
                 for submission in pending
             }
@@ -2195,52 +2243,83 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
                                 st.subheader("📬 Classroom processing result")
 
+                                classroom_rounding = st.selectbox(
+                                    "Classroom grade display",
+                                    ["2 decimal places", "Whole points"],
+                                    key="classroom_grade_rounding",
+                                    help="Rounding affects display only; calculations use unrounded marks.",
+                                )
+                                places = 0 if classroom_rounding == "Whole points" else 2
                                 summary_rows = []
                                 for row in processed_rows:
-                                    summary_rows.append(
-                                        {
+                                    if row["status"] == "Marked":
+                                        details = classroom_grade_details(row, places)
+                                        summary_rows.append({
                                             "Student": row["student"],
-                                            "Status": row["status"],
-                                            "Score": row.get("score", "—"),
-                                            "Percentage": row.get("percentage", "—"),
-                                            "Suggested Classroom grade": (
-                                                row["suggested_classroom_grade"]
-                                                if row.get("suggested_classroom_grade") is not None
-                                                else "—"
-                                            ),
-                                            "Note": row.get("reason") or "",
-                                        }
-                                    )
-
-                                st.dataframe(
-                                    pd.DataFrame(summary_rows),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-
+                                            "Status": "Marked",
+                                            "Scope": details["sample"],
+                                            "Score": details["score"],
+                                            "Percentage": details["percentage"],
+                                            "Original AI suggestion": details["ai_grade"],
+                                            "Current suggested Classroom grade": details["display_grade"],
+                                            "Teacher review": details["approval_status"],
+                                            "Reliability": details["reliability"],
+                                        })
+                                    else:
+                                        summary_rows.append({
+                                            "Student": row["student"], "Status": row["status"],
+                                            "Scope": "—", "Score": "—", "Percentage": "—",
+                                            "Original AI suggestion": "—",
+                                            "Current suggested Classroom grade": "—",
+                                            "Teacher review": "—", "Reliability": row.get("reason") or "—",
+                                        })
+                                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
                                 st.info(
-                                    "Scores are not written to Classroom. Enter the score or "
-                                    "'Suggested Classroom grade' shown above into the gradebook "
-                                    "yourself for each student."
+                                    "Grades are suggestions only and are NOT written to Google Classroom. "
+                                    "Sampled grades describe only the marked questions; they are not equivalent "
+                                    "to grading the entire assignment. Review question marks before entering a grade."
                                 )
-
                                 marked_rows = [r for r in processed_rows if r["status"] == "Marked"]
-
                                 if marked_rows:
                                     st.subheader("🧑‍🎓 Individual student reports")
-
                                     for row in marked_rows:
+                                        details = classroom_grade_details(row, places)
+                                        student_key = f"classroom_{row['submission_id']}"
                                         with st.expander(
-                                            f"{row['student']} — {row['score']} ({row['percentage']})"
+                                            f"{row['student']} — {details['score']} "
+                                            f"({details['percentage']}) — {details['approval_status']}"
                                         ):
+                                            st.markdown(f"**Assessment scope:** {details['sample']}")
+                                            st.markdown(
+                                                f"**Original AI suggested grade:** {details['ai_grade']}  |  "
+                                                f"**Current suggested grade:** {details['display_grade']} "
+                                                f"/ {row.get('classroom_max_points') or '—'}"
+                                            )
+                                            if details["low"] or details["medium"] or details["audit_failure"] or details["incomplete"]:
+                                                st.warning(
+                                                    f"Teacher review advised: {details['low']} Low-confidence, "
+                                                    f"{details['medium']} Medium-confidence questions."
+                                                    + (" The audit did not complete." if details["audit_failure"] else "")
+                                                    + (" Not all selected questions were found." if details["incomplete"] else "")
+                                                )
+                                            if row.get("selected_questions") is not None:
+                                                st.caption(
+                                                    "Selected question numbers: "
+                                                    + ", ".join(row["selected_questions"])
+                                                )
+                                            st.checkbox(
+                                                "I reviewed this result and approve this suggested Classroom grade",
+                                                key=f"classroom_approval_checkbox_{row['submission_id']}",
+                                                value=details["approved"],
+                                                on_change=lambda k=student_key, sid=row["submission_id"]:
+                                                    st.session_state.setdefault("classroom_grade_approvals", {}).__setitem__(
+                                                        k, st.session_state[f"classroom_approval_checkbox_{sid}"]
+                                                    ),
+                                            )
                                             render_student_report(
-                                                row["student"],
-                                                row["result"],
-                                                row["totals"],
-                                                row["groups"],
-                                                row["marking_model"],
-                                                row["audit_model"],
-                                                student_key=f"classroom_{row['student']}",
+                                                row["student"], row["result"], row["totals"],
+                                                row["groups"], row["marking_model"], row["audit_model"],
+                                                student_key=student_key,
                                             )
                             elif last_result:
                                 st.info(last_result["message"])
