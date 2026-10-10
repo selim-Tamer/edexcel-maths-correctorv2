@@ -819,6 +819,11 @@ def _arithmetic_equals_issues(explanation):
         right_match = leading.match(pieces[i + 1])
         if not left_match or not right_match:
             continue
+        # A partial numeric tail in a symbolic expression is not an equality
+        # we can check: e.g. "a + 7 = 15" must not become "7 = 15".
+        left_prefix = pieces[i][:left_match.start()]
+        if re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", left_prefix):
+            continue
         left_text, right_text = left_match.group(1), right_match.group(1)
         lhs = _numeric_expression_value(left_text)
         rhs = _numeric_expression_value(right_text)
