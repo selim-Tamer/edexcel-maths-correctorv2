@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.8"
+APP_VERSION = "3.3.9"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -1005,7 +1005,7 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
     """
     warnings = list(result.get("validation_warnings", []))
     unclear = re.compile(
-        r"\b(unreadable|not shown|not visible|not provided|unclear|illegible|unknown)\b", re.I
+        r"\b(unreadable|not shown|not visible|not provided|illegible)\b", re.I
     )
     for q in result.get("questions", []):
         number = str(q.get("question_number", "")).strip()
@@ -1112,6 +1112,15 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
                         f"({part}) differs from the recorded official answer; "
                         "check the original handwriting and scheme."
                     )
+
+        # A self-correction in the model's transcript may be its own guess,
+        # not handwriting. A full-credit result needs teacher review when
+        # this text contains conflicting attempts or uncertainties.
+        if re.search(r"\\b(wait|actually|ignore that|correction:|student wrote|\\?\\s*wait)\\b", working, re.I):
+            problems.append(
+                "AI-transcribed working includes a self-correction or an uncertain "
+                "reconstruction; compare directly with the handwritten page."
+            )
 
         # Arithmetic in the alleged student's working is separate from
         # arithmetic in the official solution and needs its own check.
@@ -2296,6 +2305,7 @@ Before returning:
 - include an M/A/B breakdown for EVERY awarded mark with visible handwriting evidence,
 - student_answer must transcribe what the student wrote, not the mark scheme,
 - working_summary must identify actual visible working, or say unreadable/not shown,
+- do not write your own self-corrections or guessed alternate steps in working_summary; if unreadable report uncertainty instead,
 - cross-check each part of the full-mark solution with the official mark scheme,
 - if the answer cannot be read from the student PDF, mark Low confidence; never invent evidence,
 - explain lost marks,
