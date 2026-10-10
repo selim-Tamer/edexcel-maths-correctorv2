@@ -475,6 +475,9 @@ def render_teacher_override_controls(student_key: str, result: dict):
         reasons.setdefault(student_key, {})[selected] = reason
         if student_key.startswith("classroom_"):
             st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
+            # Streamlit checkbox state must be reset as well as approval metadata.
+            submission_id = student_key[len("classroom_"):]
+            st.session_state[f"classroom_approval_checkbox_{submission_id}"] = False
         st.rerun()
 
 
@@ -1255,9 +1258,7 @@ def mark_one_classroom_submission(
         max_points = coursework.get("maxPoints")
         suggested_classroom_grade = None
         if max_points and float(max_points) > 0 and available:
-            suggested_classroom_grade = round(
-                (earned / available) * float(max_points), 2
-            )
+            suggested_classroom_grade = (earned / available) * float(max_points)
 
         return {
             "submission_id": submission_id,
