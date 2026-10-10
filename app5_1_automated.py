@@ -949,15 +949,21 @@ def _final_numeric_answer_for_part(text, part):
         numerator, denominator = candidate.split("/", 1)
         if float(denominator) == 0:
             return None
-        return float(numerator) / float(denominator)
-    return float(candidate)
+        return float(numerator) / float(denominator), 1e-8
+    # One or more displayed decimal places can legitimately represent a
+    # rounded answer. Whole-number answers remain exact.
+    if "." in candidate:
+        decimals = len(candidate.split(".")[-1])
+        return float(candidate), 0.5 * (10 ** (-decimals)) + 1e-8
+    return float(candidate), 1e-8
 
 
 def _numeric_answers_disagree(first, second):
     if first is None or second is None:
         return False
-    # Allow rounding only to the precision of the *displayed* answer.
-    return abs(first - second) > 1e-8
+    first_value, first_tolerance = first
+    second_value, second_tolerance = second
+    return abs(first_value - second_value) > max(first_tolerance, second_tolerance)
 
 
 def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
@@ -1055,6 +1061,31 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
                 problems.append(
                     "Listed frequency products do not add to the transcribed total; "
                     "recheck the handwriting."
+                )
+
+        # Check a specific, explicitly described combined-total relationship.
+        # A reported mean A/B may be right while its transcribed totals are
+        # inconsistent, as in the recent Question 49 report.
+        class_total = re.search(
+            r"\btotal\s+for\s+class\s+a\s*=\s*(\d+(?:\.\d+)?)",
+            working, re.I,
+        )
+        overall_total = re.search(
+            r"\b(?:grand|overall|combined|total)\s*=\s*(\d+(?:\.\d+)?)",
+            working, re.I,
+        )
+        class_b_mean = re.search(
+            r"\bclass\s+b\s+mean\s*=\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",
+            working, re.I,
+        )
+        if class_total and overall_total and class_b_mean:
+            a_total = float(class_total.group(1))
+            combined_total = float(overall_total.group(1))
+            b_total_claimed = float(class_b_mean.group(1))
+            if abs((combined_total - a_total) - b_total_claimed) > 1e-8:
+                problems.append(
+                    "Transcribed group totals conflict with the claimed second-group "
+                    "mean numerator; recheck the student's written calculations."
                 )
 
         if problems:
