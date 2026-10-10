@@ -1097,6 +1097,22 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
                             )
                         break
 
+        # Check individually labeled (a)/(b)/(c) student final answers
+        # against clear numeric scheme answers only if full marks were awarded.
+        # Skip prose responses and ambiguous numerical expressions.
+        if awarded == int(q.get("max_marks", 0)) and student:
+            student_parts = set(re.findall(r"\(([a-z])\)", student, re.I))
+            scheme_parts = set(re.findall(r"\(([a-z])\)", official, re.I))
+            for part in sorted(student_parts & scheme_parts):
+                student_final = _final_numeric_answer_for_part(student, part)
+                scheme_final = _final_numeric_answer_for_part(official, part)
+                if _numeric_answers_disagree(student_final, scheme_final):
+                    problems.append(
+                        f"Full marks awarded but transcribed student answer to part "
+                        f"({part}) differs from the recorded official answer; "
+                        "check the original handwriting and scheme."
+                    )
+
         # Arithmetic in the alleged student's working is separate from
         # arithmetic in the official solution and needs its own check.
         for equality in _arithmetic_equals_issues(working):
