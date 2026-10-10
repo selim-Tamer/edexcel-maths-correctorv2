@@ -5,6 +5,11 @@ boundaries fail closed until a test supplies an explicit fake. No real SDKs
 or third-party packages are installed by the offline suite.
 """
 import ast
+import copy
+import hashlib
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from queue import Queue, Empty
 import io
 import json
 import os
@@ -21,7 +26,9 @@ SOURCE = Path(__file__).resolve().parents[1] / "app5_1_automated.py"
 def load_app():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     scope = dict(ast=ast, io=io, json=json, os=os, re=re,
-                 tempfile=tempfile, time=time)
+                 tempfile=tempfile, time=time, copy=copy, hashlib=hashlib, uuid=uuid,
+                 ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed,
+                 wait=wait, FIRST_COMPLETED=FIRST_COMPLETED, Queue=Queue, Empty=Empty)
     for node in tree.body:
         if isinstance(node, ast.Assign):
             try:
