@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.6"
+APP_VERSION = "3.3.7"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -755,7 +755,7 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
                 warnings.append(f"Question {number}: mark-scheme maximum not verified.")
             elif int(q.get("max_marks", 0)) != scheme_maxima[number]:
                 warnings.append(
-                    f"Question {number}: AI maximum {q['max_marks']} vs "
+                    f"Question {number} [Mark-scheme disagreement]: AI maximum {q['max_marks']} vs "
                     f"mark-scheme reference {scheme_maxima[number]}. "
                     "Teacher must verify the question's marks and maximum."
                 )
@@ -815,11 +815,11 @@ def _numeric_expression_value(expression):
 
 
 def _arithmetic_equals_issues(explanation):
-    """Check complete, chained numeric equalities without truncating expressions.
+    """Check complete, unambiguous numerical equalities (no labels mistaken for operands).
 
-    This is deliberately conservative: ambiguous prose or algebra containing
-    variables is skipped, not guessed. Each side of a chain is evaluated in
-    full; 'a+b = c+d = total' is checked as two separate equalities.
+    Skip the first '=' in 'Sum of 5 = 5*398 = 1990', 'Q1 = 6',
+    'Divided by 80 = 66.375', etc. The genuine subsequent arithmetic
+    equality '5*398 = 1990' is still checked.
     """
     operand = r"-?\d+(?:\.\d+)?"
     expr = operand + r"(?:\s*[+*/×÷xX-]\s*" + operand + r")*"
@@ -828,7 +828,6 @@ def _arithmetic_equals_issues(explanation):
     pieces = explanation.split("=")
     issues = []
     for i in range(len(pieces) - 1):
-        # Ignore <=, >=, !=, == and non-mathematical equal signs.
         if pieces[i].rstrip().endswith(("<", ">", "!", "=")):
             continue
         if pieces[i + 1].lstrip().startswith("="):
@@ -837,27 +836,32 @@ def _arithmetic_equals_issues(explanation):
         right_match = leading.match(pieces[i + 1])
         if not left_match or not right_match:
             continue
-        # A partial numeric tail in a symbolic expression is not an equality
-        # we can check: e.g. "a + 7 = 15" must not become "7 = 15".
-        left_prefix = pieces[i][:left_match.start()]
-        if re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", left_prefix):
+        # Reject numbers embedded in labels: Q1, Q3, M2, and so on.
+        left_piece = pieces[i]
+        prefix = left_piece[:left_match.start()]
+        if prefix and (prefix[-1].isalnum() or prefix[-1] in "_."):
+            continue
+        # If the numerical LHS has a prose prefix, evaluate only when it
+        # clearly follows punctuation that introduces a calculation.
+        # A prior '=' is already separated into another piece.
+        fragment = re.split(r"[;:\n]", prefix)[-1].strip()
+        if re.search(r"[A-Za-z]", fragment):
+            continue
+        if re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", prefix):
             continue
         left_text, right_text = left_match.group(1), right_match.group(1)
         lhs = _numeric_expression_value(left_text)
         rhs = _numeric_expression_value(right_text)
         if lhs is None or rhs is None:
             continue
-        # Rounded decimal output is allowed, but an incorrect exact
-        # integer result is NOT waved through as a rounding difference.
-        if re.fullmatch(r"-?\d+", right_text.strip()):
-            tolerance = 1e-8
-        elif re.fullmatch(r"-?\d+\.\d+", right_text.strip()):
-            decimal_places = len(right_text.strip().split(".")[1])
-            tolerance = 0.5 * 10 ** (-decimal_places) + 1e-8
+        shown = right_text.strip()
+        if re.fullmatch(r"-?\d+\.\d+", shown):
+            decimals = len(shown.split(".")[1])
+            tolerance = 0.5 * 10 ** (-decimals) + 1e-8
         else:
             tolerance = 1e-8
         if abs(lhs - rhs) > tolerance:
-            issues.append(f"{left_text.strip()} = {right_text.strip()}")
+            issues.append(f"{left_text.strip()} = {shown}")
     return list(dict.fromkeys(issues))
 
 
@@ -1045,22 +1049,23 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
         # arithmetic in the official solution and needs its own check.
         for equality in _arithmetic_equals_issues(working):
             problems.append(
-                f"Transcribed student working contains a questionable equality: {equality}."
+                f"AI-transcribed working contains an inconsistent numerical equality: {equality}."
             )
 
         # E.g. 'Products: 138, 252, 144, 245, 100, 51; sum = 960'
         # must be internally consistent; skip mixed prose/expressions.
         product_list = re.search(
             r"\bproducts?\s*:\s*((?:-?\d+(?:\.\d+)?\s*,\s*){2,}-?\d+(?:\.\d+)?)"
-            r"\s*;\s*sum\s*=\s*(-?\d+(?:\.\d+)?)\b", working, re.I
+            r"\s*[.;]?\s*(?:total(?:\s+sum)?|sum)\s*=\s*(-?\d+(?:\.\d+)?)\b",
+            working, re.I,
         )
         if product_list:
             values = [float(v.strip()) for v in product_list.group(1).split(",")]
             total = float(product_list.group(2))
             if abs(sum(values) - total) > 1e-8:
                 problems.append(
-                    "Listed frequency products do not add to the transcribed total; "
-                    "recheck the handwriting."
+                    "Listed frequency products do not add to the AI-transcribed total; "
+                    "check the original handwritten values."
                 )
 
         # Check a specific, explicitly described combined-total relationship.
@@ -1090,10 +1095,17 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
 
         if problems:
             q["confidence"] = "Low"
-            warnings.extend(
-                f"Question {number}: {issue} Teacher review required."
-                for issue in dict.fromkeys(problems)
-            )
+            for issue in dict.fromkeys(problems):
+                if ("transcribed" in issue.lower() or "frequency products" in issue.lower()
+                        or "group totals" in issue.lower()):
+                    category = "AI transcription inconsistency"
+                elif "final answer differs" in issue.lower() or "official answer" in issue.lower():
+                    category = "Mark-scheme disagreement"
+                else:
+                    category = "Insufficient marking evidence"
+                warnings.append(
+                    f"Question {number} [{category}]: {issue} Teacher review required."
+                )
     result["validation_warnings"] = list(dict.fromkeys(warnings))
     result["grade_unverified"] = bool(result["validation_warnings"])
     return result
