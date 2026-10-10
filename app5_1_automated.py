@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.2"
+APP_VERSION = "3.3.3"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -381,7 +381,8 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
         lines.append("## Mark-scheme validation warnings — teacher review required")
         lines.extend(f"- {x}" for x in result["validation_warnings"])
         lines.append("")
-    lines.append("Explanation verification: automatic arithmetic checks only; teacher review is still needed.")
+    lines.append("Score status: UNVERIFIED — teacher review required." if result.get("validation_warnings") else "Score status: Provisional AI score; not independently certified.")
+    lines.append("Explanation verification: conservative Python arithmetic checks only; teacher review is still needed.")
     lines.append("")
     lines.append("## Question breakdown")
 
@@ -518,7 +519,7 @@ def classroom_grade_details(row, rounding_places=2):
         "approved": approval,
         "approval_status": "Teacher approved" if approval else "Pending review",
         "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
-        "reliability": "Review recommended" if requires_review else "No validation/confidence flags (not independently certified)",
+        "reliability": "UNVERIFIED — teacher review required" if requires_review else "Provisional AI grade (not independently certified)",
         "low": low,
         "medium": medium,
         "audit_failure": audit_failure,
@@ -529,10 +530,12 @@ def classroom_grade_details(row, rounding_places=2):
 
 def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None):
     """Render the full single-student report (metrics, notes, groups, per-question detail)."""
+    if result.get("validation_warnings"):
+        st.warning("UNVERIFIED MARKING RESULT — issues need teacher review before this score is trusted.")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Score", f"{totals['earned']} / {totals['available']}")
+    c1.metric("Score" + (" (unverified)" if result.get("validation_warnings") else " (AI provisional)"), f"{totals['earned']} / {totals['available']}")
     c2.metric("Percentage", f"{totals['percentage']:.2f}%")
-    c3.metric("Provisional band", f"Grade {totals['provisional_grade']}")
+    c3.metric("Unverified band" if result.get("validation_warnings") else "Provisional band", f"Grade {totals['provisional_grade']}")
     c4.metric("Questions marked", len(result["questions"]))
 
     info = result["paper_info"]
@@ -793,19 +796,51 @@ def _numeric_expression_value(expression):
         return None
 
 
-def verify_math_explanations(result):
-    """Zero-token arithmetic sanity checks on explanations, NOT student grading.
+def _arithmetic_equals_issues(explanation):
+    """Check complete, chained numeric equalities without truncating expressions.
 
-    This detects simple arithmetic errors, contradictory self-corrections,
-    and incomplete feedback. It cannot prove an explanation or a mark correct.
+    This is deliberately conservative: ambiguous prose or algebra containing
+    variables is skipped, not guessed. Each side of a chain is evaluated in
+    full; 'a+b = c+d = total' is checked as two separate equalities.
     """
+    operand = r"-?\d+(?:\.\d+)?"
+    expr = operand + r"(?:\s*[+*/×÷xX-]\s*" + operand + r")*"
+    trailing = re.compile(r"(" + expr + r")\s*$")
+    leading = re.compile(r"^\s*(" + expr + r")(?![\d.])")
+    pieces = explanation.split("=")
+    issues = []
+    for i in range(len(pieces) - 1):
+        # Ignore <=, >=, !=, == and non-mathematical equal signs.
+        if pieces[i].rstrip().endswith(("<", ">", "!", "=")):
+            continue
+        if pieces[i + 1].lstrip().startswith("="):
+            continue
+        left_match = trailing.search(pieces[i])
+        right_match = leading.match(pieces[i + 1])
+        if not left_match or not right_match:
+            continue
+        left_text, right_text = left_match.group(1), right_match.group(1)
+        lhs = _numeric_expression_value(left_text)
+        rhs = _numeric_expression_value(right_text)
+        if lhs is None or rhs is None:
+            continue
+        # Rounded decimal output is allowed, but an incorrect exact
+        # integer result is NOT waved through as a rounding difference.
+        if re.fullmatch(r"-?\d+", right_text.strip()):
+            tolerance = 1e-8
+        elif re.fullmatch(r"-?\d+\.\d+", right_text.strip()):
+            decimal_places = len(right_text.strip().split(".")[1])
+            tolerance = 0.5 * 10 ** (-decimal_places) + 1e-8
+        else:
+            tolerance = 1e-8
+        if abs(lhs - rhs) > tolerance:
+            issues.append(f"{left_text.strip()} = {right_text.strip()}")
+    return list(dict.fromkeys(issues))
+
+
+def verify_math_explanations(result):
+    """Use free Python checks to flag doubtful feedback, never alter awards."""
     warnings = list(result.get("validation_warnings", []))
-    arithmetic = re.compile(
-        r"(?<![\w.])"
-        r"(\d+(?:\.\d+)?\s*(?:[+*/×÷xX-]\s*\d+(?:\.\d+)?\s*){1,8})"
-        r"=\s*(-?\d+(?:\.\d+)?)"
-        r"(?!\s*[+*/×÷xX-])"
-    )
     for q in result.get("questions", []):
         number = str(q.get("question_number", "")).strip()
         explanations = [
@@ -819,27 +854,43 @@ def verify_math_explanations(result):
                 continue
             if re.search(r"\b(wait|actually|ignore that|correction:|let.s follow)\b", explanation, re.I):
                 problems.append(
-                    f"{label.capitalize()} contains a self-correction or contradiction; check against the mark scheme."
+                    f"{label.capitalize()} includes a self-correction; compare its conclusion with the mark scheme."
                 )
-            for match in arithmetic.finditer(explanation):
-                left = _numeric_expression_value(match.group(1))
-                right = _numeric_expression_value(match.group(2))
-                if left is None or right is None:
-                    continue
-                # Allow small display-rounding differences (e.g. 14.692 = 14.7).
-                shown = match.group(2).strip()
-                decimals = len(shown.split(".")[1]) if "." in shown else 0
-                tolerance = max(1e-8, 0.5 * 10 ** (-decimals) + 1e-8)
-                if abs(left - right) > tolerance:
-                    problems.append(
-                        f"{label.capitalize()} has a potentially incorrect equation: "
-                        f"{match.group(1).strip()} = {shown}."
-                    )
+            for equality in _arithmetic_equals_issues(explanation):
+                problems.append(
+                    f"{label.capitalize()} contains a potentially incorrect equality: {equality}."
+                )
+
+        # Detect an award/feedback contradiction without assuming the model
+        # transcribed the student's handwriting accurately.
+        if q.get("max_marks", 0) > 0 and q.get("awarded_marks") == q.get("max_marks"):
+            narrative = " ".join([
+                str(q.get("full_mark_solution", "")),
+                str(q.get("working_summary", "")),
+                str(q.get("loss_reason", "")),
+            ])
+            student_reference = re.search(
+                r"\b(student|student.s|student wrote|student gave|their answer)\b",
+                narrative, re.I
+            )
+            negative_judgement = re.search(
+                r"\b(incorrect|wrong|not correct|does not match|do not match|"
+                r"not satisfy|does not satisfy|should (?:award|receive) 0|"
+                r"award 0|0 marks|doesn.t match)\b",
+                narrative, re.I
+            )
+            if student_reference and negative_judgement:
+                problems.append(
+                    "AI awarded full marks but described the student's answer as "
+                    "incorrect or unworthy of full credit. Review handwritten evidence."
+                )
+
         if problems:
             q["confidence"] = "Low"
             for problem in dict.fromkeys(problems):
                 warnings.append(f"Question {number}: {problem} Teacher review required.")
     result["validation_warnings"] = list(dict.fromkeys(warnings))
+    result["grade_unverified"] = bool(result["validation_warnings"])
     return result
 
 
