@@ -698,6 +698,14 @@ def mark_one_submission(
     )
 
     result = normalise_result(raw_result)
+    if selected_questions is not None:
+        chosen = {str(n).strip() for n in selected_questions}
+        result["questions"] = [
+            q for q in result["questions"]
+            if str(q["question_number"]).strip() in chosen
+        ]
+        if not result["questions"]:
+            raise ValueError("Gemini did not return any of the selected homework questions.")
     audit_model = "Not run"
     audit_warning = None
 
@@ -1173,6 +1181,14 @@ def mark_one_classroom_submission(
         )
 
         result = normalise_result(raw_result)
+        if selected_questions is not None:
+            chosen = {str(n).strip() for n in selected_questions}
+            result["questions"] = [
+                q for q in result["questions"]
+                if str(q["question_number"]).strip() in chosen
+            ]
+            if not result["questions"]:
+                raise ValueError("Gemini did not return any of the selected homework questions.")
         audit_model = "Not run"
         audit_warning = None
 
