@@ -761,10 +761,13 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
                 )
                 q["confidence"] = "Low"
                 q["max_marks_reference"] = scheme_maxima[number]
-    if selected_questions is not None:
-        for number in selected_questions:
-            if str(number).strip() not in seen:
-                warnings.append(f"Selected question {number} is missing from the AI result.")
+    # A full-paper run can omit a question just as a selected-question run can.
+    # Use the extracted scheme as a review reference; never invent a score for it.
+    expected_questions = selected_questions if selected_questions is not None else (scheme_maxima or {})
+    for number in expected_questions:
+        if str(number).strip() not in seen:
+            source = "Selected" if selected_questions is not None else "Mark-scheme"
+            warnings.append(f"{source} question {number} is missing from the AI result.")
     result["validation_warnings"] = warnings
     result["max_marks_review_required"] = any("AI maximum" in w for w in warnings)
     return result
@@ -1529,48 +1532,45 @@ def classroom_request(method: str, url: str, token: str, **kwargs):
     return response.json()
 
 
+def classroom_list_all(token: str, url: str, item_key: str, params: dict):
+    """Read every page without silently truncating large classes."""
+    items = []
+    page_params = dict(params)
+    seen_tokens = set()
+    while True:
+        data = classroom_request("GET", url, token, params=dict(page_params))
+        items.extend(data.get(item_key, []))
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            return items
+        if next_token in seen_tokens:
+            raise RuntimeError("Google API repeated a pagination token; listing is incomplete.")
+        seen_tokens.add(next_token)
+        page_params["pageToken"] = next_token
+
+
 def list_teacher_courses(token: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses",
-        token,
-        params={
-            "teacherId": "me",
-            "courseStates": "ACTIVE",
-            "pageSize": 100,
-        },
+    return classroom_list_all(
+        token, f"{CLASSROOM_BASE}/courses", "courses",
+        {"teacherId": "me", "courseStates": "ACTIVE", "pageSize": 100},
     )
-    return data.get("courses", [])
 
 
 def list_assignments(token: str, course_id: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork",
-        token,
-        params={
-            "courseWorkStates": "PUBLISHED",
-            "pageSize": 100,
-        },
+    assignments = classroom_list_all(
+        token, f"{CLASSROOM_BASE}/courses/{course_id}/courseWork", "courseWork",
+        {"courseWorkStates": "PUBLISHED", "pageSize": 100},
     )
-    assignments = data.get("courseWork", [])
-    return [
-        item for item in assignments
-        if item.get("workType") == "ASSIGNMENT"
-    ]
+    return [item for item in assignments if item.get("workType") == "ASSIGNMENT"]
 
 
 def list_turned_in_submissions(token: str, course_id: str, coursework_id: str):
-    data = classroom_request(
-        "GET",
-        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
+    return classroom_list_all(
         token,
-        params={
-            "states": "TURNED_IN",
-            "pageSize": 100,
-        },
+        f"{CLASSROOM_BASE}/courses/{course_id}/courseWork/{coursework_id}/studentSubmissions",
+        "studentSubmissions",
+        {"states": "TURNED_IN", "pageSize": 100},
     )
-    return data.get("studentSubmissions", [])
 
 
 def get_user_profile(token: str, user_id: str):
