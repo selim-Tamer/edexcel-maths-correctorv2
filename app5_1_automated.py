@@ -753,7 +753,7 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
 def _numeric_expression_value(expression):
     """Safely evaluate simple numeric arithmetic; never use eval()."""
     expression = expression.replace("×", "*").replace("÷", "/")
-    expression = re.sub(r"(?<=\\d)\\s*[xX]\\s*(?=\\d)", "*", expression)
+    expression = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", expression)
     try:
         tree = ast.parse(expression.strip(), mode="eval")
     except (ValueError, SyntaxError):
@@ -801,10 +801,10 @@ def verify_math_explanations(result):
     """
     warnings = list(result.get("validation_warnings", []))
     arithmetic = re.compile(
-        r"(?<![\\w.])"
-        r"(\\d+(?:\\.\\d+)?\\s*(?:[+*/×÷xX-]\\s*\\d+(?:\\.\\d+)?\\s*){1,8})"
-        r"=\\s*(-?\\d+(?:\\.\\d+)?)"
-        r"(?!\\s*[+*/×÷xX-])"
+        r"(?<![\w.])"
+        r"(\d+(?:\.\d+)?\s*(?:[+*/×÷xX-]\s*\d+(?:\.\d+)?\s*){1,8})"
+        r"=\s*(-?\d+(?:\.\d+)?)"
+        r"(?!\s*[+*/×÷xX-])"
     )
     for q in result.get("questions", []):
         number = str(q.get("question_number", "")).strip()
@@ -817,7 +817,7 @@ def verify_math_explanations(result):
             if not explanation.strip():
                 problems.append(f"Missing {label}.")
                 continue
-            if re.search(r"\\b(wait|actually|ignore that|correction:|let.s follow)\\b", explanation, re.I):
+            if re.search(r"\b(wait|actually|ignore that|correction:|let.s follow)\b", explanation, re.I):
                 problems.append(
                     f"{label.capitalize()} contains a self-correction or contradiction; check against the mark scheme."
                 )
