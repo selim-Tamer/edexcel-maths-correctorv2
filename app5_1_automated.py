@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.4"
+APP_VERSION = "3.3.5"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -257,6 +257,7 @@ def normalise_result(data: dict) -> dict:
                 "mark_breakdown": cleaned_breakdown,
                 "correct_method": str(q.get("correct_method", "")).strip(),
                 "full_mark_solution": str(q.get("full_mark_solution", "")).strip(),
+                "scheme_answer_evidence": str(q.get("scheme_answer_evidence", "")).strip(),
                 "confidence": (
                     str(q.get("confidence", "Medium")).strip().title()
                     if str(q.get("confidence", "Medium")).strip().title()
@@ -395,6 +396,10 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
                 f"Loss reason: {q['loss_reason'] or 'None'}",
                 f"Correct method: {q['correct_method']}",
                 f"Full-mark solution: {q['full_mark_solution']}",
+                f"Official answer evidence: {q.get('scheme_answer_evidence', '')}",
+                f"Student answer transcribed: {q.get('student_answer', '')}",
+                f"Visible student working: {q.get('working_summary', '')}",
+                f"Mark-by-mark evidence: {json.dumps(q.get('mark_breakdown', []), ensure_ascii=False)}",
             ]
         )
 
@@ -658,6 +663,9 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
             st.markdown("**Correct method**")
             st.write(q["correct_method"] or "Not provided.")
+
+            st.markdown("**Official scheme answer evidence (AI-extracted)**")
+            st.write(q.get("scheme_answer_evidence") or "Not extracted; verify against the official PDF.")
 
             st.markdown("**Full-mark model solution**")
             st.write(q["full_mark_solution"] or "Not provided.")
@@ -1810,11 +1818,20 @@ CORE RULES
 12. Never exceed a question's maximum mark.
 13. Return one entry for every identifiable question in the student submission.
 14. For each lost mark, explain the precise mathematical/mark-scheme reason.
-15. Give a correct full-mark solution that a student can study.
+15. Give a correct full-mark solution by checking the official mark
+    scheme, not simply copying a guessed solution.
 16. Give each question a confidence label: High, Medium, or Low. Use Low when
     handwriting/diagrams are unclear, the evidence is ambiguous, the question
     match is uncertain, or the awarded mark is unusually difficult to justify.
 17. Keep the output factual and concise. Do not give a fake "official" grade.
+18. In student_answer transcribe ONLY the actual handwritten answer(s).
+    Never substitute the answer from the official mark scheme.
+19. In working_summary quote concrete student-written calculations,
+    steps or words. If no working is legible, say "unreadable" or "not shown".
+20. In mark_breakdown record each M/A/B award with a clear reason that
+    identifies actual student evidence and the scheme requirement.
+    Do not award a mark merely because the correct solution exists on
+    the supplied mark scheme. Flag ambiguous evidence as Low confidence.
 
 VERY IMPORTANT
 The application's Python code will calculate the total score and percentage.
@@ -1861,6 +1878,7 @@ OUTPUT_SCHEMA = {
                     },
                     "correct_method": {"type": "string"},
                     "full_mark_solution": {"type": "string"},
+                    "scheme_answer_evidence": {"type": "string"},
                     "confidence": {"type": "string"},
                 },
                 "required": [
@@ -1874,6 +1892,7 @@ OUTPUT_SCHEMA = {
                     "mark_breakdown",
                     "correct_method",
                     "full_mark_solution",
+                    "scheme_answer_evidence",
                     "confidence",
                 ],
             },
@@ -1998,7 +2017,11 @@ Before returning:
 - identify every question you can,
 - assign max marks from the mark scheme,
 - assign earned marks question-by-question,
-- record M/A/B-style evidence where available,
+- include an M/A/B breakdown for EVERY awarded mark with visible handwriting evidence,
+- student_answer must transcribe what the student wrote, not the mark scheme,
+- working_summary must identify actual visible working, or say unreadable/not shown,
+- cross-check each part of the full-mark solution with the official mark scheme,
+- if the answer cannot be read from the student PDF, mark Low confidence; never invent evidence,
 - explain lost marks,
 - provide a full-mark solution,
 - flag any unreadable or genuinely ambiguous evidence,
