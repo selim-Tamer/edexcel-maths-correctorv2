@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import re
@@ -47,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.3.2"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -380,6 +381,8 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
         lines.append("## Mark-scheme validation warnings — teacher review required")
         lines.extend(f"- {x}" for x in result["validation_warnings"])
         lines.append("")
+    lines.append("Explanation verification: automatic arithmetic checks only; teacher review is still needed.")
+    lines.append("")
     lines.append("## Question breakdown")
 
     for q in result["questions"]:
@@ -515,7 +518,7 @@ def classroom_grade_details(row, rounding_places=2):
         "approved": approval,
         "approval_status": "Teacher approved" if approval else "Pending review",
         "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
-        "reliability": "Review recommended" if requires_review else "No confidence flags",
+        "reliability": "Review recommended" if requires_review else "No validation/confidence flags (not independently certified)",
         "low": low,
         "medium": medium,
         "audit_failure": audit_failure,
@@ -584,9 +587,11 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
             st.write("No major revision areas were identified.")
 
     if result.get("validation_warnings"):
-        st.error("Mark-scheme validation needs teacher review; displayed grade is provisional.")
+        st.error("Mark-scheme or mathematical explanation checks need teacher review; displayed grade is provisional.")
         for warning in result["validation_warnings"]:
             st.write(f"• {warning}")
+
+    st.caption("Explanation verification uses Python arithmetic checks; it cannot certify handwriting, method marks, or every algebraic step.")
 
     if result["uncertainties"]:
         st.subheader("⚠️ Marking uncertainties")
@@ -744,6 +749,100 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
     return result
 
 
+
+def _numeric_expression_value(expression):
+    """Safely evaluate simple numeric arithmetic; never use eval()."""
+    expression = expression.replace("×", "*").replace("÷", "/")
+    expression = re.sub(r"(?<=\\d)\\s*[xX]\\s*(?=\\d)", "*", expression)
+    try:
+        tree = ast.parse(expression.strip(), mode="eval")
+    except (ValueError, SyntaxError):
+        return None
+
+    def value(node):
+        if isinstance(node, ast.Expression):
+            return value(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return float(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            v = value(node.operand)
+            return v if isinstance(node.op, ast.UAdd) else -v
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
+        ):
+            left, right = value(node.left), value(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if right == 0:
+                raise ZeroDivisionError
+            return left / right
+        raise ValueError("Unsupported arithmetic expression")
+
+    try:
+        if len(expression) > 120:
+            return None
+        result = value(tree)
+        if abs(result) > 1e12:
+            return None
+        return result
+    except (ValueError, TypeError, OverflowError, ZeroDivisionError):
+        return None
+
+
+def verify_math_explanations(result):
+    """Zero-token arithmetic sanity checks on explanations, NOT student grading.
+
+    This detects simple arithmetic errors, contradictory self-corrections,
+    and incomplete feedback. It cannot prove an explanation or a mark correct.
+    """
+    warnings = list(result.get("validation_warnings", []))
+    arithmetic = re.compile(
+        r"(?<![\\w.])"
+        r"(\\d+(?:\\.\\d+)?\\s*(?:[+*/×÷xX-]\\s*\\d+(?:\\.\\d+)?\\s*){1,8})"
+        r"=\\s*(-?\\d+(?:\\.\\d+)?)"
+        r"(?!\\s*[+*/×÷xX-])"
+    )
+    for q in result.get("questions", []):
+        number = str(q.get("question_number", "")).strip()
+        explanations = [
+            ("full-mark solution", str(q.get("full_mark_solution", ""))),
+            ("correct method", str(q.get("correct_method", ""))),
+        ]
+        problems = []
+        for label, explanation in explanations:
+            if not explanation.strip():
+                problems.append(f"Missing {label}.")
+                continue
+            if re.search(r"\\b(wait|actually|ignore that|correction:|let.s follow)\\b", explanation, re.I):
+                problems.append(
+                    f"{label.capitalize()} contains a self-correction or contradiction; check against the mark scheme."
+                )
+            for match in arithmetic.finditer(explanation):
+                left = _numeric_expression_value(match.group(1))
+                right = _numeric_expression_value(match.group(2))
+                if left is None or right is None:
+                    continue
+                # Allow small display-rounding differences (e.g. 14.692 = 14.7).
+                shown = match.group(2).strip()
+                decimals = len(shown.split(".")[1]) if "." in shown else 0
+                tolerance = max(1e-8, 0.5 * 10 ** (-decimals) + 1e-8)
+                if abs(left - right) > tolerance:
+                    problems.append(
+                        f"{label.capitalize()} has a potentially incorrect equation: "
+                        f"{match.group(1).strip()} = {shown}."
+                    )
+        if problems:
+            q["confidence"] = "Low"
+            for problem in dict.fromkeys(problems):
+                warnings.append(f"Question {number}: {problem} Teacher review required.")
+    result["validation_warnings"] = list(dict.fromkeys(warnings))
+    return result
+
+
 def select_spread_questions(question_numbers, count):
     """Stratified sampling across the complete ordered homework, shared by a batch."""
     numbers = list(dict.fromkeys(str(x).strip() for x in question_numbers if str(x).strip()))
@@ -864,6 +963,7 @@ def mark_one_submission(
             audit_warning = str(audit_error)
 
     result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
+    result = verify_math_explanations(result)
     earned, available, percentage = calculate_totals(result)
     provisional_grade = percentage_band_grade(percentage)
     groups = make_group_rows(result["questions"])
@@ -1351,6 +1451,7 @@ def mark_one_classroom_submission(
                 audit_warning = str(audit_error)
 
         result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
+        result = verify_math_explanations(result)
         earned, available, percentage = calculate_totals(result)
         provisional_grade = percentage_band_grade(percentage)
         groups = make_group_rows(result["questions"])
@@ -2407,7 +2508,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                     f"{details['medium']} Medium-confidence questions."
                                                     + (" The audit did not complete." if details["audit_failure"] else "")
                                                     + (" Not all selected questions were found." if details["incomplete"] else "")
-                                                    + (" Question maximum marks need verification." if row["result"].get("validation_warnings") else "")
+                                                    + (" Mark scheme or explanation needs verification." if row["result"].get("validation_warnings") else "")
                                                 )
                                             if row.get("selected_questions") is not None:
                                                 st.caption(
