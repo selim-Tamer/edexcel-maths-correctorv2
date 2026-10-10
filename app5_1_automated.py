@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -55,17 +55,13 @@ PRIMARY_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
 ]
 AUDIT_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash-lite",
 ]
 GROUP_SIZE = 5
 
@@ -662,10 +658,7 @@ def discover_question_numbers(client, mark_scheme_file, question_file=None):
             return numbers
         except Exception as exc:
             errors.append(f"{model}: {exc}")
-            if is_quota_error(exc):
-                _QUOTA_BLOCKED_UNTIL[model] = time.monotonic() + (
-                    21600 if is_daily_quota_exhausted_error(exc) else 90
-                )
+            remember_model_failure(model, exc)
     raise RuntimeError("Could not identify questions for random marking. " + " | ".join(errors))
 
 
@@ -1629,6 +1622,24 @@ def model_on_quota_cooldown(model_name: str) -> bool:
     return True
 
 
+def is_model_unavailable_error(exc: Exception) -> bool:
+    """Identify a retired or inaccessible model, not an ordinary timeout."""
+    message = str(exc).lower()
+    return (
+        ("404" in message or "not_found" in message)
+        and ("model" in message or "not available" in message)
+    )
+
+
+def remember_model_failure(model_name: str, exc: Exception):
+    """Avoid repeatedly calling unavailable models and rate-limited models."""
+    if is_model_unavailable_error(exc):
+        _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + 86400
+    elif is_quota_error(exc):
+        cooldown_seconds = 21600 if is_daily_quota_exhausted_error(exc) else 90
+        _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + cooldown_seconds
+
+
 def is_quota_error(exc: Exception) -> bool:
     """Detect quota exhaustion, including minute-level limits."""
     message = str(exc).lower()
@@ -1733,9 +1744,7 @@ Do not calculate the final total as a free-form narrative. The application will 
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
 
-                if is_quota_error(exc):
-                    cooldown_seconds = 21600 if is_daily_quota_exhausted_error(exc) else 90
-                    _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + cooldown_seconds
+                remember_model_failure(model_name, exc)
 
                 # Daily free-tier quota exhaustion will not be fixed by waiting
                 # a couple of seconds or retrying this same model. Skip straight
@@ -1756,9 +1765,9 @@ Do not calculate the final total as a free-form narrative. The application will 
                         )
                     break
 
-                if is_temporary_model_error(exc) and attempt == 0:
-                    time.sleep(2)
-                    continue
+                # Do not repeat a costly generation after a timeout; try the next model.
+                if is_model_unavailable_error(exc) and status_callback:
+                    status_callback(f"⏭️ Skipping unavailable model {model_name}")
 
                 break
 
@@ -1851,10 +1860,7 @@ def audit_result(client, result, student_file, mark_scheme_file, model_names, st
             return updated, model
         except Exception as exc:
             errors.append(f"{model}: {exc}")
-            if is_quota_error(exc):
-                _QUOTA_BLOCKED_UNTIL[model] = time.monotonic() + (
-                    21600 if is_daily_quota_exhausted_error(exc) else 90
-                )
+            remember_model_failure(model, exc)
     raise RuntimeError("Low-confidence audit models failed. " + " | ".join(errors))
 
 
