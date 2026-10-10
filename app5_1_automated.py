@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.1.2"
+APP_VERSION = "3.2.0"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -609,6 +609,66 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         st.code(json.dumps(result, indent=2, ensure_ascii=False), language="json")
 
 
+
+def select_spread_questions(question_numbers, count):
+    """Stratified sampling across the complete ordered homework, shared by a batch."""
+    numbers = list(dict.fromkeys(str(x).strip() for x in question_numbers if str(x).strip()))
+    if not numbers:
+        raise ValueError("No question numbers were identified in the mark scheme.")
+    count = min(max(1, int(count)), len(numbers))
+    return [
+        random.choice(numbers[(i * len(numbers)) // count:((i + 1) * len(numbers)) // count])
+        for i in range(count)
+    ]
+
+
+def discover_question_numbers(client, mark_scheme_file, question_file=None):
+    """One small metadata call per batch; never guess how many questions exist."""
+    contents = [mark_scheme_file]
+    if question_file is not None:
+        contents.append(question_file)
+    contents.append(
+        "Identify all distinct MAIN question numbers, in their original order, "
+        "in this mathematics homework. Return a JSON object with one key "
+        "'question_numbers' containing an array of strings. "
+        "For parts (a), (b), etc., use the parent question number only. "
+        "Do not include page numbers, mark codes, or example question numbers. "
+        "Do not invent questions."
+    )
+    errors = []
+    for model in PRIMARY_MODELS:
+        if model_on_quota_cooldown(model):
+            continue
+        try:
+            response = client.models.generate_content(
+                model=model, contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "object",
+                        "properties": {
+                            "question_numbers": {
+                                "type": "array", "items": {"type": "string"}
+                            }
+                        },
+                        "required": ["question_numbers"],
+                    },
+                ),
+            )
+            numbers = extract_json(response.text).get("question_numbers", [])
+            numbers = list(dict.fromkeys(str(n).strip() for n in numbers if str(n).strip()))
+            if not numbers:
+                raise ValueError("No homework question numbers found.")
+            return numbers
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+            if is_quota_error(exc):
+                _QUOTA_BLOCKED_UNTIL[model] = time.monotonic() + (
+                    21600 if is_daily_quota_exhausted_error(exc) else 90
+                )
+    raise RuntimeError("Could not identify questions for random marking. " + " | ".join(errors))
+
+
 def mark_one_submission(
     client,
     student_name: str,
@@ -616,6 +676,7 @@ def mark_one_submission(
     mark_scheme_file,
     question_file,
     audit_enabled: bool,
+    selected_questions=None,
 ):
     """
     Mark one student's already-uploaded file(s) and return a result dict.
@@ -633,6 +694,7 @@ def mark_one_submission(
         mark_scheme_file=mark_scheme_file,
         question_file=question_file,
         status_callback=None,
+        selected_questions=selected_questions,
     )
 
     result = normalise_result(raw_result)
@@ -1036,6 +1098,7 @@ def mark_one_classroom_submission(
     mark_scheme_remote,
     audit_enabled: bool,
     progress_queue=None,
+    selected_questions=None,
 ):
     """
     Mark one Classroom submission's attachment(s) and return a result dict.
@@ -1106,6 +1169,7 @@ def mark_one_classroom_submission(
             mark_scheme_file=mark_scheme_remote,
             question_file=None,
             status_callback=report_stage,
+            selected_questions=selected_questions,
         )
 
         result = normalise_result(raw_result)
@@ -1198,6 +1262,7 @@ def run_classroom_marking_job(
     mark_scheme_upload,
     audit_enabled: bool,
     already_processed_ids: set,
+    random_count=None,
 ):
     """
     Find TURNED_IN submissions not yet processed this session and mark their
@@ -1234,6 +1299,18 @@ def run_classroom_marking_job(
 
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
     processed = []
+    selected_questions = None
+    if random_count is not None:
+        try:
+            numbers = discover_question_numbers(client, mark_scheme_remote)
+            selected_questions = select_spread_questions(numbers, random_count)
+            st.info("Random questions (same for all students): " + ", ".join(selected_questions))
+        except Exception:
+            try:
+                client.files.delete(name=mark_scheme_remote.name)
+            except Exception:
+                pass
+            raise
 
     try:
         max_workers = 1
@@ -1261,6 +1338,7 @@ def run_classroom_marking_job(
                     mark_scheme_remote,
                     audit_enabled,
                     progress_queue,
+                    selected_questions,
                 ): submission
                 for submission in pending
             }
@@ -1552,6 +1630,7 @@ def grade_with_model(
     mark_scheme_file,
     question_file=None,
     status_callback=None,
+    selected_questions=None,
 ):
     """
     Try several current Gemini models automatically.
@@ -1585,6 +1664,17 @@ Before returning:
 
 Do not calculate the final total as a free-form narrative. The application will calculate it from the individual question marks.
 """
+
+    if selected_questions is not None:
+        selected = [str(q).strip() for q in selected_questions]
+        prompt += (
+            "\\nSTRICT SELECTION: Mark ONLY these main questions: "
+            + ", ".join(selected)
+            + ". Include all parts of each selected question. "
+            "Do not mark, return, or assign scores to unselected questions. "
+            "Return one question entry per selected main question if identifiable. "
+            "Treat the listed question identifiers as authoritative.\\n"
+        )
 
     if isinstance(student_file, (list, tuple)):
         student_files = list(student_file)
@@ -1662,154 +1752,94 @@ Do not calculate the final total as a free-form narrative. The application will 
     )
 
 
-def audit_result(
-    client,
-    result,
-    student_file,
-    mark_scheme_file,
-    model_names,
-    status_callback=None,
-):
-    """
-    Independently audit up to 10 randomly selected questions, then merge
-    those audited questions back into the complete first-pass result.
-    Supports multiple student files/pages.
-    """
-    all_questions = result.get("questions", [])
-    # Intelligent audit: prioritise questions most likely to contain a marking
-    # error, then fill the remaining slots with a random sample.
-    high_priority = [
-        q for q in all_questions
-        if q.get("confidence") == "Low"
-        or (
-            0 < int(q.get("awarded_marks", 0) or 0)
-            < int(q.get("max_marks", 0) or 0)
-        )
-        or bool(q.get("loss_reason"))
+def audit_result(client, result, student_file, mark_scheme_file, model_names, status_callback=None):
+    """Audit ONLY Low-confidence questions; send compact evidence and return deltas."""
+    questions = result.get("questions", [])
+    low = [q for q in questions if str(q.get("confidence", "")).lower() == "low"]
+    if not low:
+        return result, "Skipped (no Low-confidence questions)"
+
+    compact = [
+        {
+            "question_number": q["question_number"],
+            "max_marks": q["max_marks"],
+            "awarded_marks": q["awarded_marks"],
+            "student_answer": q["student_answer"],
+            "working_summary": q["working_summary"],
+            "loss_reason": q["loss_reason"],
+            "mark_breakdown": q["mark_breakdown"],
+        }
+        for q in low
     ]
-    priority_ids = {id(q) for q in high_priority}
-    if len(high_priority) >= 10:
-        selected_questions = random.sample(high_priority, 10)
-    else:
-        remaining_pool = [q for q in all_questions if id(q) not in priority_ids]
-        fill_count = min(10 - len(high_priority), len(remaining_pool))
-        selected_questions = high_priority + (
-            random.sample(remaining_pool, fill_count) if fill_count else []
-        )
-
-    selected_numbers = {str(q.get("question_number", "")).strip() for q in selected_questions}
-    audit_input = dict(result)
-    audit_input["questions"] = selected_questions
-
-    audit_prompt = f"""
-You are performing a second-pass audit of an automated mathematics marking report.
-
-IMPORTANT SCOPE LIMIT:
-Audit ONLY the questions listed in the FIRST-PASS REPORT below. This report
-contains a random sample of up to 10 questions, not the whole paper. Do not
-attempt to audit, add, or invent any other questions. Return the corrected
-JSON in the requested schema, with the questions array containing only these
-provided questions.
-
-Compare these selected questions against the actual student submission file(s)
-and the official mark scheme. Correct question-level marks that are not
-supported by the mark scheme. Pay particular attention to:
-- M/A/B mark logic
-- ECF/follow-through
-- ISW
-- arithmetic in the student's working
-- omitted vs shown working
-- maximum marks
-- question matching
-- diagrams and geometry
-- algebraic equivalence
-
-Do NOT change a mark merely because another valid method exists.
-Do NOT invent evidence that is not visible.
-
-FIRST-PASS REPORT (SELECTED QUESTIONS ONLY):
-{json.dumps(audit_input, ensure_ascii=False)}
-"""
-
-    if isinstance(student_file, (list, tuple)):
-        student_files = list(student_file)
-    else:
-        student_files = [student_file]
-
-    contents = student_files + [mark_scheme_file, audit_prompt]
+    prompt = (
+        "Independently recheck ONLY these Low-confidence maths questions using "
+        "the student files and official mark scheme. Verify M/A/B, ECF, ISW, "
+        "diagrams and shown working. Return compact corrections only: "
+        "question_number, awarded_marks, reason. Keep a mark unchanged if justified. "
+        "Never invent evidence or add questions.\\n"
+        + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    )
+    student_files = list(student_file) if isinstance(student_file, (list, tuple)) else [student_file]
+    contents = student_files + [mark_scheme_file, prompt]
+    schema = {
+        "type": "object",
+        "properties": {
+            "corrections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question_number": {"type": "string"},
+                        "awarded_marks": {"type": "integer"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["question_number", "awarded_marks", "reason"],
+                },
+            }
+        },
+        "required": ["corrections"],
+    }
+    ids = {str(q["question_number"]).strip() for q in low}
     errors = []
-
-    for model_name in model_names:
-        if model_on_quota_cooldown(model_name):
+    for model in model_names:
+        if model_on_quota_cooldown(model):
             continue
-        for attempt in range(1):
-            try:
-                if status_callback:
-                    status_callback(
-                        f"🔎 Auditing {len(selected_questions)} random question(s) with {model_name}"
-                        + (f" (attempt {attempt + 1}/2)" if attempt else "")
-                    )
-
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=MARKING_SYSTEM,
-                        response_mime_type="application/json",
-                        response_schema=OUTPUT_SCHEMA,
-                    ),
-                )
-
-                if response and response.text:
-                    audited_subset = extract_json(response.text)
-                    audited_questions = audited_subset.get("questions", [])
-                    audited_by_number = {
-                        str(q.get("question_number", "")).strip(): q
-                        for q in audited_questions
-                        if isinstance(q, dict)
-                        and str(q.get("question_number", "")).strip() in selected_numbers
-                    }
-
-                    merged_result = dict(result)
-                    merged_result["questions"] = [
-                        audited_by_number.get(
-                            str(q.get("question_number", "")).strip(), q
-                        )
-                        for q in all_questions
-                    ]
-                    return merged_result, model_name
-
-                raise RuntimeError(f"{model_name} returned an empty response.")
-
-            except Exception as exc:
-                errors.append(f"{model_name}: {exc}")
-
-                if is_quota_error(exc):
-                    cooldown_seconds = 21600 if is_daily_quota_exhausted_error(exc) else 90
-                    _QUOTA_BLOCKED_UNTIL[model_name] = time.monotonic() + cooldown_seconds
-
-                # A daily quota cannot be fixed by retrying the same model.
-                if is_daily_quota_exhausted_error(exc):
-                    if status_callback:
-                        status_callback(
-                            f"⏭️ Skipping audit model {model_name}: daily quota exhausted"
-                        )
-                    break
-
-                if is_quota_error(exc):
-                    if status_callback:
-                        status_callback(
-                            f"⏭️ Skipping audit model {model_name}: Gemini quota limit reached"
-                        )
-                    break
-
-                if is_temporary_model_error(exc) and attempt == 0:
-                    time.sleep(2)
+        try:
+            if status_callback:
+                status_callback(f"🔎 Auditing {len(low)} Low-confidence question(s) with {model}")
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", response_schema=schema
+                ),
+            )
+            corrections = extract_json(response.text).get("corrections", [])
+            if not isinstance(corrections, list):
+                raise ValueError("Audit corrections are invalid.")
+            updated = dict(result)
+            updated["questions"] = [dict(q) for q in questions]
+            for change in corrections:
+                number = str(change.get("question_number", "")).strip()
+                if number not in ids:
                     continue
-
-                break
-
-    raise RuntimeError("Audit models failed. " + " | ".join(errors))
+                for question in updated["questions"]:
+                    if str(question["question_number"]).strip() == number:
+                        new_mark = clamp_mark(change.get("awarded_marks"), question["max_marks"])
+                        if new_mark != question["awarded_marks"]:
+                            question["awarded_marks"] = new_mark
+                            question["loss_reason"] = (
+                                "Second-pass audit: " + str(change.get("reason", ""))
+                            )
+                        break
+            return updated, model
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+            if is_quota_error(exc):
+                _QUOTA_BLOCKED_UNTIL[model] = time.monotonic() + (
+                    21600 if is_daily_quota_exhausted_error(exc) else 90
+                )
+    raise RuntimeError("Low-confidence audit models failed. " + " | ".join(errors))
 
 
 # ============================================================
@@ -1877,6 +1907,20 @@ with st.sidebar:
     st.caption(f"App version: {APP_VERSION}")
     st.caption("Automatic Gemini model fallback: ON")
     st.caption("Google Classroom integration: available when configured")
+
+    st.subheader("Marking mode")
+    marking_mode = st.radio(
+        "Choose how much homework to mark",
+        ["Mark entire homework", "Mark spread-out random questions"],
+        key="marking_mode",
+    )
+    random_question_count = None
+    if marking_mode == "Mark spread-out random questions":
+        random_question_count = st.number_input(
+            "Number of random questions to mark",
+            min_value=1, max_value=1000, value=5, step=1,
+            help="The app identifies main questions from the mark scheme, then randomly picks across the full homework. One selection is shared across students.",
+        )
 
     audit_enabled = st.checkbox(
         "Run second-pass marking audit",
@@ -2042,6 +2086,9 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                 key="classroom_audit",
                             )
 
+                            classroom_random_count = random_question_count
+                            st.caption("Marking mode from the sidebar applies to this Classroom assignment.")
+
                             process_now = st.button(
                                 "🚀 Check and mark new submissions",
                                 type="primary",
@@ -2085,6 +2132,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 mark_scheme_upload=ms_upload,
                                                 audit_enabled=classroom_audit,
                                                 already_processed_ids=processed_ids,
+                                                random_count=classroom_random_count,
                                             )
 
                                             classroom_status.update(
@@ -2273,6 +2321,11 @@ if st.button(
 
             mark_scheme_remote = upload_jobs["mark_scheme"]
             question_remote = upload_jobs.get("question")
+            selected_questions = None
+            if random_question_count is not None:
+                numbers = discover_question_numbers(client, mark_scheme_remote, question_remote)
+                selected_questions = select_spread_questions(numbers, random_question_count)
+                st.info("Random questions for all students: " + ", ".join(selected_questions))
 
             # Process student marking jobs sequentially to keep Gemini request
             # volume conservative and avoid multiple students being marked at once.
@@ -2295,7 +2348,7 @@ if st.button(
                 for i, sp in enumerate(student_pdfs):
                     cache_key = (
                         f"{sp.name}|{__import__('hashlib').sha256(sp.getvalue()).hexdigest()}"
-                        f"|{mark_scheme_sig}|{question_sig}|audit={audit_enabled}"
+                        f"|{mark_scheme_sig}|{question_sig}|audit={audit_enabled}|selection={selected_questions}|version={APP_VERSION}"
                     )
                     if cache_key in cache:
                         cached_rows.append(cache[cache_key])
@@ -2308,6 +2361,7 @@ if st.button(
                             mark_scheme_remote,
                             question_remote,
                             audit_enabled,
+                            selected_questions,
                         )
                         marking_futures[future] = (sp.name, cache_key)
 
