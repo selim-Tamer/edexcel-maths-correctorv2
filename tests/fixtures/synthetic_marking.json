@@ -1,0 +1,941 @@
+{
+  "provenance": "Original synthetic questions; not Pearson material or student work. Fixed authored allocations, not model-generated marks.",
+  "questions": [
+    {
+      "id": "1",
+      "prompt": "Solve 2x + 3 = 11",
+      "method": "Subtract 3 to get 2x = 8",
+      "answer": "4",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Subtract 3 to get 2x = 8"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 4 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "4",
+          "working": "Subtract 3 to get 2x = 8; final answer 4",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "5",
+          "working": "Subtract 3 to get 2x = 8; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "5",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "2",
+      "prompt": "Solve 3x - 4 = 11",
+      "method": "Add 4 to get 3x = 15",
+      "answer": "5",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Add 4 to get 3x = 15"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 5 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "5",
+          "working": "Add 4 to get 3x = 15; final answer 5",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "6",
+          "working": "Add 4 to get 3x = 15; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "6",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "3",
+      "prompt": "Find 15 percent of 80",
+      "method": "One percent is 0.8",
+      "answer": "12",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "One percent is 0.8"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 12 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "12",
+          "working": "One percent is 0.8; final answer 12",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "15",
+          "working": "One percent is 0.8; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "15",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "4",
+      "prompt": "Find the area of a triangle, base 8 height 5",
+      "method": "Base times height is 40",
+      "answer": "20",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Base times height is 40"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 20 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "20",
+          "working": "Base times height is 40; final answer 20",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "40",
+          "working": "Base times height is 40; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "40",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "5",
+      "prompt": "Find rectangle perimeter, sides 7 and 4",
+      "method": "Sum adjacent sides to get 11",
+      "answer": "22",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Sum adjacent sides to get 11"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 22 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "22",
+          "working": "Sum adjacent sides to get 11; final answer 22",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "28",
+          "working": "Sum adjacent sides to get 11; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "28",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "6",
+      "prompt": "Find mean of 3, 5, 10",
+      "method": "Sum the values to get 18",
+      "answer": "6",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Sum the values to get 18"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 6 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "6",
+          "working": "Sum the values to get 18; final answer 6",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "9",
+          "working": "Sum the values to get 18; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "9",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "7",
+      "prompt": "Find speed for 120 km in 3 hours",
+      "method": "Divide distance by time",
+      "answer": "40",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Divide distance by time"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 40 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "40",
+          "working": "Divide distance by time; final answer 40",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "360",
+          "working": "Divide distance by time; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "360",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "8",
+      "prompt": "Find density for mass 90 g and volume 30 cm cubed",
+      "method": "Divide mass by volume",
+      "answer": "3",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Divide mass by volume"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 3 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "3",
+          "working": "Divide mass by volume; final answer 3",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "2700",
+          "working": "Divide mass by volume; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "2700",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "9",
+      "prompt": "Find 3/4 of 28",
+      "method": "One quarter is 7",
+      "answer": "21",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "One quarter is 7"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 21 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "21",
+          "working": "One quarter is 7; final answer 21",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "7",
+          "working": "One quarter is 7; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "7",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "10",
+      "prompt": "Increase 50 by 20 percent",
+      "method": "The increase is 10",
+      "answer": "60",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "The increase is 10"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 60 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "60",
+          "working": "The increase is 10; final answer 60",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "70",
+          "working": "The increase is 10; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "70",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "11",
+      "prompt": "Decrease 80 by 15 percent",
+      "method": "The decrease is 12",
+      "answer": "68",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "The decrease is 12"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 68 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "68",
+          "working": "The decrease is 12; final answer 68",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "65",
+          "working": "The decrease is 12; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "65",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "12",
+      "prompt": "Share 35 in ratio 2:5; give smaller share",
+      "method": "One ratio unit is 5",
+      "answer": "10",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "One ratio unit is 5"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 10 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "10",
+          "working": "One ratio unit is 5; final answer 10",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "14",
+          "working": "One ratio unit is 5; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "14",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "13",
+      "prompt": "Solve x/4 + 2 = 5",
+      "method": "Subtract 2 to get x/4 = 3",
+      "answer": "12",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Subtract 2 to get x/4 = 3"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 12 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "12",
+          "working": "Subtract 2 to get x/4 = 3; final answer 12",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "3",
+          "working": "Subtract 2 to get x/4 = 3; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "3",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "14",
+      "prompt": "Evaluate 2(3 + 4)",
+      "method": "Evaluate the bracket to get 7",
+      "answer": "14",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Evaluate the bracket to get 7"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 14 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "14",
+          "working": "Evaluate the bracket to get 7; final answer 14",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "10",
+          "working": "Evaluate the bracket to get 7; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "10",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "15",
+      "prompt": "Convert 2.5 hours to minutes",
+      "method": "Multiply hours by 60",
+      "answer": "150",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Multiply hours by 60"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 150 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "150",
+          "working": "Multiply hours by 60; final answer 150",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "250",
+          "working": "Multiply hours by 60; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "250",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "16",
+      "prompt": "Find the third angle of triangle with angles 35 and 65",
+      "method": "Known angles sum to 100",
+      "answer": "80",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Known angles sum to 100"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 80 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "80",
+          "working": "Known angles sum to 100; final answer 80",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "100",
+          "working": "Known angles sum to 100; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "100",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "17",
+      "prompt": "Find simple interest on 200 at 5 percent for 3 years",
+      "method": "Annual interest is 10",
+      "answer": "30",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Annual interest is 10"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 30 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "30",
+          "working": "Annual interest is 10; final answer 30",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "10",
+          "working": "Annual interest is 10; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "10",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "18",
+      "prompt": "Find gradient through (1,2) and (3,8)",
+      "method": "Rise is 6 and run is 2",
+      "answer": "3",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Rise is 6 and run is 2"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 3 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "3",
+          "working": "Rise is 6 and run is 2; final answer 3",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "6",
+          "working": "Rise is 6 and run is 2; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "6",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "19",
+      "prompt": "Find y when y = 3x + 2 and x = 4",
+      "method": "Multiply 3 by 4 to get 12",
+      "answer": "14",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Multiply 3 by 4 to get 12"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 14 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "14",
+          "working": "Multiply 3 by 4 to get 12; final answer 14",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "20",
+          "working": "Multiply 3 by 4 to get 12; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "20",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "20",
+      "prompt": "Find volume of cuboid with edges 2, 3, 4",
+      "method": "Base area is 6",
+      "answer": "24",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Base area is 6"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 24 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "24",
+          "working": "Base area is 6; final answer 24",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "9",
+          "working": "Base area is 6; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "9",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "21",
+      "prompt": "Find missing length: right triangle legs 6 and 8",
+      "method": "Squared lengths sum to 100",
+      "answer": "10",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Squared lengths sum to 100"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 10 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "10",
+          "working": "Squared lengths sum to 100; final answer 10",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "14",
+          "working": "Squared lengths sum to 100; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "14",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "22",
+      "prompt": "Find nth term 3n + 1 for n = 7",
+      "method": "Multiply 3 by 7 to get 21",
+      "answer": "22",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Multiply 3 by 7 to get 21"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 22 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "22",
+          "working": "Multiply 3 by 7 to get 21; final answer 22",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "25",
+          "working": "Multiply 3 by 7 to get 21; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "25",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "23",
+      "prompt": "Find total cost of 3 items at 4 plus delivery 2",
+      "method": "Items cost 12",
+      "answer": "14",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Items cost 12"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 14 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "14",
+          "working": "Items cost 12; final answer 14",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "18",
+          "working": "Items cost 12; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "18",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    },
+    {
+      "id": "24",
+      "prompt": "Find distance at speed 12 for 5 hours",
+      "method": "Multiply speed by time",
+      "answer": "60",
+      "max_marks": 2,
+      "allocation": [
+        {
+          "code": "M1",
+          "criterion": "Multiply speed by time"
+        },
+        {
+          "code": "A1",
+          "criterion": "Correct final answer 60 after valid method"
+        }
+      ],
+      "responses": {
+        "correct": {
+          "answer": "60",
+          "working": "Multiply speed by time; final answer 60",
+          "expected_marks": 2
+        },
+        "partial": {
+          "answer": "17",
+          "working": "Multiply speed by time; arithmetic slip in final step",
+          "expected_marks": 1
+        },
+        "incorrect": {
+          "answer": "17",
+          "working": "Unsupported guess",
+          "expected_marks": 0
+        },
+        "blank": {
+          "answer": "",
+          "working": "",
+          "expected_marks": 0
+        }
+      }
+    }
+  ]
+}
