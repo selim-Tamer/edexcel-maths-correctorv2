@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.7"
+APP_VERSION = "3.3.8"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -921,44 +921,71 @@ def verify_math_explanations(result):
     return result
 
 
-def _final_numeric_answer_for_part(text, part):
-    """Get only the final numeric answer in a labeled subpart.
+def _plain_numeric_answer_list(text):
+    """Recognize a complete comma-separated numeric answer, not working."""
+    if not isinstance(text, str):
+        return None
+    number = r"-?\d+(?:\.\d+)?"
+    if not re.fullmatch(r"\s*" + number + r"(?:\s*,\s*" + number + r")+\s*", text):
+        return None
+    return sorted(float(piece.strip()) for piece in text.split(","))
 
-    An intermediate expression such as '764 / 52 = 14.7' gives 14.7;
-    '24/52 = 6/13' gives 6/13. Skip non-numeric or uncertain outputs.
-    """
+
+def _final_numeric_answer_for_part(text, part):
+    """Read the last scalar, fraction or scientific-notation answer of a part."""
     if not text:
         return None
     matches = list(re.finditer(r"\(([a-z])\)", text, re.I))
     selected = None
     for i, match in enumerate(matches):
         if match.group(1).lower() == part.lower():
-            selected = text[match.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            selected = text[match.end():end].strip().rstrip(".; ")
             break
-    if selected is None:
+    if not selected:
         return None
-    # The last equality in the *part* is the answer, not its first
-    # intermediate value. Require a scalar or fraction at the end.
-    selected = selected.strip().rstrip(".; ")
-    tail = re.search(r"(?<![A-Za-z0-9])(-?\d+(?:\.\d+)?(?:\s*/\s*-?\d+(?:\.\d+)?)?)$", selected)
-    if not tail:
+    number = r"-?\d+(?:\.\d+)?"
+    pattern = (
+        r"(?<![A-Za-z0-9.^])("
+        + number +
+        r"(?:\s*[×xX*]\s*10\s*\^\s*-?\d+|[eE][+-]?\d+)?"
+        r"(?:\s*/\s*" + number + r")?"
+        r")\s*$"
+    )
+    match = re.search(pattern, selected)
+    if not match:
         return None
-    candidate = tail.group(1)
-    # Do not mistake the final part of an inequality or an uncompleted
-    # operation for an answer.
-    prefix = selected[:tail.start()].rstrip()
-    if prefix.endswith(("+", "-", "*", "×", "÷", "/", "<", ">")):
+    candidate = match.group(1).strip()
+    prefix = selected[:match.start()].rstrip()
+    if prefix.endswith(("+", "-", "*", "×", "÷", "/", "<", ">", "^", ",")):
         return None
+    scientific = re.fullmatch(
+        r"(" + number + r")\s*[×xX*]\s*10\s*\^\s*(-?\d+)", candidate
+    )
+    if scientific:
+        mantissa = float(scientific.group(1))
+        exponent = int(scientific.group(2))
+        if not -20 <= exponent <= 20:
+            return None
+        scale = 10 ** exponent
+        decimals = len(scientific.group(1).split(".")[1]) if "." in scientific.group(1) else 0
+        return mantissa * scale, 0.5 * 10 ** (-decimals) * scale + 1e-8
+    if re.fullmatch(number + r"[eE][+-]?\d+", candidate):
+        mantissa, exponent = re.split("[eE]", candidate)
+        exponent = int(exponent)
+        if not -20 <= exponent <= 20:
+            return None
+        decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+        scale = 10 ** exponent
+        return float(mantissa) * scale, 0.5 * 10 ** (-decimals) * scale + 1e-8
     if "/" in candidate:
         numerator, denominator = candidate.split("/", 1)
         if float(denominator) == 0:
             return None
         return float(numerator) / float(denominator), 1e-8
-    # One or more displayed decimal places can legitimately represent a
-    # rounded answer. Whole-number answers remain exact.
     if "." in candidate:
         decimals = len(candidate.split(".")[-1])
-        return float(candidate), 0.5 * (10 ** (-decimals)) + 1e-8
+        return float(candidate), 0.5 * 10 ** (-decimals) + 1e-8
     return float(candidate), 1e-8
 
 
@@ -1045,6 +1072,31 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
                         "check the original official mark scheme."
                     )
 
+        # Full-credit list answers must match the transcribed student answer.
+        # Only compare complete plain number lists, not prose or expressions.
+        if awarded == int(q.get("max_marks", 0)):
+            student_list = _plain_numeric_answer_list(student)
+            scheme_list = _plain_numeric_answer_list(official)
+            independent_list = _plain_numeric_answer_list(independent)
+            solution_list = _plain_numeric_answer_list(solution)
+            reference_list = scheme_list or independent_list or solution_list
+            if student_list is not None and reference_list is not None:
+                if student_list != reference_list:
+                    problems.append(
+                        "Full marks awarded, but the AI-transcribed student answer "
+                        "list differs from the official/model answer list; "
+                        "verify the handwritten response."
+                    )
+            elif re.fullmatch(r"\s*-?\d+(?:\.\d+)?\s*", student):
+                for reference in (official, independent, solution):
+                    if re.fullmatch(r"\s*-?\d+(?:\.\d+)?\s*", reference):
+                        if abs(float(student) - float(reference)) > 1e-8:
+                            problems.append(
+                                "Full marks awarded, but the transcribed student "
+                                "final answer differs from the official answer."
+                            )
+                        break
+
         # Arithmetic in the alleged student's working is separate from
         # arithmetic in the official solution and needs its own check.
         for equality in _arithmetic_equals_issues(working):
@@ -1099,7 +1151,8 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
                 if ("transcribed" in issue.lower() or "frequency products" in issue.lower()
                         or "group totals" in issue.lower()):
                     category = "AI transcription inconsistency"
-                elif "final answer differs" in issue.lower() or "official answer" in issue.lower():
+                elif ("final answer differs" in issue.lower() or "official answer" in issue.lower()
+                      or "full marks" in issue.lower()):
                     category = "Mark-scheme disagreement"
                 else:
                     category = "Insufficient marking evidence"
