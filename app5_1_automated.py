@@ -47,7 +47,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.1.1"
+APP_VERSION = "3.1.2"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -2036,21 +2036,11 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                 "Classroom website. Marks are shown below for you to enter manually."
                             )
 
-                            auto_col1, auto_col2 = st.columns(2)
-
-                            with auto_col1:
-                                classroom_audit = st.checkbox(
-                                    "Second-pass audit",
-                                    value=True,
-                                    key="classroom_audit",
-                                )
-
-                            with auto_col2:
-                                auto_poll = st.checkbox(
-                                    "Auto-check every 60 seconds while this page is open",
-                                    value=False,
-                                    key="classroom_auto_poll",
-                                )
+                            classroom_audit = st.checkbox(
+                                "Second-pass audit",
+                                value=True,
+                                key="classroom_audit",
+                            )
 
                             process_now = st.button(
                                 "🚀 Check and mark new submissions",
@@ -2069,43 +2059,6 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                             processed_ids = st.session_state.setdefault(
                                 "classroom_processed_ids", set()
                             )
-
-                            # Automatic polling while the active Streamlit session remains open.
-                            if auto_poll and hasattr(st, "fragment"):
-                                @st.fragment(run_every="60s")
-                                def classroom_auto_runner():
-                                    st.caption("🔄 Auto-check is active — checking for new turned-in work.")
-                                    try:
-                                        poll_client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=120_000),
-        )
-
-                                        poll_result = run_classroom_marking_job(
-                                            token=token,
-                                            client=poll_client,
-                                            course_id=selected_course_id,
-                                            coursework=selected_assignment,
-                                            mark_scheme_upload=ms_upload,
-                                            audit_enabled=classroom_audit,
-                                            already_processed_ids=processed_ids,
-                                        )
-
-                                        if poll_result["processed"]:
-                                            st.success(
-                                                f"✅ Auto-check processed "
-                                                f"{len(poll_result['processed'])} new submission(s)."
-                                            )
-                                            st.session_state["classroom_last_result"] = poll_result
-                                        else:
-                                            st.caption(poll_result["message"])
-                                    except Exception as auto_error:
-                                        st.error(
-                                            "Automatic Classroom check failed: "
-                                            f"{auto_error}"
-                                        )
-
-                                classroom_auto_runner()
 
                             if job_request:
                                 if not api_key:
