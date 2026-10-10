@@ -383,12 +383,6 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
     lines.append("## Question breakdown")
 
     for q in result["questions"]:
-        if q.get("teacher_override"):
-            edit = q["teacher_override"]
-            lines.append(
-                f"Teacher override: {edit['original_marks']} -> {edit['teacher_marks']}. "
-                f"Reason: {edit['reason'] or 'Not supplied'}"
-            )
         lines.extend(
             [
                 "",
@@ -403,6 +397,13 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
                 f"Mark-by-mark evidence: {json.dumps(q.get('mark_breakdown', []), ensure_ascii=False)}",
             ]
         )
+
+        if q.get("teacher_override"):
+            edit = q["teacher_override"]
+            lines.append(
+                f"Teacher override: {edit['original_marks']} -> {edit['teacher_marks']}. "
+                f"Reason: {edit['reason'] or 'Not supplied'}"
+            )
 
     return "\n".join(lines)
 
@@ -2709,8 +2710,8 @@ with st.sidebar:
         "Official Edexcel 1–9 grades depend on the relevant exam session and paper."
     )
     st.info(
-        "Without official session-specific grade boundaries, the app shows a "
-        "PROVISIONAL percentage-band grade rather than pretending it is an official Pearson grade."
+        "The app reports PROVISIONAL percentage-band grades only. "
+        "Official session-specific grade boundaries are not applied."
     )
 
 

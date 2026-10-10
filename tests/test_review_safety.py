@@ -211,6 +211,40 @@ class ClassroomStateTests(unittest.TestCase):
                 self.assertEqual(other["processed"], set())
         self.assertIs(self.f["classroom_job_state"](self.context()), first)
 
+    def test_actual_classroom_view_uses_current_context_and_reviewed_totals(self):
+        row = self.f["new_review_row"](self.row(), "classroom")
+        row.update(submission_id="s", student="Synthetic", suggested_classroom_grade=50,
+                   classroom_max_points=100, selected_questions=None, audit_warning=None)
+        state = self.f["classroom_job_state"](self.context())
+        state["last_result"] = {"processed": [row]}
+        self.f["save_teacher_override"](row["review_key"], "1", 2, "Checked")
+        self.f["pd"] = SimpleNamespace(DataFrame=Frame)
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        nodes = None
+        for parent in ast.walk(tree):
+            body = getattr(parent, "body", None)
+            if not isinstance(body, list):
+                continue
+            for index, node in enumerate(body):
+                if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                    and target.id == "last_result" for target in node.targets)):
+                    nodes = body[index:index + 2]
+                    break
+        self.assertIsNotNone(nodes)
+        code = compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec")
+        self.f["job_state"] = state
+        exec(code, self.f)
+        self.assertEqual(self.ui.tables[0][0]["Score"], "2/2")
+        self.assertEqual(self.ui.tables[0][0]["Current suggested Classroom grade"], "100.00")
+        self.assertEqual(self.ui.metrics[0][1], "2 / 2")
+        # A different assignment must not render the previous student's table.
+        self.ui.tables.clear()
+        self.ui.metrics.clear()
+        self.f["job_state"] = self.f["classroom_job_state"](self.context(course_id="other"))
+        exec(code, self.f)
+        self.assertEqual(self.ui.tables, [])
+        self.assertEqual(self.ui.metrics, [])
+
     def test_drive_content_edit_changes_revision_without_submission_timestamp_change(self):
         submission = {"id": "s", "updateTime": "same", "assignmentSubmission": {
             "attachments": [{"driveFile": {"id": "f"}}]}}

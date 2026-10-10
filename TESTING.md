@@ -42,8 +42,8 @@ main/scheduled failure issue-reporting job. No test publishes Classroom grades,
 merges PRs or deploys. GitHub Actions billing depends on repository/account policy;
 there is no GPU, hosted database or model/API cost in this suite.
 
-PR #1 remains unmerged. This branch includes its three commits so CI can run while
-the maintainer reviews both changes. Review/merge ordering remains a maintainer choice.
+The offline workflow is installed on main. Feature/fix pull requests run the same suite
+before a maintainer chooses whether to merge them.
 
 ## Opt-in live acceptance plan (manual only)
 
@@ -77,3 +77,34 @@ Actions runs tests and reports failures; it does not itself launch Codex. An ass
 Codex session can inspect failing runs, make fixes and open PRs. Continuous unattended
 repair requires separately configured agent scheduling/authorization; no such service
 or paid agent job is introduced here.
+
+
+## Review-state and lifecycle regressions
+
+The suite now also executes the actual manual summary/export block and Classroom
+results block with a recording UI. It checks that overrides affect metrics,
+question rows, totals, Markdown and CSV in the same rerun. These are headless UI
+contract tests, not a real browser/OAuth end-to-end run.
+
+- Every new run (including a manual cache hit) creates a fresh review identity.
+  Cached AI results are kept separate from reviewed results; original marks and
+  teacher reasons are available in exports.
+- Classroom overrides invalidate approval using a Streamlit callback before
+  widgets render. Re-marking creates a new approval identity.
+- Classroom history is scoped to account, course, assignment, scheme and settings.
+  Each check reads Drive version metadata to detect edits; this adds Google
+  metadata requests but no extra model generation for unchanged submissions.
+  Failed/skipped work stays retryable. An explicit re-mark option bypasses the cache.
+- Validators run before the optional audit and again after it. Flagged questions
+  may now trigger an audit that was previously skipped. Audit remains opt-in via
+  the existing checkbox and may consume additional model quota.
+- Failed/timed-out remote uploads are deleted on a best-effort basis. Batch
+  failures collect late successful uploads for cleanup before reporting the error.
+  Successful uploads remain owned by the existing caller cleanup path.
+- The unused grade-boundary upload has been removed. All displayed bands remain
+  provisional; this change does not implement official session-specific grades.
+
+For a manual acceptance check, use synthetic work, apply an override, download both
+report formats, re-mark the same filename, switch Classroom assignments, edit a test
+attachment and check again. Confirm that each new run needs its own review and that
+no grades are written to Classroom. Do not use live student data for CI.
