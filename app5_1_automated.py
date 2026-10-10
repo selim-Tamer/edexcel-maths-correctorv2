@@ -909,6 +909,71 @@ def verify_math_explanations(result):
     return result
 
 
+def verify_awarded_mark_evidence(result):
+    """Flag unsubstantiated marks and plain official-answer mismatches.
+
+    Checks use the model's written evidence; they cannot establish whether
+    the model actually read the handwriting or mark scheme correctly.
+    Do not change marks automatically based on these heuristic warnings.
+    """
+    warnings = list(result.get("validation_warnings", []))
+    # Compare only plainly labeled scalar numeric subpart answers, not all
+    # numbers in complex worked solutions.
+    parts = re.compile(
+        r"\(([a-z])\)\s*(?:\([ivx]+\)\s*)?"
+        r"(?:answer\s*(?:is|:)\s*)?"
+        r"(-?\d+(?:\.\d+)?)\b", re.I
+    )
+    for q in result.get("questions", []):
+        number = str(q.get("question_number", "")).strip()
+        problems = []
+        awarded = int(q.get("awarded_marks", 0))
+        if awarded <= 0:
+            continue
+        student = str(q.get("student_answer", "")).strip()
+        working = str(q.get("working_summary", "")).strip()
+        breakdown = q.get("mark_breakdown", []) or []
+        official = str(q.get("scheme_answer_evidence", "")).strip()
+        solution = str(q.get("full_mark_solution", "")).strip()
+        unclear = re.compile(r"\b(unreadable|not shown|not visible|not provided|unclear|illegible|unknown)\b", re.I)
+        if not student or unclear.search(student):
+            problems.append("Awarded marks lack a clearly transcribed student answer.")
+        if not working or unclear.search(working):
+            problems.append("Awarded marks lack clearly identified visible student working; review whether an answer-only mark is permitted.")
+        if not breakdown:
+            problems.append("Awarded marks have no individual mark-scheme evidence decisions.")
+        else:
+            earned_entries = [item for item in breakdown if item.get("awarded")]
+            if not earned_entries:
+                problems.append("Positive awarded score but no mark-breakdown entries are marked as earned.")
+            for entry in earned_entries:
+                reason = str(entry.get("reason", "")).strip()
+                if len(reason) < 14 or unclear.search(reason):
+                    problems.append("An awarded M/A/B mark has no clear student-specific evidence.")
+                    break
+        if not official:
+            problems.append("No official answer transcribed for comparison with the generated model solution.")
+        else:
+            expected = {m.group(1).lower(): m.group(2) for m in parts.finditer(official)}
+            actual = {m.group(1).lower(): m.group(2) for m in parts.finditer(solution)}
+            for part in sorted(expected.keys() & actual.keys()):
+                a, b = expected[part], actual[part]
+                if abs(float(a) - float(b)) > 1e-8:
+                    problems.append(
+                        f"Part ({part}) model solution says {b}, but the separately "
+                        f"transcribed official answer says {a}; verify the original PDF."
+                    )
+        if problems:
+            q["confidence"] = "Low"
+            warnings.extend(
+                f"Question {number}: {issue} Teacher review required."
+                for issue in dict.fromkeys(problems)
+            )
+    result["validation_warnings"] = list(dict.fromkeys(warnings))
+    result["grade_unverified"] = bool(result["validation_warnings"])
+    return result
+
+
 def select_spread_questions(question_numbers, count):
     """Stratified sampling across the complete ordered homework, shared by a batch."""
     numbers = list(dict.fromkeys(str(x).strip() for x in question_numbers if str(x).strip()))
@@ -1031,6 +1096,7 @@ def mark_one_submission(
 
     result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
     result = verify_math_explanations(result)
+    result = verify_awarded_mark_evidence(result)
     earned, available, percentage = calculate_totals(result)
     provisional_grade = percentage_band_grade(percentage)
     groups = make_group_rows(result["questions"])
@@ -1520,6 +1586,7 @@ def mark_one_classroom_submission(
 
         result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
         result = verify_math_explanations(result)
+        result = verify_awarded_mark_evidence(result)
         earned, available, percentage = calculate_totals(result)
         provisional_grade = percentage_band_grade(percentage)
         groups = make_group_rows(result["questions"])
