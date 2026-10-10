@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.5"
+APP_VERSION = "3.3.6"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -917,73 +917,146 @@ def verify_math_explanations(result):
     return result
 
 
-def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
-    """Flag unsubstantiated marks and plain official-answer mismatches.
+def _final_numeric_answer_for_part(text, part):
+    """Get only the final numeric answer in a labeled subpart.
 
-    Checks use the model's written evidence; they cannot establish whether
-    the model actually read the handwriting or mark scheme correctly.
-    Do not change marks automatically based on these heuristic warnings.
+    An intermediate expression such as '764 / 52 = 14.7' gives 14.7;
+    '24/52 = 6/13' gives 6/13. Skip non-numeric or uncertain outputs.
+    """
+    if not text:
+        return None
+    matches = list(re.finditer(r"\(([a-z])\)", text, re.I))
+    selected = None
+    for i, match in enumerate(matches):
+        if match.group(1).lower() == part.lower():
+            selected = text[match.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+            break
+    if selected is None:
+        return None
+    # The last equality in the *part* is the answer, not its first
+    # intermediate value. Require a scalar or fraction at the end.
+    selected = selected.strip().rstrip(".; ")
+    tail = re.search(r"(?<![A-Za-z0-9])(-?\d+(?:\.\d+)?(?:\s*/\s*-?\d+(?:\.\d+)?)?)$", selected)
+    if not tail:
+        return None
+    candidate = tail.group(1)
+    # Do not mistake the final part of an inequality or an uncompleted
+    # operation for an answer.
+    prefix = selected[:tail.start()].rstrip()
+    if prefix.endswith(("+", "-", "*", "×", "÷", "/", "<", ">")):
+        return None
+    if "/" in candidate:
+        numerator, denominator = candidate.split("/", 1)
+        if float(denominator) == 0:
+            return None
+        return float(numerator) / float(denominator)
+    return float(candidate)
+
+
+def _numeric_answers_disagree(first, second):
+    if first is None or second is None:
+        return False
+    # Allow rounding only to the precision of the *displayed* answer.
+    return abs(first - second) > 1e-8
+
+
+def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
+    """Review unsupported awards, final-answer mismatches and simple working arithmetic.
+
+    Model transcriptions and AI-read scheme references are fallible. This is a
+    warning-only step: never change the student's awarded marks automatically.
     """
     warnings = list(result.get("validation_warnings", []))
-    # Compare only plainly labeled scalar numeric subpart answers, not all
-    # numbers in complex worked solutions.
-    parts = re.compile(
-        r"\(([a-z])\)\s*(?:\([ivx]+\)\s*)?"
-        r"(?:answer\s*(?:is|:)\s*)?"
-        r"(-?\d+(?:\.\d+)?)\b", re.I
+    unclear = re.compile(
+        r"\b(unreadable|not shown|not visible|not provided|unclear|illegible|unknown)\b", re.I
     )
     for q in result.get("questions", []):
         number = str(q.get("question_number", "")).strip()
-        problems = []
         awarded = int(q.get("awarded_marks", 0))
         if awarded <= 0:
             continue
+        problems = []
         student = str(q.get("student_answer", "")).strip()
         working = str(q.get("working_summary", "")).strip()
         breakdown = q.get("mark_breakdown", []) or []
         official = str(q.get("scheme_answer_evidence", "")).strip()
         solution = str(q.get("full_mark_solution", "")).strip()
-        unclear = re.compile(r"\b(unreadable|not shown|not visible|not provided|unclear|illegible|unknown)\b", re.I)
+        independent = str((independent_scheme_answers or {}).get(number, "")).strip()
+
         if not student or unclear.search(student):
             problems.append("Awarded marks lack a clearly transcribed student answer.")
         if not working or unclear.search(working):
-            problems.append("Awarded marks lack clearly identified visible student working; review whether an answer-only mark is permitted.")
+            problems.append("Visible working was not reliably transcribed; check whether answer-only marks are allowed.")
         if not breakdown:
-            problems.append("Awarded marks have no individual mark-scheme evidence decisions.")
+            problems.append("Awarded marks have no individual mark-scheme decisions.")
         else:
-            earned_entries = [item for item in breakdown if item.get("awarded")]
-            if not earned_entries:
-                problems.append("Positive awarded score but no mark-breakdown entries are marked as earned.")
-            for entry in earned_entries:
-                reason = str(entry.get("reason", "")).strip()
-                if len(reason) < 14 or unclear.search(reason):
-                    problems.append("An awarded M/A/B mark has no clear student-specific evidence.")
-                    break
-        independently_read = str((independent_scheme_answers or {}).get(number, "")).strip()
+            positive = [entry for entry in breakdown if entry.get("awarded")]
+            if not positive:
+                problems.append("Positive awarded score but no mark-breakdown entries are earned.")
+            else:
+                # Short A/B-mark evidence such as 'x = 10' is valid when
+                # supported by the transcribed answer or working. Do not
+                # enforce arbitrary minimum character lengths.
+                for entry in positive:
+                    reason = str(entry.get("reason", "")).strip()
+                    if not reason or unclear.search(reason):
+                        problems.append("An awarded mark has no usable explanation.")
+                        break
+                if student and working:
+                    # Count multi-mark codes (M2 etc.) without assuming that
+                    # all schemes use the same code vocabulary.
+                    points = 0
+                    for entry in positive:
+                        code = str(entry.get("code", "")).strip()
+                        match = re.fullmatch(r"[MAB](\d+)", code, re.I)
+                        points += int(match.group(1)) if match else 1
+                    if points != awarded:
+                        problems.append(
+                            f"Awarded mark breakdown accounts for {points} marks, "
+                            f"but the AI awarded {awarded}."
+                        )
+
         if not official:
-            problems.append("No official answer transcribed for comparison with the generated model solution.")
-        else:
-            expected = {m.group(1).lower(): m.group(2) for m in parts.finditer(official)}
-            actual = {m.group(1).lower(): m.group(2) for m in parts.finditer(solution)}
-            for part in sorted(expected.keys() & actual.keys()):
-                a, b = expected[part], actual[part]
-                if abs(float(a) - float(b)) > 1e-8:
+            problems.append("No official answer recorded; compare against the original PDF.")
+
+        # Compare *final* labeled answers only, never initial numbers of
+        # intermediate calculations. Also compare equivalent fractions.
+        part_ids = set(re.findall(r"\(([a-z])\)", official + " " + independent, re.I))
+        for part in sorted(part_ids):
+            final_model = _final_numeric_answer_for_part(solution, part)
+            for reference, label in (
+                (official, "AI-recorded mark scheme"),
+                (independent, "independent mark-scheme extraction"),
+            ):
+                expected = _final_numeric_answer_for_part(reference, part)
+                if _numeric_answers_disagree(final_model, expected):
                     problems.append(
-                        f"Part ({part}) model solution says {b}, but the separately "
-                        f"transcribed official answer says {a}; verify the original PDF."
+                        f"Part ({part}) final answer differs from {label}; "
+                        "check the original official mark scheme."
                     )
-        if independently_read:
-            original_parts = {m.group(1).lower(): m.group(2)
-                              for m in parts.finditer(independently_read)}
-            output_parts = {m.group(1).lower(): m.group(2)
-                            for m in parts.finditer(solution)}
-            for part in sorted(original_parts.keys() & output_parts.keys()):
-                if abs(float(original_parts[part]) - float(output_parts[part])) > 1e-8:
-                    problems.append(
-                        f"Part ({part}) full-mark solution {output_parts[part]} "
-                        f"disagrees with independent mark-scheme extraction "
-                        f"{original_parts[part]}; verify official PDF."
-                    )
+
+        # Arithmetic in the alleged student's working is separate from
+        # arithmetic in the official solution and needs its own check.
+        for equality in _arithmetic_equals_issues(working):
+            problems.append(
+                f"Transcribed student working contains a questionable equality: {equality}."
+            )
+
+        # E.g. 'Products: 138, 252, 144, 245, 100, 51; sum = 960'
+        # must be internally consistent; skip mixed prose/expressions.
+        product_list = re.search(
+            r"\bproducts?\s*:\s*((?:-?\d+(?:\.\d+)?\s*,\s*){2,}-?\d+(?:\.\d+)?)"
+            r"\s*;\s*sum\s*=\s*(-?\d+(?:\.\d+)?)\b", working, re.I
+        )
+        if product_list:
+            values = [float(v.strip()) for v in product_list.group(1).split(",")]
+            total = float(product_list.group(2))
+            if abs(sum(values) - total) > 1e-8:
+                problems.append(
+                    "Listed frequency products do not add to the transcribed total; "
+                    "recheck the handwriting."
+                )
+
         if problems:
             q["confidence"] = "Low"
             warnings.extend(
