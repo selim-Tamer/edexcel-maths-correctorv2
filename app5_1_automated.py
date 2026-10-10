@@ -48,7 +48,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.3"
+APP_VERSION = "3.3.4"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -744,11 +744,13 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
                     "Teacher must verify the question's marks and maximum."
                 )
                 q["confidence"] = "Low"
+                q["max_marks_reference"] = scheme_maxima[number]
     if selected_questions is not None:
         for number in selected_questions:
             if str(number).strip() not in seen:
                 warnings.append(f"Selected question {number} is missing from the AI result.")
     result["validation_warnings"] = warnings
+    result["max_marks_review_required"] = any("AI maximum" in w for w in warnings)
     return result
 
 
@@ -983,6 +985,7 @@ def mark_one_submission(
         question_file=question_file,
         status_callback=None,
         selected_questions=selected_questions,
+        scheme_maxima=scheme_maxima,
     )
 
     result = normalise_result(raw_result)
@@ -1471,6 +1474,7 @@ def mark_one_classroom_submission(
             question_file=None,
             status_callback=report_stage,
             selected_questions=selected_questions,
+            scheme_maxima=scheme_maxima,
         )
 
         result = normalise_result(raw_result)
@@ -1969,6 +1973,7 @@ def grade_with_model(
     question_file=None,
     status_callback=None,
     selected_questions=None,
+    scheme_maxima=None,
 ):
     """
     Try several current Gemini models automatically.
@@ -2012,6 +2017,26 @@ Do not calculate the final total as a free-form narrative. The application will 
             "Do not mark, return, or assign scores to unselected questions. "
             "Return one question entry per selected main question if identifiable. "
             "Treat the listed question identifiers as authoritative.\\n"
+        )
+
+    # AI-extracted maxima are a guide; the original scheme is authoritative.
+    if scheme_maxima:
+        allowed = (
+            {str(n).strip() for n in selected_questions}
+            if selected_questions is not None else None
+        )
+        reference = {
+            str(n): int(m) for n, m in scheme_maxima.items()
+            if allowed is None or str(n) in allowed
+        }
+        prompt += (
+            "\\nQUESTION MAXIMUM MARK REFERENCE (AI-extracted from the official "
+            "mark scheme, not independently certified): "
+            + json.dumps(reference, sort_keys=True)
+            + "\\nUse these totals where they agree with the original scheme. "
+            "If the original document disagrees, use its value, lower confidence, "
+            "and explain the discrepancy. Never award marks just because a "
+            "full-mark solution exists; check the student's actual handwriting.\\n"
         )
 
     if isinstance(student_file, (list, tuple)):
