@@ -1116,7 +1116,7 @@ def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
         # A self-correction in the model's transcript may be its own guess,
         # not handwriting. A full-credit result needs teacher review when
         # this text contains conflicting attempts or uncertainties.
-        if re.search(r"\\b(wait|actually|ignore that|correction:|student wrote|\\?\\s*wait)\\b", working, re.I):
+        if re.search(r"\b(wait|actually|ignore that|correction:|student wrote|\?\s*wait)\b", working, re.I):
             problems.append(
                 "AI-transcribed working includes a self-correction or an uncertain "
                 "reconstruction; compare directly with the handwritten page."
