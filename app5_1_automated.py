@@ -684,8 +684,9 @@ def extract_scheme_maxima(client, mark_scheme_file):
             "properties": {
                 "question_number": {"type": "string"},
                 "max_marks": {"type": "integer"},
+                "answer_summary": {"type": "string"},
             },
-            "required": ["question_number", "max_marks"],
+            "required": ["question_number", "max_marks", "answer_summary"],
         }}},
         "required": ["questions"],
     }
@@ -693,7 +694,10 @@ def extract_scheme_maxima(client, mark_scheme_file):
         "From this official homework mark scheme, extract the TOTAL maximum marks "
         "for EACH MAIN HOMEWORK question (sum all parts). Use the worksheet's "
         "outer numbered items, NOT the embedded past-paper question identifiers. "
-        "Only report clear, supported values. Omit uncertain entries. JSON only."
+        "For each main question also transcribe a SHORT official answer for "
+        "each subpart (e.g. (a) 10-19; (b) 42/59; (c) 1376) into answer_summary. "
+        "Use empty answer_summary for unclear answers; never guess. "
+        "Only report clear, supported maximum marks. JSON only."
     )
     errors = []
     for model in PRIMARY_MODELS:
@@ -706,7 +710,7 @@ def extract_scheme_maxima(client, mark_scheme_file):
                     response_mime_type="application/json", response_schema=schema
                 ),
             )
-            maxima, conflicts = {}, set()
+            maxima, answers, conflicts = {}, {}, set()
             for q in extract_json(response.text).get("questions", []):
                 number = str(q.get("question_number", "")).strip()
                 try:
@@ -718,15 +722,19 @@ def extract_scheme_maxima(client, mark_scheme_file):
                 if number in maxima and maximum != maxima[number]:
                     conflicts.add(number)
                 maxima[number] = maximum
+                summary = str(q.get("answer_summary", "")).strip()
+                if summary:
+                    answers[number] = summary
             for number in conflicts:
                 maxima.pop(number, None)
+                answers.pop(number, None)
             if not maxima:
                 raise ValueError("No readable question maximum marks.")
-            return maxima, None
+            return maxima, answers, None
         except Exception as exc:
             remember_model_failure(model, exc)
             errors.append(f"{model}: {exc}")
-    return {}, "Unable to extract mark-scheme totals; teacher verification required."
+    return {}, {}, "Unable to extract mark-scheme totals; teacher verification required."
 
 
 def check_question_marks(result, scheme_maxima=None, selected_questions=None, reference_warning=None):
@@ -909,7 +917,7 @@ def verify_math_explanations(result):
     return result
 
 
-def verify_awarded_mark_evidence(result):
+def verify_awarded_mark_evidence(result, independent_scheme_answers=None):
     """Flag unsubstantiated marks and plain official-answer mismatches.
 
     Checks use the model's written evidence; they cannot establish whether
@@ -951,6 +959,7 @@ def verify_awarded_mark_evidence(result):
                 if len(reason) < 14 or unclear.search(reason):
                     problems.append("An awarded M/A/B mark has no clear student-specific evidence.")
                     break
+        independently_read = str((independent_scheme_answers or {}).get(number, "")).strip()
         if not official:
             problems.append("No official answer transcribed for comparison with the generated model solution.")
         else:
@@ -962,6 +971,18 @@ def verify_awarded_mark_evidence(result):
                     problems.append(
                         f"Part ({part}) model solution says {b}, but the separately "
                         f"transcribed official answer says {a}; verify the original PDF."
+                    )
+        if independently_read:
+            original_parts = {m.group(1).lower(): m.group(2)
+                              for m in parts.finditer(independently_read)}
+            output_parts = {m.group(1).lower(): m.group(2)
+                            for m in parts.finditer(solution)}
+            for part in sorted(original_parts.keys() & output_parts.keys()):
+                if abs(float(original_parts[part]) - float(output_parts[part])) > 1e-8:
+                    problems.append(
+                        f"Part ({part}) full-mark solution {output_parts[part]} "
+                        f"disagrees with independent mark-scheme extraction "
+                        f"{original_parts[part]}; verify official PDF."
                     )
         if problems:
             q["confidence"] = "Low"
@@ -1040,6 +1061,7 @@ def mark_one_submission(
     selected_questions=None,
     scheme_maxima=None,
     scheme_warning=None,
+    scheme_answers=None,
 ):
     """
     Mark one student's already-uploaded file(s) and return a result dict.
@@ -1096,7 +1118,7 @@ def mark_one_submission(
 
     result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
     result = verify_math_explanations(result)
-    result = verify_awarded_mark_evidence(result)
+    result = verify_awarded_mark_evidence(result, scheme_answers)
     earned, available, percentage = calculate_totals(result)
     provisional_grade = percentage_band_grade(percentage)
     groups = make_group_rows(result["questions"])
@@ -1477,6 +1499,7 @@ def mark_one_classroom_submission(
     homework_question_count=None,
     scheme_maxima=None,
     scheme_warning=None,
+    scheme_answers=None,
 ):
     """
     Mark one Classroom submission's attachment(s) and return a result dict.
@@ -1586,7 +1609,7 @@ def mark_one_classroom_submission(
 
         result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
         result = verify_math_explanations(result)
-        result = verify_awarded_mark_evidence(result)
+        result = verify_awarded_mark_evidence(result, scheme_answers)
         earned, available, percentage = calculate_totals(result)
         provisional_grade = percentage_band_grade(percentage)
         groups = make_group_rows(result["questions"])
@@ -1690,7 +1713,7 @@ def run_classroom_marking_job(
 
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
     processed = []
-    scheme_maxima, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+    scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
     if scheme_warning:
         st.warning(scheme_warning)
     selected_questions = None
@@ -1738,6 +1761,7 @@ def run_classroom_marking_job(
                     homework_question_count,
                     scheme_maxima,
                     scheme_warning,
+                    scheme_answers,
                 ): submission
                 for submission in pending
             }
@@ -2801,7 +2825,7 @@ if st.button(
 
             mark_scheme_remote = upload_jobs["mark_scheme"]
             question_remote = upload_jobs.get("question")
-            scheme_maxima, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+            scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
             if scheme_warning:
                 st.warning(scheme_warning)
             selected_questions = None
@@ -2847,6 +2871,7 @@ if st.button(
                             selected_questions,
                             scheme_maxima,
                             scheme_warning,
+                            scheme_answers,
                         )
                         marking_futures[future] = (sp.name, cache_key)
 
