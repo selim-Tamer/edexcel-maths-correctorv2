@@ -84,5 +84,24 @@ class StreamlitReviewTests(unittest.TestCase):
         self.assertIn("Historical", frame.iloc[0]["Teacher review"])
         self.assertEqual(app.metric[0].value, "1 / 2")
 
+    def test_unresolved_full_score_shows_review_without_changing_marks(self):
+        script = BOOTSTRAP.replace('state = st.session_state["review_fixture"]', '''
+state = st.session_state["review_fixture"]
+row = state["last_result"]["processed"][0]
+q = row["ai_result"]["questions"][0]
+q["awarded_marks"] = 2
+q["confidence"] = "Low"
+q["audit_review"] = {"status": "unresolved", "reason": "Original handwriting needs review."}
+row["ai_result"]["validation_warnings"] = ["Question 1: unresolved source discrepancy"]
+''')
+        app = AppTest.from_string(script, default_timeout=20).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(app.metric[0].value, "2 / 2")
+        self.assertIn("unverified", app.metric[0].label.lower())
+        self.assertFalse(app.checkbox[0].value)
+        visible = " ".join(str(item.value) for item in app.markdown)
+        self.assertIn("Original handwriting needs review", visible)
+        self.assertIn("marks unchanged by audit", visible)
+
 if __name__ == "__main__":
     unittest.main()

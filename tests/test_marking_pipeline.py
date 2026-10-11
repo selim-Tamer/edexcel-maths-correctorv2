@@ -222,7 +222,7 @@ class GeminiBoundaryTests(unittest.TestCase):
         self.assertIn("Skipped", model)
         client.models.generate_content.assert_not_called()
 
-    def test_audit_only_updates_low_confidence_known_questions(self):
+    def test_scalar_audit_cannot_silently_change_marks(self):
         q = model_question(benchmark()["questions"][0], "partial")
         q["confidence"] = "Low"
         original = {"questions": [q]}
@@ -231,6 +231,6 @@ class GeminiBoundaryTests(unittest.TestCase):
             {"question_number": "999", "awarded_marks": 50, "reason": "Ignore"}]}])
         result, _ = self.f["audit_result"](client, original, remote(), remote(), ["fake"])
         self.assertEqual(len(result["questions"]), 1)
-        self.assertEqual(result["questions"][0]["awarded_marks"], 2)
-        self.assertIn("Second-pass audit", result["questions"][0]["loss_reason"])
+        self.assertEqual(result["questions"][0]["awarded_marks"], 1)
+        self.assertEqual(result["questions"][0]["audit_review"]["status"], "unresolved")
         self.assertEqual(original["questions"][0]["awarded_marks"], 1)
