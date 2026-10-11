@@ -1,4 +1,7 @@
 import ast
+import copy
+import hashlib
+import uuid
 import json
 import os
 import re
@@ -48,7 +51,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.9"
+APP_VERSION = "3.3.11"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -80,102 +83,44 @@ GROUP_SIZE = 5
 # HELPERS
 # ============================================================
 
-def get_saved_api_key() -> str:
-    """Read the API key from Streamlit secrets, local .env, or the environment."""
-    # Streamlit secrets
+def get_server_api_key() -> str:
+    """Read server credentials without exposing them through browser widgets."""
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
         if secret_key:
             return str(secret_key).strip()
     except Exception:
         pass
-
-    # Local .env file in the same folder as this app.
-    # This is useful for a personal/local installation so the key
-    # survives closing and reopening the app.
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    try:
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    if key.strip() == "GEMINI_API_KEY":
-                        value = value.strip().strip('"').strip("'")
-                        if value:
-                            return value
-    except OSError:
-        pass
-
     return os.getenv("GEMINI_API_KEY", "").strip()
 
 
-def save_api_key_locally(api_key: str) -> bool:
-    """Save the working key in a local .env file next to the app."""
-    if not api_key:
-        return False
-
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
-    try:
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("# Local Gemini API key for the IGCSE Maths Corrector\n")
-            f.write("GEMINI_API_KEY=" + api_key.replace("\n", "").strip() + "\n")
-
-        # Best-effort restriction on systems that support chmod.
-        try:
-            os.chmod(env_path, 0o600)
-        except OSError:
-            pass
-
-        return True
-    except OSError:
-        return False
-
-
-def mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return "********"
-    return f"{key[:4]}{'*' * max(4, len(key) - 8)}{key[-4:]}"
-
-
 def upload_pdf(client, uploaded_file):
-    """Upload a Streamlit PDF to Gemini and wait until processing finishes."""
-    suffix = ".pdf"
+    """Upload a manual PDF using the same lifecycle as Classroom attachments."""
+    return upload_bytes_to_gemini(client, uploaded_file.getvalue(), uploaded_file.name)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
 
-    try:
-        remote_file = client.files.upload(file=tmp_path)
-
-        upload_wait_started = time.monotonic()
-        upload_timeout_seconds = 180
-        while getattr(remote_file.state, "name", "") == "PROCESSING":
-            if time.monotonic() - upload_wait_started > upload_timeout_seconds:
-                raise TimeoutError(
-                    f"Gemini file processing timed out after "
-                    f"{upload_timeout_seconds} seconds for {uploaded_file.name}."
-                )
-            time.sleep(0.5)
-            remote_file = client.files.get(name=remote_file.name)
-
-        state_name = getattr(remote_file.state, "name", "")
-        if state_name and state_name not in {"ACTIVE", "SUCCEEDED"}:
-            raise RuntimeError(
-                f"Gemini could not finish processing {uploaded_file.name}. "
-                f"File state: {state_name}"
-            )
-
-        return remote_file
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+def upload_pdf_batch(client, files_to_upload):
+    """Own all uploads until the whole batch succeeds, including late completions."""
+    uploaded = {}
+    errors = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(files_to_upload)))) as executor:
+        futures = {
+            executor.submit(upload_pdf, client, upload): name
+            for name, upload in files_to_upload.items()
+        }
+        for future in as_completed(futures):
+            try:
+                uploaded[futures[future]] = future.result()
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        for remote_file in uploaded.values():
+            try:
+                client.files.delete(name=remote_file.name)
+            except Exception:
+                pass
+        raise errors[0]
+    return uploaded
 
 
 def extract_json(text: str) -> dict:
@@ -403,6 +348,13 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
             ]
         )
 
+        if q.get("teacher_override"):
+            edit = q["teacher_override"]
+            lines.append(
+                f"Teacher override: {edit['original_marks']} -> {edit['teacher_marks']}. "
+                f"Reason: {edit['reason'] or 'Not supplied'}"
+            )
+
     return "\n".join(lines)
 
 
@@ -423,9 +375,39 @@ def build_csv_rows(student_name: str, result: dict) -> list:
                 "Topic": q["topic"],
                 "Loss Reason": q["loss_reason"],
                 "Correct Method": q["correct_method"],
+                "Teacher Override Reason": q.get("teacher_override", {}).get("reason", ""),
+                "Original AI Awarded": q.get("teacher_override", {}).get("original_marks", q["awarded_marks"]),
             }
         )
     return rows
+
+
+def new_review_row(row, namespace):
+    """Keep cached AI output separate from this run's teacher review."""
+    reviewed = copy.deepcopy(row)
+    if reviewed.get("status") == "Marked":
+        reviewed["review_key"] = namespace + "_" + uuid.uuid4().hex
+        reviewed["ai_result"] = copy.deepcopy(row.get("ai_result", row["result"]))
+    return reviewed
+
+
+def prepare_review_row(row):
+    """Apply session overrides once before summaries, downloads or details."""
+    if row.get("status") != "Marked":
+        return row
+    if "review_key" not in row:
+        row["review_key"] = "review_" + uuid.uuid4().hex
+    if "ai_result" not in row:
+        row["ai_result"] = copy.deepcopy(row["result"])
+    row["result"] = copy.deepcopy(row["ai_result"])
+    apply_teacher_overrides(row["review_key"], row["result"])
+    earned, available, percentage = calculate_totals(row["result"])
+    row["totals"] = {
+        "earned": earned, "available": available, "percentage": percentage,
+        "provisional_grade": percentage_band_grade(percentage),
+    }
+    row["groups"] = make_group_rows(row["result"]["questions"])
+    return row
 
 
 def apply_teacher_overrides(student_key: str, result: dict) -> bool:
@@ -437,6 +419,11 @@ def apply_teacher_overrides(student_key: str, result: dict) -> bool:
         if key in overrides:
             new_mark = clamp_mark(overrides[key], q["max_marks"])
             if q["awarded_marks"] != new_mark:
+                q["teacher_override"] = {
+                    "original_marks": q["awarded_marks"],
+                    "teacher_marks": new_mark,
+                    "reason": st.session_state.get("teacher_override_reasons", {}).get(student_key, {}).get(key, ""),
+                }
                 q["awarded_marks"] = new_mark
                 changed = True
     return changed
@@ -464,7 +451,7 @@ def render_teacher_override_controls(student_key: str, result: dict):
         key=f"override_q_{student_key}",
     )
     q = next(q for q in questions if str(q["question_number"]) == selected)
-    new_mark = st.number_input(
+    st.number_input(
         "Teacher-awarded marks",
         min_value=0,
         max_value=int(q["max_marks"]),
@@ -472,31 +459,44 @@ def render_teacher_override_controls(student_key: str, result: dict):
         step=1,
         key=f"override_mark_{student_key}_{selected}",
     )
-    reason = st.text_input(
+    st.text_input(
         "Reason (optional)",
         key=f"override_reason_{student_key}_{selected}",
     )
-    if st.button(
+    st.button(
         "Apply override",
         key=f"apply_override_{student_key}_{selected}",
         use_container_width=True,
-    ):
-        overrides = st.session_state.setdefault("teacher_overrides", {})
-        student_overrides = overrides.setdefault(student_key, {})
-        student_overrides[selected] = int(new_mark)
-        reasons = st.session_state.setdefault("teacher_override_reasons", {})
-        reasons.setdefault(student_key, {})[selected] = reason
-        if student_key.startswith("classroom_"):
-            st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
-            # Streamlit checkbox state must be reset as well as approval metadata.
-            submission_id = student_key[len("classroom_"):]
-            st.session_state[f"classroom_approval_checkbox_{submission_id}"] = False
-        st.rerun()
+        on_click=save_teacher_override_from_widgets,
+        args=(student_key, selected),
+    )
+
+
+def save_teacher_override_from_widgets(student_key, selected):
+    """Read the submitted state; callback args are snapshots from the last render."""
+    save_teacher_override(
+        student_key, selected,
+        st.session_state[f"override_mark_{student_key}_{selected}"],
+        st.session_state[f"override_reason_{student_key}_{selected}"],
+    )
+
+
+def invalidate_classroom_approval(student_key):
+    st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
+    st.session_state[f"classroom_approval_checkbox_{student_key}"] = False
+
+
+def save_teacher_override(student_key, selected, new_mark, reason):
+    """Streamlit callbacks run before rendering, so approval widgets can reset safely."""
+    st.session_state.setdefault("teacher_overrides", {}).setdefault(student_key, {})[selected] = int(new_mark)
+    st.session_state.setdefault("teacher_override_reasons", {}).setdefault(student_key, {})[selected] = reason
+    if student_key.startswith("classroom_"):
+        invalidate_classroom_approval(student_key)
 
 
 def classroom_grade_details(row, rounding_places=2):
     """Current suggested grade and review flags; no extra AI API calls."""
-    student_key = f"classroom_{row['submission_id']}"
+    student_key = row["review_key"]
     overrides = st.session_state.get("teacher_overrides", {}).get(student_key, {})
     questions = row["result"]["questions"]
     earned = sum(
@@ -515,16 +515,23 @@ def classroom_grade_details(row, rounding_places=2):
     audit_failure = bool(row.get("audit_warning"))
     incomplete = bool(selected and len(questions) != len(row.get("selected_questions") or []))
     requires_review = low > 0 or medium > 0 or audit_failure or incomplete or bool(row["result"].get("validation_warnings"))
-    approval = st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
+    is_current = row.get("is_current", True)
+    approval = is_current and st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
+    if not is_current:
+        proposed = None
     return {
         "score": f"{earned}/{possible}",
         "percentage": f"{percentage:.2f}%",
         "display_grade": f"{proposed:.{rounding_places}f}" if proposed is not None else "—",
         "ai_grade": f"{original:.{rounding_places}f}" if original is not None else "—",
         "approved": approval,
-        "approval_status": "Teacher approved" if approval else "Pending review",
+        "approval_status": ("Historical — no longer turned in" if not is_current
+                            else "Teacher approved" if approval else "Pending review"),
+        "is_current": is_current,
         "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
-        "reliability": "UNVERIFIED — teacher review required" if requires_review else "Provisional AI grade (not independently certified)",
+        "reliability": ("Historical result — not a current grade suggestion" if not is_current
+                        else "UNVERIFIED — teacher review required" if requires_review
+                        else "Provisional AI grade (not independently certified)"),
         "low": low,
         "medium": medium,
         "audit_failure": audit_failure,
@@ -535,6 +542,12 @@ def classroom_grade_details(row, rounding_places=2):
 
 def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None):
     """Render the full single-student report (metrics, notes, groups, per-question detail)."""
+    if student_key:
+        apply_teacher_overrides(student_key, result)
+        earned, available, percentage = calculate_totals(result)
+        totals.update(earned=earned, available=available, percentage=percentage,
+                      provisional_grade=percentage_band_grade(percentage))
+        groups = make_group_rows(result["questions"])
     if result.get("validation_warnings"):
         st.warning("UNVERIFIED MARKING RESULT — issues need teacher review before this score is trusted.")
     c1, c2, c3, c4 = st.columns(4)
@@ -559,17 +572,11 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
         )
     )
     if student_key:
-        apply_teacher_overrides(student_key, result)
         render_teacher_override_controls(student_key, result)
-        earned, available, percentage = calculate_totals(result)
-        totals["earned"], totals["available"], totals["percentage"] = earned, available, percentage
-        totals["provisional_grade"] = percentage_band_grade(percentage)
-        groups = make_group_rows(result["questions"])
 
     st.info(
-        "The score above is calculated directly from the question-level marks returned "
-        "by the marker. The Grade shown is only a provisional percentage band unless "
-        "official session-specific grade boundaries are supplied and applied."
+        "The score above includes any teacher overrides. The Grade shown is a "
+        "provisional percentage band, not an official session-specific grade."
     )
 
     if result["overall_notes"]["summary"]:
@@ -1292,6 +1299,10 @@ def mark_one_submission(
     audit_model = "Not run"
     audit_warning = None
 
+    result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
+    result = verify_math_explanations(result)
+    result = verify_awarded_mark_evidence(result, scheme_answers)
+
     if audit_enabled:
         try:
             audit_candidates = [
@@ -1630,19 +1641,18 @@ def download_drive_file(token: str, file_id: str):
 
 
 def upload_bytes_to_gemini(client, data: bytes, filename: str):
-    """Upload Classroom-downloaded content to Gemini as a temporary file."""
+    """Transfer ownership to the caller only after remote processing succeeds."""
     suffix = os.path.splitext(filename)[1].lower() or ".bin"
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
+    remote_file = None
     try:
         remote_file = client.files.upload(file=tmp_path)
-
         upload_wait_started = time.monotonic()
         upload_timeout_seconds = 180
-        while getattr(remote_file.state, "name", "") == "PROCESSING":
+        while getattr(getattr(remote_file, "state", None), "name", "") == "PROCESSING":
             if time.monotonic() - upload_wait_started > upload_timeout_seconds:
                 raise TimeoutError(
                     f"Gemini file processing timed out after "
@@ -1651,14 +1661,20 @@ def upload_bytes_to_gemini(client, data: bytes, filename: str):
             time.sleep(0.5)
             remote_file = client.files.get(name=remote_file.name)
 
-        state_name = getattr(remote_file.state, "name", "")
-        if state_name and state_name not in {"ACTIVE", "SUCCEEDED"}:
+        state_name = getattr(getattr(remote_file, "state", None), "name", "")
+        if state_name not in {"ACTIVE", "SUCCEEDED"}:
             raise RuntimeError(
                 f"Gemini could not finish processing '{filename}'. "
-                f"File state: {state_name}"
+                f"File state: {state_name or 'unknown'}"
             )
-
         return remote_file
+    except Exception:
+        if remote_file is not None:
+            try:
+                client.files.delete(name=remote_file.name)
+            except Exception:
+                pass
+        raise
     finally:
         try:
             os.remove(tmp_path)
@@ -1780,6 +1796,10 @@ def mark_one_classroom_submission(
         audit_model = "Not run"
         audit_warning = None
 
+        result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
+        result = verify_math_explanations(result)
+        result = verify_awarded_mark_evidence(result, scheme_answers)
+
         if audit_enabled:
             audit_candidates = [
                 m for m in AUDIT_MODELS if m != marking_model
@@ -1862,6 +1882,56 @@ def mark_one_classroom_submission(
                 pass
 
 
+def classroom_context_key(account_id, course_id, coursework, scheme_data, audit_enabled, random_count):
+    """Separate review history by account, assignment, scheme and marking settings."""
+    context = [account_id, course_id, coursework.get("id"), coursework.get("maxPoints"),
+               coursework.get("updateTime"), hashlib.sha256(scheme_data).hexdigest(),
+               audit_enabled, random_count, APP_VERSION]
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+
+def classroom_job_state(context_key):
+    return st.session_state.setdefault("classroom_jobs", {}).setdefault(
+        context_key, {"processed": set(), "last_result": None}
+    )
+
+
+def classroom_submission_revision(token, submission):
+    """Drive edits may not update the Classroom submission timestamp."""
+    files = []
+    for file_id in classroom_attachment_ids(submission):
+        metadata = classroom_request(
+            "GET", f"{DRIVE_BASE}/files/{file_id}", token,
+            params={"fields": "id,modifiedTime,version,md5Checksum"},
+        )
+        files.append([file_id, metadata.get("modifiedTime"), metadata.get("version"),
+                      metadata.get("md5Checksum")])
+    identity = [submission.get("id"), submission.get("updateTime"),
+                submission.get("assignmentSubmission"), files]
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def merge_classroom_results(previous, current, processed_revisions=None):
+    """Reconcile history against a complete, successful turned-in listing."""
+    rows = {row["submission_id"]: row for row in (previous or {}).get("processed", [])}
+    for row in current["processed"]:
+        old = rows.get(row["submission_id"])
+        if old and old.get("review_key") != row.get("review_key") and old.get("review_key"):
+            invalidate_classroom_approval(old["review_key"])
+        rows[row["submission_id"]] = row
+    active_ids = set(current["active_submission_ids"])
+    for submission_id, row in rows.items():
+        row["is_current"] = submission_id in active_ids
+        if not row["is_current"]:
+            if row.get("review_key"):
+                invalidate_classroom_approval(row["review_key"])
+            # A later resubmission needs a fresh review even if its fingerprint
+            # happens to be unchanged.
+            if processed_revisions is not None:
+                processed_revisions.discard(row.get("revision"))
+    return dict(current, processed=list(rows.values()))
+
+
 def run_classroom_marking_job(
     token: str,
     client,
@@ -1871,6 +1941,7 @@ def run_classroom_marking_job(
     audit_enabled: bool,
     already_processed_ids: set,
     random_count=None,
+    force_remark=False,
 ):
     """
     Find TURNED_IN submissions not yet processed this session and mark their
@@ -1883,8 +1954,8 @@ def run_classroom_marking_job(
     keeping Gemini request volume conservative. Streamlit UI updates happen
     only on the main thread as each worker finishes.
 
-    `already_processed_ids` is a set of submission IDs already handled in
-    this session; the caller is responsible for persisting/updating it.
+    `already_processed_ids` stores revision fingerprints within this assignment,
+    scheme and configuration. The caller persists them; force_remark bypasses them.
     """
     submissions = list_turned_in_submissions(
         token,
@@ -1892,17 +1963,28 @@ def run_classroom_marking_job(
         coursework["id"],
     )
 
-    pending = [
-        s for s in submissions
-        if s.get("state") == "TURNED_IN"
-        and s["id"] not in already_processed_ids
-    ]
+    active_submission_ids = [s["id"] for s in submissions if s.get("state") == "TURNED_IN"]
+    pending = []
+    revisions = {}
+    for submission in submissions:
+        if submission.get("state") != "TURNED_IN":
+            continue
+        try:
+            revision = classroom_submission_revision(token, submission)
+        except Exception:
+            # If revision lookup fails, retry the work instead of silently
+            # treating a potentially updated submission as already marked.
+            revision = "retry_" + uuid.uuid4().hex
+        revisions[submission["id"]] = revision
+        if force_remark or revision not in already_processed_ids:
+            pending.append(submission)
 
     if not pending:
         return {
             "pending": 0,
             "processed": [],
             "message": "No new turned-in submissions found.",
+            "active_submission_ids": active_submission_ids,
         }
 
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
@@ -2051,16 +2133,22 @@ def run_classroom_marking_job(
                             f"**{row['student']}** — {row['reason']}"
                         )
     
-                    processed.append(row)
+                    reviewed = new_review_row(row, "classroom")
+                    reviewed["revision"] = revisions[row["submission_id"]]
+                    reviewed["is_current"] = True
+                    processed.append(reviewed)
     
-                    # Marked/Skipped are handled; Failed submissions remain retryable.
-                    if row["status"] in ("Marked", "Skipped"):
-                        already_processed_ids.add(row["submission_id"])
+                    # Failed/skipped work remains retryable on the next check.
+                    if row["status"] == "Marked":
+                        already_processed_ids.add(revisions[row["submission_id"]])
+                    else:
+                        already_processed_ids.discard(revisions[row["submission_id"]])
     
         return {
             "pending": len(pending),
             "processed": processed,
             "message": f"Processed {len(processed)} submission(s).",
+            "active_submission_ids": active_submission_ids,
         }
 
     finally:
@@ -2522,53 +2610,29 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    saved_key = get_saved_api_key()
-
-    cloud_key_configured = False
-    try:
-        cloud_key_configured = bool(st.secrets.get("GEMINI_API_KEY", ""))
-    except Exception:
-        cloud_key_configured = False
-
-    if cloud_key_configured:
-        api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
-        st.success("🔐 Gemini API key loaded from Streamlit Secrets")
-        st.caption("The API key is hidden from app users.")
+    server_key = get_server_api_key()
+    if server_key:
+        api_key = server_key
+        st.success("🔐 Gemini API key configured on the server")
     else:
         api_key = st.text_input(
             "Gemini API key",
-            value=saved_key,
+            value="",
             type="password",
-            help="For local use, enter a Gemini API key. For Community Cloud, "
-                 "put GEMINI_API_KEY in Streamlit Secrets instead.",
+            key="session_gemini_api_key",
+            help="Used only for this session. For a server key, configure "
+                 "GEMINI_API_KEY in Streamlit Secrets or the server environment.",
         ).strip()
-
-    remember_key = st.checkbox(
-        "Remember this API key on this computer",
-        value=True,
-        help="After a successful test, save the key locally so you do not "
-             "need to enter it every time.",
-    )
 
     if st.button("🔑 Test API key", use_container_width=True):
         ok, message = test_api_key(api_key)
         if ok:
             st.success(message)
-
-            if remember_key and not cloud_key_configured:
-                if save_api_key_locally(api_key):
-                    st.success("✅ API key saved. You will not need to enter it next time.")
-                else:
-                    st.warning(
-                        "The API key works, but I could not save it locally. "
-                        "You may need to enter it again next time."
-                    )
         else:
-            st.error(message)
+            # Provider errors may echo request credentials; keep them server-side.
+            st.error("API key test failed. Check the key, model access and quota.")
 
-    if api_key:
-        st.caption(f"Key loaded: {mask_key(api_key)}")
-    else:
+    if not api_key:
         st.caption("No API key loaded.")
 
     st.caption(f"App version: {APP_VERSION}")
@@ -2614,8 +2678,8 @@ with st.sidebar:
         "Official Edexcel 1–9 grades depend on the relevant exam session and paper."
     )
     st.info(
-        "Without official session-specific grade boundaries, the app shows a "
-        "PROVISIONAL percentage-band grade rather than pretending it is an official Pearson grade."
+        "The app reports PROVISIONAL percentage-band grades only. "
+        "Official session-specific grade boundaries are not applied."
     )
 
 
@@ -2737,7 +2801,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                             ms_upload = st.file_uploader(
                                 "3. Upload the official mark scheme PDF for this assignment",
                                 type=["pdf"],
-                                key="classroom_mark_scheme",
+                                key=f"classroom_mark_scheme_{selected_course_id}_{selected_assignment_id}",
                             )
 
                             st.caption(
@@ -2755,6 +2819,18 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
                             classroom_random_count = random_question_count
                             st.caption("Marking mode from the sidebar applies to this Classroom assignment.")
+                            context_key = classroom_context_key(
+                                str(st.user.get("sub", "")), selected_course_id,
+                                selected_assignment, ms_upload.getvalue() if ms_upload else b"",
+                                classroom_audit, classroom_random_count,
+                            )
+                            job_state = classroom_job_state(context_key)
+                            force_remark = st.checkbox(
+                                "Re-mark all turned-in submissions",
+                                value=False,
+                                key=f"classroom_remark_{context_key}",
+                                help="Starts a new review for each submission, including previously marked work.",
+                            )
 
                             process_now = st.button(
                                 "🚀 Check and mark new submissions",
@@ -2766,13 +2842,9 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
                             job_request = process_now
 
-                            # Submissions this app has already marked this session. There's no
-                            # Classroom-side "already graded" signal to rely on any more (we
-                            # never write a grade), so this session-only set is what prevents
-                            # re-marking the same submission on every check.
-                            processed_ids = st.session_state.setdefault(
-                                "classroom_processed_ids", set()
-                            )
+                            # Revision fingerprints are scoped to this account, assignment,
+                            # scheme and settings. Corrected Drive files are eligible again.
+                            processed_ids = job_state["processed"]
 
                             if job_request:
                                 if not api_key:
@@ -2800,6 +2872,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 audit_enabled=classroom_audit,
                                                 already_processed_ids=processed_ids,
                                                 random_count=classroom_random_count,
+                                                force_remark=force_remark,
                                             )
 
                                             classroom_status.update(
@@ -2808,7 +2881,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 expanded=False,
                                             )
 
-                                        st.session_state["classroom_last_result"] = result
+                                        job_state["last_result"] = merge_classroom_results(job_state["last_result"], result, processed_ids)
 
                                     except Exception as classroom_error:
                                         message = str(classroom_error)
@@ -2833,10 +2906,10 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
                             # Render the most recent batch (persists across reruns, e.g. from
                             # expanding a report below, without re-hitting the Classroom API).
-                            last_result = st.session_state.get("classroom_last_result")
+                            last_result = job_state["last_result"]
 
                             if last_result and last_result["processed"]:
-                                processed_rows = last_result["processed"]
+                                processed_rows = [prepare_review_row(row) for row in last_result["processed"]]
 
                                 st.subheader("📬 Classroom processing result")
 
@@ -2853,7 +2926,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                         details = classroom_grade_details(row, places)
                                         summary_rows.append({
                                             "Student": row["student"],
-                                            "Status": "Marked",
+                                            "Status": "Marked" if details["is_current"] else "Historical",
                                             "Scope": details["sample"],
                                             "Score": details["score"],
                                             "Percentage": details["percentage"],
@@ -2881,7 +2954,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                     st.subheader("🧑‍🎓 Individual student reports")
                                     for row in marked_rows:
                                         details = classroom_grade_details(row, places)
-                                        student_key = f"classroom_{row['submission_id']}"
+                                        student_key = row["review_key"]
                                         with st.expander(
                                             f"{row['student']} — {details['score']} "
                                             f"({details['percentage']}) — {details['approval_status']}"
@@ -2907,17 +2980,18 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 )
                                             st.checkbox(
                                                 "I reviewed this result and approve this suggested Classroom grade",
-                                                key=f"classroom_approval_checkbox_{row['submission_id']}",
+                                                key=f"classroom_approval_checkbox_{student_key}",
                                                 value=details["approved"],
-                                                on_change=lambda k=student_key, sid=row["submission_id"]:
+                                                disabled=not details["is_current"],
+                                                on_change=lambda k=student_key:
                                                     st.session_state.setdefault("classroom_grade_approvals", {}).__setitem__(
-                                                        k, st.session_state[f"classroom_approval_checkbox_{sid}"]
+                                                        k, st.session_state[f"classroom_approval_checkbox_{k}"]
                                                     ),
                                             )
                                             render_student_report(
                                                 row["student"], row["result"], row["totals"],
                                                 row["groups"], row["marking_model"], row["audit_model"],
-                                                student_key=student_key,
+                                                student_key=student_key if details["is_current"] else None,
                                             )
                             elif last_result:
                                 st.info(last_result["message"])
@@ -2963,12 +3037,10 @@ with col3:
     )
 
 with col4:
-    st.markdown("### 4. Grade boundaries (optional)")
-    grade_boundary_pdf = st.file_uploader(
-        "Official grade-boundary PDF",
-        type=["pdf"],
-        key="grade_boundary_uploader",
-        help="Optional. This is needed for a genuine session-specific 1–9 boundary result.",
+    st.markdown("### Grade reporting")
+    st.caption(
+        "Grades use provisional percentage bands. Official session-specific "
+        "grade boundaries are not supported; check the published boundaries separately."
     )
 
 ready = bool(student_pdfs and mark_scheme_pdf and api_key)
@@ -3007,16 +3079,8 @@ if st.button(
             for i, sp in enumerate(student_pdfs):
                 files_to_upload[f"student_{i}"] = sp
 
-            upload_jobs = {}
-            with ThreadPoolExecutor(max_workers=min(8, len(files_to_upload))) as executor:
-                futures = {
-                    name: executor.submit(upload_pdf, client, upload)
-                    for name, upload in files_to_upload.items()
-                }
-
-                for name, future in futures.items():
-                    upload_jobs[name] = future.result()
-                    uploaded_remote_files.append(upload_jobs[name])
+            upload_jobs = upload_pdf_batch(client, files_to_upload)
+            uploaded_remote_files.extend(upload_jobs.values())
 
             mark_scheme_remote = upload_jobs["mark_scheme"]
             question_remote = upload_jobs.get("question")
@@ -3118,7 +3182,7 @@ if st.button(
                         )
 
             # Store for download/re-render.
-            st.session_state["last_batch_results"] = batch_results
+            st.session_state["last_batch_results"] = [new_review_row(row, "manual") for row in batch_results]
             st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
 
             marked_count = sum(1 for r in batch_results if r["status"] == "Marked")
@@ -3168,7 +3232,7 @@ if st.button(
 
 
 if "last_batch_results" in st.session_state:
-    batch_results = st.session_state["last_batch_results"]
+    batch_results = [prepare_review_row(row) for row in st.session_state["last_batch_results"]]
     marked_results = [r for r in batch_results if r["status"] == "Marked"]
 
     st.divider()
@@ -3266,7 +3330,7 @@ if "last_batch_results" in st.session_state:
                     r["groups"],
                     r["marking_model"],
                     r["audit_model"],
-                    student_key=f"manual_{idx}_{r['student_name']}",
+                    student_key=r["review_key"],
                 )
 
                 st.download_button(
