@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, codex/review-state-and-marking-safety]
   schedule:
     - cron: '15 6 * * *'
   workflow_dispatch:
@@ -24,7 +24,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Syntax validation
-        run: python -m py_compile app5_1_automated.py
+        run: python -m py_compile app5_1_automated.py document_pipeline.py
+      - name: Offline document benchmark
+        run: python tests/benchmark_document_pipeline.py
       - name: Run marking regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 

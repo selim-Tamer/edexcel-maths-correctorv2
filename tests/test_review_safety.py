@@ -1,3 +1,4 @@
+from pipeline_fakes import Clock
 """Regressions for review state, audit sequencing and upload ownership."""
 import ast
 import copy
@@ -343,9 +344,8 @@ class UploadOwnershipTests(unittest.TestCase):
                 client = fake_client()
                 client.files.upload.side_effect = None
                 client.files.upload.return_value = remote("" if failure == "unknown" else "PROCESSING", "pending")
-                f["time"] = SimpleNamespace(
-                    monotonic=Mock(side_effect=[0, 181 if failure == "timeout" else 0]), sleep=Mock())
-                client.files.get.side_effect = RuntimeError("poll error")
+                f["time"] = Clock()
+                client.files.get.side_effect = (lambda **kw: remote("PROCESSING", "pending")) if failure == "timeout" else RuntimeError("poll error")
                 with self.assertRaises((RuntimeError, TimeoutError)):
                     f["upload_bytes_to_gemini"](client, b"synthetic", "synthetic.pdf")
                 client.files.delete.assert_called_once_with(name="pending")
