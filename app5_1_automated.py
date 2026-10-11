@@ -9,6 +9,7 @@ import io
 import random
 import tempfile
 import time
+import document_pipeline as documents
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -51,7 +52,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.11"
+APP_VERSION = "3.3.12"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -94,6 +95,146 @@ def get_server_api_key() -> str:
     return os.getenv("GEMINI_API_KEY", "").strip()
 
 
+def document_session(api_key):
+    """Create caches per browser session, API credential, and signed-in identity."""
+    account = (getattr(st.user, "sub", "") or getattr(st.user, "email", "")) if google_logged_in() else "manual"
+    scope = documents.digest(json.dumps([api_key, account]).encode())
+    session = st.session_state.get("document_session")
+    if session is None or session["files"].scope != scope:
+        if session is not None:
+            session["files"].clear()
+        session = {"files": documents.FileCache(scope),
+                   "metadata": documents.Memo(), "results": documents.Memo()}
+        st.session_state["document_session"] = session
+    return session
+
+
+def show_document_progress(action):
+    """Run preparation off the UI thread; report elapsed time without extra API polls."""
+    events = Queue()
+    area = st.empty()
+    records = []
+    current = {}
+    result = None
+    started = time.monotonic()
+    def report(label, event):
+        events.put((label, event, time.monotonic()))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(action, report)
+            while True:
+                wait([future], timeout=0.25)
+                while True:
+                    try:
+                        label, event, received = events.get_nowait()
+                        current[label] = (event, received)
+                        if event.get("done"):
+                            records.append({"Document": label, "Stage": event["stage"],
+                                            "Seconds": round(event["elapsed"], 3)})
+                    except Empty:
+                        break
+                if current:
+                    lines = []
+                    for label, (event, received) in current.items():
+                        elapsed = event["elapsed"] + (0 if event.get("done") else time.monotonic() - received)
+                        lines.append(f"{label} — {event['stage']}: {elapsed:.1f}s")
+                    area.caption("\n\n".join(lines))
+                else:
+                    area.caption(f"Preparing documents: {time.monotonic() - started:.1f}s")
+                if future.done():
+                    result = future.result()
+                    break
+        return result
+    finally:
+        st.session_state["last_document_timings"] = records
+        if records:
+            st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
+
+
+def prepare_manual_batch(client, students, scheme, question, audit, random_count, session, run, report=None):
+    """Resolve successful result hits BEFORE uploading student/reference documents."""
+    started = time.monotonic()
+    def event(label, stage, elapsed, done=True):
+        if report:
+            report(label, {"stage": stage, "elapsed": elapsed, "done": done})
+    scope = session["files"].scope
+    scheme_data = scheme.getvalue()
+    question_data = question.getvalue() if question else None
+    scheme_hash = documents.digest(scheme_data)
+    question_hash = documents.digest(question_data) if question_data is not None else "none"
+    config = (APP_VERSION, tuple(PRIMARY_MODELS), tuple(AUDIT_MODELS))
+    reference_key = (scope, "manual", scheme_hash, question_hash, config)
+    metadata = session["metadata"]
+    results = session["results"]
+    remotes = {}
+    event("References", "Content hashing", time.monotonic() - started)
+
+    def acquire(label, data, filename, owner, reference=False):
+        callback = (lambda update: report(label, update)) if report else None
+        return run.acquire(data, filename, owner, reference, callback)
+
+    def references():
+        if "mark_scheme" not in remotes:
+            remotes["mark_scheme"] = acquire("Mark scheme", scheme_data, scheme.name, "manual:scheme", True)
+            if question:
+                remotes["question"] = acquire("Question paper", question_data, question.name, "manual:question", True)
+
+    selected = None
+    if random_count is not None:
+        numbers = metadata.get((reference_key, "question_numbers"))
+        if numbers is None:
+            references()
+            tick = time.monotonic()
+            event("References", "Identify question numbers", 0, False)
+            numbers = discover_question_numbers(client, remotes["mark_scheme"], remotes.get("question"))
+            metadata.put((reference_key, "question_numbers"), numbers)
+            event("References", "Identify question numbers", time.monotonic() - tick)
+        selected = select_spread_questions(numbers, random_count)
+
+    started = time.monotonic()
+    keys, cached, pending = {}, {}, []
+    for index, student in enumerate(students):
+        key = (reference_key, index, student.name, documents.digest(student.getvalue()),
+               bool(audit), tuple(selected) if selected is not None else None)
+        keys[index] = key
+        row = results.get(key)
+        if row is not None and row.get("status") == "Marked" and not row.get("audit_warning"):
+            cached[index] = row
+        else:
+            pending.append(index)
+    event("Batch", "Hash and result-cache lookup", time.monotonic() - started)
+    scheme_info = (None, None, None)
+    if pending:
+        # Resolve cache hits first, then overlap at most two required uploads.
+        # Wait for every worker before handing cleanup back to DocumentRun.close().
+        jobs = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if "mark_scheme" not in remotes:
+                jobs[executor.submit(acquire, "Mark scheme", scheme_data, scheme.name, "manual:scheme", True)] = "mark_scheme"
+                if question:
+                    jobs[executor.submit(acquire, "Question paper", question_data, question.name, "manual:question", True)] = "question"
+            for index in pending:
+                student = students[index]
+                jobs[executor.submit(acquire, f"Student PDF {index + 1}", student.getvalue(), student.name,
+                                     f"manual:student:{index}:{student.name}")] = f"student_{index}"
+            for future in as_completed(jobs):
+                remotes[jobs[future]] = future.result()
+        scheme_info = metadata.get((reference_key, "scheme"))
+        if scheme_info is None:
+            tick = time.monotonic()
+            event("Mark scheme", "Prepare marking evidence", 0, False)
+            scheme_info = extract_scheme_maxima(client, remotes["mark_scheme"])
+            if scheme_info[0] and not scheme_info[2]:
+                metadata.put((reference_key, "scheme"), scheme_info)
+            event("Mark scheme", "Prepare marking evidence", time.monotonic() - tick)
+        else:
+            event("Mark scheme", "Reused extracted evidence", 0)
+    else:
+        event("Batch", "All student results reused" if remotes else "All results reused; no Gemini requests", 0)
+    return {"remotes": remotes, "scheme_info": scheme_info, "selected": selected,
+            "keys": keys, "cached": cached, "pending": pending}
+
+
 def upload_pdf(client, uploaded_file):
     """Upload a manual PDF using the same lifecycle as Classroom attachments."""
     return upload_bytes_to_gemini(client, uploaded_file.getvalue(), uploaded_file.name)
@@ -103,7 +244,7 @@ def upload_pdf_batch(client, files_to_upload):
     """Own all uploads until the whole batch succeeds, including late completions."""
     uploaded = {}
     errors = []
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(files_to_upload)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(2, max(1, len(files_to_upload)))) as executor:
         futures = {
             executor.submit(upload_pdf, client, upload): name
             for name, upload in files_to_upload.items()
@@ -1640,46 +1781,9 @@ def download_drive_file(token: str, file_id: str):
     return name, response.content, mime
 
 
-def upload_bytes_to_gemini(client, data: bytes, filename: str):
-    """Transfer ownership to the caller only after remote processing succeeds."""
-    suffix = os.path.splitext(filename)[1].lower() or ".bin"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
-    remote_file = None
-    try:
-        remote_file = client.files.upload(file=tmp_path)
-        upload_wait_started = time.monotonic()
-        upload_timeout_seconds = 180
-        while getattr(getattr(remote_file, "state", None), "name", "") == "PROCESSING":
-            if time.monotonic() - upload_wait_started > upload_timeout_seconds:
-                raise TimeoutError(
-                    f"Gemini file processing timed out after "
-                    f"{upload_timeout_seconds} seconds for '{filename}'."
-                )
-            time.sleep(0.5)
-            remote_file = client.files.get(name=remote_file.name)
-
-        state_name = getattr(getattr(remote_file, "state", None), "name", "")
-        if state_name not in {"ACTIVE", "SUCCEEDED"}:
-            raise RuntimeError(
-                f"Gemini could not finish processing '{filename}'. "
-                f"File state: {state_name or 'unknown'}"
-            )
-        return remote_file
-    except Exception:
-        if remote_file is not None:
-            try:
-                client.files.delete(name=remote_file.name)
-            except Exception:
-                pass
-        raise
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+def upload_bytes_to_gemini(client, data: bytes, filename: str, progress=None):
+    """Identical byte-preserving transport for manual and Classroom documents."""
+    return documents.transfer(client, data, filename, progress=progress, clock=time)
 
 
 def classroom_attachment_ids(submission: dict):
@@ -1754,7 +1858,9 @@ def mark_one_classroom_submission(
     try:
         for file_index, file_id in enumerate(attachment_ids, start=1):
             report_stage(f"Downloading attachment {file_index}/{len(attachment_ids)} from Google Drive")
+            download_started = time.monotonic()
             filename, data, mime = download_drive_file(token, file_id)
+            report_stage(f"Drive download complete: {time.monotonic() - download_started:.1f}s")
 
             # For now, safely accept PDFs and common images.
             # Unsupported Drive types are skipped with an explanation.
@@ -1770,7 +1876,9 @@ def mark_one_classroom_submission(
                 )
 
             report_stage(f"Uploading {filename} to Gemini")
-            remote_students.append(upload_bytes_to_gemini(client, data, filename))
+            remote_students.append(upload_bytes_to_gemini(
+                client, data, filename, progress=lambda event: report_stage(
+                    f"Attachment {file_index}: {event['stage']} — {event['elapsed']:.1f}s")))
 
         report_stage("Waiting for Gemini to mark the submission")
         raw_result, marking_model = grade_with_model(
@@ -1932,6 +2040,34 @@ def merge_classroom_results(previous, current, processed_revisions=None):
     return dict(current, processed=list(rows.values()))
 
 
+def prepare_classroom_reference(client, upload, session, run, context, random_count, report):
+    """Cache only successful reference interpretation, scoped to this assignment."""
+    data = upload.getvalue()
+    key = (session["files"].scope, context, documents.digest(data), APP_VERSION, tuple(PRIMARY_MODELS))
+    remote = run.acquire(data, upload.name, "classroom:scheme:" + context, True,
+                         lambda event: report("Classroom mark scheme", event))
+    info = session["metadata"].get((key, "scheme"))
+    if info is None:
+        started = time.monotonic()
+        report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": 0, "done": False})
+        info = extract_scheme_maxima(client, remote)
+        if info[0] and not info[2]:
+            session["metadata"].put((key, "scheme"), info)
+        report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": time.monotonic() - started, "done": True})
+    else:
+        report("Classroom mark scheme", {"stage": "Reused extracted evidence", "elapsed": 0, "done": True})
+    numbers = None
+    if random_count is not None:
+        numbers = session["metadata"].get((key, "numbers"))
+        if numbers is None:
+            started = time.monotonic()
+            report("Classroom mark scheme", {"stage": "Identify question numbers", "elapsed": 0, "done": False})
+            numbers = discover_question_numbers(client, remote)
+            session["metadata"].put((key, "numbers"), numbers)
+            report("Classroom mark scheme", {"stage": "Identify question numbers", "elapsed": time.monotonic() - started, "done": True})
+    return remote, info, numbers
+
+
 def run_classroom_marking_job(
     token: str,
     client,
@@ -1942,6 +2078,9 @@ def run_classroom_marking_job(
     already_processed_ids: set,
     random_count=None,
     force_remark=False,
+    document_state=None,
+    retain_references=False,
+    document_context="",
 ):
     """
     Find TURNED_IN submissions not yet processed this session and mark their
@@ -1950,8 +2089,8 @@ def run_classroom_marking_job(
     project created, so scores are surfaced in the UI/report for the teacher
     to enter into the gradebook.
 
-    Mark up to two submissions concurrently. This improves throughput while
-    keeping Gemini request volume conservative. Streamlit UI updates happen
+    Mark submissions sequentially to keep Gemini request volume conservative.
+    Streamlit UI updates happen
     only on the main thread as each worker finishes.
 
     `already_processed_ids` stores revision fingerprints within this assignment,
@@ -1987,27 +2126,29 @@ def run_classroom_marking_job(
             "active_submission_ids": active_submission_ids,
         }
 
-    mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
+    mark_scheme_remote = None
+    reference_run = None
     processed = []
-    scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
-    if scheme_warning:
-        st.warning(scheme_warning)
-    selected_questions = None
-    homework_question_count = None
-    if random_count is not None:
-        try:
-            numbers = discover_question_numbers(client, mark_scheme_remote)
+    try:
+        if document_state is not None:
+            reference_run = documents.DocumentRun(client, document_state["files"], retain_references)
+            mark_scheme_remote, info, numbers = show_document_progress(
+                lambda report: prepare_classroom_reference(client, mark_scheme_upload,
+                    document_state, reference_run, document_context, random_count, report))
+            scheme_maxima, scheme_answers, scheme_warning = info
+        else:
+            mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
+            scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+            numbers = discover_question_numbers(client, mark_scheme_remote) if random_count is not None else None
+        if scheme_warning:
+            st.warning(scheme_warning)
+        selected_questions = None
+        homework_question_count = None
+        if random_count is not None:
             homework_question_count = len(numbers)
             selected_questions = select_spread_questions(numbers, random_count)
             st.info("Random questions (same for all students): " + ", ".join(selected_questions))
-        except Exception:
-            try:
-                client.files.delete(name=mark_scheme_remote.name)
-            except Exception:
-                pass
-            raise
 
-    try:
         max_workers = 1
         st.write(
             f"⚡ Marking {len(pending)} pending submission(s), "
@@ -2152,10 +2293,14 @@ def run_classroom_marking_job(
         }
 
     finally:
-        try:
-            client.files.delete(name=mark_scheme_remote.name)
-        except Exception:
-            pass
+        if reference_run is not None:
+            reference_run.close()
+        elif mark_scheme_remote is not None:
+            try:
+                client.files.delete(name=mark_scheme_remote.name)
+            except Exception:
+                pass
+
 
 
 # ============================================================
@@ -2624,6 +2769,26 @@ with st.sidebar:
                  "GEMINI_API_KEY in Streamlit Secrets or the server environment.",
         ).strip()
 
+    document_state = document_session(api_key)
+    retain_references = st.checkbox(
+        "Reuse reference PDFs for up to 10 minutes", value=False,
+        key="retain_reference_pdfs",
+        help="Optional: keep mark schemes and question papers in Gemini for this browser session. "
+             "Student uploads are always deleted after each run. If this tab closes, Gemini may "
+             "retain reference files until its automatic expiry (up to 48 hours).",
+    )
+    if not retain_references:
+        document_state["files"].clear()
+    else:
+        document_state["files"].prune()
+    if st.button("Clear document and marking caches"):
+        document_state["files"].clear()
+        document_state["metadata"].entries.clear()
+        document_state["results"].entries.clear()
+        st.success("Document and marking caches cleared.")
+    if document_state["files"].cleanup_failures:
+        st.warning("Some Gemini files could not be deleted. They remain subject to Gemini's automatic expiry.")
+
     if st.button("🔑 Test API key", use_container_width=True):
         ok, message = test_api_key(api_key)
         if ok:
@@ -2729,6 +2894,8 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
         with auth_col2:
             if google_logged_in():
                 if st.button("Log out", use_container_width=True, key="classroom_logout"):
+                    document_state["files"].clear()
+                    st.session_state.pop("document_session", None)
                     st.logout()
             else:
                 if st.button("🔗 Connect Google Classroom", type="primary", use_container_width=True):
@@ -2873,6 +3040,9 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 already_processed_ids=processed_ids,
                                                 random_count=classroom_random_count,
                                                 force_remark=force_remark,
+                                                document_state=document_state,
+                                                retain_references=retain_references,
+                                                document_context=context_key,
                                             )
 
                                             classroom_status.update(
@@ -3058,7 +3228,7 @@ if st.button(
     disabled=not ready,
 ):
     client = None
-    uploaded_remote_files = []
+    document_run = None
     batch_results = []
 
     try:
@@ -3068,29 +3238,21 @@ if st.button(
         )
 
         with st.status("Preparing automatic marking...", expanded=True) as status:
-            st.write(
-                f"⚡ Uploading mark scheme, question paper (if any), and "
-                f"{len(student_pdfs)} student PDF(s) to Gemini..."
-            )
-
-            files_to_upload = {"mark_scheme": mark_scheme_pdf}
-            if question_pdf:
-                files_to_upload["question"] = question_pdf
-            for i, sp in enumerate(student_pdfs):
-                files_to_upload[f"student_{i}"] = sp
-
-            upload_jobs = upload_pdf_batch(client, files_to_upload)
-            uploaded_remote_files.extend(upload_jobs.values())
-
-            mark_scheme_remote = upload_jobs["mark_scheme"]
+            document_run = documents.DocumentRun(client, document_state["files"], retain_references)
+            total_bytes = sum(item.size for item in student_pdfs) + mark_scheme_pdf.size + (question_pdf.size if question_pdf else 0)
+            st.caption(f"Streamlit received {total_bytes / 1024 / 1024:.2f} MiB. "
+                       "Browser-to-Streamlit upload time is not exposed by the native uploader.")
+            plan = show_document_progress(lambda report: prepare_manual_batch(
+                client, student_pdfs, mark_scheme_pdf, question_pdf, audit_enabled,
+                random_question_count, document_state, document_run, report))
+            upload_jobs = plan["remotes"]
+            mark_scheme_remote = upload_jobs.get("mark_scheme")
             question_remote = upload_jobs.get("question")
-            scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
+            scheme_maxima, scheme_answers, scheme_warning = plan["scheme_info"]
+            selected_questions = plan["selected"]
             if scheme_warning:
                 st.warning(scheme_warning)
-            selected_questions = None
-            if random_question_count is not None:
-                numbers = discover_question_numbers(client, mark_scheme_remote, question_remote)
-                selected_questions = select_spread_questions(numbers, random_question_count)
+            if selected_questions is not None:
                 st.info("Random questions for all students: " + ", ".join(selected_questions))
 
             # Process student marking jobs sequentially to keep Gemini request
@@ -3103,21 +3265,10 @@ if st.button(
             with ThreadPoolExecutor(max_workers=max_workers) as marking_executor:
                 marking_futures = {}
                 cached_rows = []
-                cache = st.session_state.setdefault("marking_cache", {})
-                mark_scheme_sig = __import__("hashlib").sha256(
-                    mark_scheme_pdf.getvalue()
-                ).hexdigest()
-                question_sig = (
-                    __import__("hashlib").sha256(question_pdf.getvalue()).hexdigest()
-                    if question_pdf else "none"
-                )
                 for i, sp in enumerate(student_pdfs):
-                    cache_key = (
-                        f"{sp.name}|{__import__('hashlib').sha256(sp.getvalue()).hexdigest()}"
-                        f"|{mark_scheme_sig}|{question_sig}|audit={audit_enabled}|selection={selected_questions}|version={APP_VERSION}"
-                    )
-                    if cache_key in cache:
-                        cached_rows.append(cache[cache_key])
+                    cache_key = plan["keys"][i]
+                    if i in plan["cached"]:
+                        cached_rows.append(plan["cached"][i])
                     else:
                         future = marking_executor.submit(
                             mark_one_submission,
@@ -3158,7 +3309,8 @@ if st.button(
                             )
 
                         batch_results.append(row)
-                        st.session_state.setdefault("marking_cache", {})[cache_key] = row
+                        if row.get("status") == "Marked" and not row.get("audit_warning") and not scheme_warning:
+                            document_state["results"].put(cache_key, row)
                         st.write(
                             f"✅ [{completed}/{len(student_pdfs)}] Marked {sp_name}"
                         )
@@ -3222,12 +3374,9 @@ if st.button(
             st.code(message)
 
     finally:
-        if client is not None:
-            for remote_file in uploaded_remote_files:
-                try:
-                    client.files.delete(name=remote_file.name)
-                except Exception:
-                    pass
+        if document_run is not None:
+            document_run.close()
+
 
 
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from support import fake_client, load_app, remote
+from pipeline_fakes import Clock
 
 
 def synthetic_pdf(pages=1):
@@ -48,7 +49,7 @@ class PdfProcessingTests(unittest.TestCase):
                 client = fake_client()
                 data = synthetic_pdf(3)
                 paths = []
-                def upload(*, file):
+                def upload(*, file, config=None):
                     paths.append(file)
                     self.assertEqual(Path(file).read_bytes(), data)
                     return remote("PROCESSING")
@@ -68,18 +69,24 @@ class PdfProcessingTests(unittest.TestCase):
                     f = load_app()
                     client = fake_client()
                     paths = []
-                    def upload(*, file):
+                    def upload(*, file, config=None):
                         paths.append(file)
                         if failure == "upload error":
                             raise RuntimeError("synthetic transport error")
                         return remote("PROCESSING" if failure == "timeout" else "FAILED")
                     client.files.upload.side_effect = upload
-                    f["time"] = SimpleNamespace(monotonic=Mock(side_effect=[0, 181]), sleep=Mock())
+                    f["time"] = Clock()
+                    if failure == "timeout":
+                        client.files.get.side_effect = lambda **kwargs: remote("PROCESSING")
                     with self.assertRaises((RuntimeError, TimeoutError)):
                         self.invoke(f, client, synthetic_pdf(), manual)
                     self.assertTrue(paths)
                     self.assertTrue(all(not os.path.exists(p) for p in paths))
-                    client.files.get.assert_not_called()
+                    if failure == "timeout":
+                        self.assertEqual(f["time"].monotonic(), 180)
+                        self.assertLessEqual(client.files.get.call_count, 92)
+                    else:
+                        client.files.get.assert_not_called()
 
     def test_corrupt_or_empty_pdf_rejected_by_service_is_propagated(self):
         for data in (b"", b"%PDF-corrupt"):

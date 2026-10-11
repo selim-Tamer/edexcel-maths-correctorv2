@@ -147,3 +147,8 @@ but their approval is cleared, approval/override controls are disabled or absent
 and no current Classroom grade is suggested. A subsequent resubmission receives
 a fresh review even if its revision fingerprint is unchanged. Unchanged work
 that is still turned in retains its review and approval.
+
+
+## Document preparation performance
+
+Run `python tests/benchmark_document_pipeline.py` for a zero-network comparison against PR #4. The main stdlib suite enforces its request budgets. `python -m unittest discover -s tests/ui -p "test_*.py" -v` includes the actual manual Mark button and ordinary rerun checks in Streamlit AppTest. See [PDF_PERFORMANCE.md](PDF_PERFORMANCE.md) for measurements, cache privacy, lifecycle, request limits and unmeasured live stages. Never add supplied student PDFs to test fixtures.
