@@ -108,3 +108,42 @@ For a manual acceptance check, use synthetic work, apply an override, download b
 report formats, re-mark the same filename, switch Classroom assignments, edit a test
 attachment and check again. Confirm that each new run needs its own review and that
 no grades are written to Classroom. Do not use live student data for CI.
+
+
+## PR review follow-up regressions
+
+The stdlib suite covers submitted widget values versus render-time callback
+arguments; success → failed/skipped forced re-mark → normal retry; withdrawal and
+resubmission; unchanged current approvals; and keeping environment/Secrets keys
+out of browser inputs. Result reconciliation uses the complete successful
+turned-in listing, including when there are no new submissions to mark. A failed
+listing does not remove or relabel history.
+
+A separate CI job installs Streamlit 1.65.0 and runs real widget lifecycle tests:
+
+    python -m pip install streamlit==1.65.0
+    python -m unittest discover -s tests/ui -p 'test_*.py' -v
+
+These tests use AppTest, the production report block and synthetic session data.
+They submit edited marks/reasons together with the Apply button, check approval
+reset before rendering, and verify historical results cannot be approved or edited.
+They make no OAuth, Classroom or Gemini requests. AppTest is not a browser/OAuth
+end-to-end test; the live acceptance plan above still applies. The original
+stdlib job remains dependency-free; the UI job requires package downloads.
+
+### Credential migration
+
+Automatic key persistence and reading keys from a local .env file have been
+removed. Existing .env files are not deleted or modified. If you used that feature,
+configure GEMINI_API_KEY in Streamlit Secrets or the server environment, or enter
+a key for the current session. Server credentials are never used as widget values.
+Keys entered through the UI are session-only and are never saved to a shared file.
+
+### Historical Classroom results
+
+After a successful check, submissions no longer in the turned-in listing remain
+visible as historical results. Their previous score is retained for reference,
+but their approval is cleared, approval/override controls are disabled or absent,
+and no current Classroom grade is suggested. A subsequent resubmission receives
+a fresh review even if its revision fingerprint is unchanged. Unchanged work
+that is still turned in retains its review and approval.

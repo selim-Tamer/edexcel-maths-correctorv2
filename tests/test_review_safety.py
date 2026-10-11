@@ -303,7 +303,8 @@ class ClassroomStateTests(unittest.TestCase):
 
     def test_refresh_preserves_older_rows_and_replaces_remarked_rows(self):
         previous = {"processed": [{"submission_id": "a", "score": 1}, {"submission_id": "b", "score": 2}]}
-        current = {"pending": 1, "processed": [{"submission_id": "a", "score": 3}]}
+        current = {"pending": 1, "processed": [{"submission_id": "a", "score": 3}],
+                   "active_submission_ids": ["a", "b"]}
         result = self.f["merge_classroom_results"](previous, current)
         self.assertEqual({r["submission_id"]: r["score"] for r in result["processed"]}, {"a": 3, "b": 2})
         empty = dict(current, pending=0, processed=[])

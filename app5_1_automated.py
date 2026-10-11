@@ -51,7 +51,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.10"
+APP_VERSION = "3.3.11"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -83,65 +83,15 @@ GROUP_SIZE = 5
 # HELPERS
 # ============================================================
 
-def get_saved_api_key() -> str:
-    """Read the API key from Streamlit secrets, local .env, or the environment."""
-    # Streamlit secrets
+def get_server_api_key() -> str:
+    """Read server credentials without exposing them through browser widgets."""
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
         if secret_key:
             return str(secret_key).strip()
     except Exception:
         pass
-
-    # Local .env file in the same folder as this app.
-    # This is useful for a personal/local installation so the key
-    # survives closing and reopening the app.
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    try:
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, value = line.split("=", 1)
-                    if key.strip() == "GEMINI_API_KEY":
-                        value = value.strip().strip('"').strip("'")
-                        if value:
-                            return value
-    except OSError:
-        pass
-
     return os.getenv("GEMINI_API_KEY", "").strip()
-
-
-def save_api_key_locally(api_key: str) -> bool:
-    """Save the working key in a local .env file next to the app."""
-    if not api_key:
-        return False
-
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
-    try:
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("# Local Gemini API key for the IGCSE Maths Corrector\n")
-            f.write("GEMINI_API_KEY=" + api_key.replace("\n", "").strip() + "\n")
-
-        # Best-effort restriction on systems that support chmod.
-        try:
-            os.chmod(env_path, 0o600)
-        except OSError:
-            pass
-
-        return True
-    except OSError:
-        return False
-
-
-def mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return "********"
-    return f"{key[:4]}{'*' * max(4, len(key) - 8)}{key[-4:]}"
 
 
 def upload_pdf(client, uploaded_file):
@@ -501,7 +451,7 @@ def render_teacher_override_controls(student_key: str, result: dict):
         key=f"override_q_{student_key}",
     )
     q = next(q for q in questions if str(q["question_number"]) == selected)
-    new_mark = st.number_input(
+    st.number_input(
         "Teacher-awarded marks",
         min_value=0,
         max_value=int(q["max_marks"]),
@@ -509,7 +459,7 @@ def render_teacher_override_controls(student_key: str, result: dict):
         step=1,
         key=f"override_mark_{student_key}_{selected}",
     )
-    reason = st.text_input(
+    st.text_input(
         "Reason (optional)",
         key=f"override_reason_{student_key}_{selected}",
     )
@@ -517,9 +467,23 @@ def render_teacher_override_controls(student_key: str, result: dict):
         "Apply override",
         key=f"apply_override_{student_key}_{selected}",
         use_container_width=True,
-        on_click=save_teacher_override,
-        args=(student_key, selected, new_mark, reason),
+        on_click=save_teacher_override_from_widgets,
+        args=(student_key, selected),
     )
+
+
+def save_teacher_override_from_widgets(student_key, selected):
+    """Read the submitted state; callback args are snapshots from the last render."""
+    save_teacher_override(
+        student_key, selected,
+        st.session_state[f"override_mark_{student_key}_{selected}"],
+        st.session_state[f"override_reason_{student_key}_{selected}"],
+    )
+
+
+def invalidate_classroom_approval(student_key):
+    st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
+    st.session_state[f"classroom_approval_checkbox_{student_key}"] = False
 
 
 def save_teacher_override(student_key, selected, new_mark, reason):
@@ -527,8 +491,7 @@ def save_teacher_override(student_key, selected, new_mark, reason):
     st.session_state.setdefault("teacher_overrides", {}).setdefault(student_key, {})[selected] = int(new_mark)
     st.session_state.setdefault("teacher_override_reasons", {}).setdefault(student_key, {})[selected] = reason
     if student_key.startswith("classroom_"):
-        st.session_state.setdefault("classroom_grade_approvals", {}).pop(student_key, None)
-        st.session_state[f"classroom_approval_checkbox_{student_key}"] = False
+        invalidate_classroom_approval(student_key)
 
 
 def classroom_grade_details(row, rounding_places=2):
@@ -552,16 +515,23 @@ def classroom_grade_details(row, rounding_places=2):
     audit_failure = bool(row.get("audit_warning"))
     incomplete = bool(selected and len(questions) != len(row.get("selected_questions") or []))
     requires_review = low > 0 or medium > 0 or audit_failure or incomplete or bool(row["result"].get("validation_warnings"))
-    approval = st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
+    is_current = row.get("is_current", True)
+    approval = is_current and st.session_state.get("classroom_grade_approvals", {}).get(student_key, False)
+    if not is_current:
+        proposed = None
     return {
         "score": f"{earned}/{possible}",
         "percentage": f"{percentage:.2f}%",
         "display_grade": f"{proposed:.{rounding_places}f}" if proposed is not None else "—",
         "ai_grade": f"{original:.{rounding_places}f}" if original is not None else "—",
         "approved": approval,
-        "approval_status": "Teacher approved" if approval else "Pending review",
+        "approval_status": ("Historical — no longer turned in" if not is_current
+                            else "Teacher approved" if approval else "Pending review"),
+        "is_current": is_current,
         "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
-        "reliability": "UNVERIFIED — teacher review required" if requires_review else "Provisional AI grade (not independently certified)",
+        "reliability": ("Historical result — not a current grade suggestion" if not is_current
+                        else "UNVERIFIED — teacher review required" if requires_review
+                        else "Provisional AI grade (not independently certified)"),
         "low": low,
         "medium": medium,
         "audit_failure": audit_failure,
@@ -1941,10 +1911,24 @@ def classroom_submission_revision(token, submission):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def merge_classroom_results(previous, current):
-    """Keep earlier results when checking for new work; replace re-marked rows."""
+def merge_classroom_results(previous, current, processed_revisions=None):
+    """Reconcile history against a complete, successful turned-in listing."""
     rows = {row["submission_id"]: row for row in (previous or {}).get("processed", [])}
-    rows.update({row["submission_id"]: row for row in current["processed"]})
+    for row in current["processed"]:
+        old = rows.get(row["submission_id"])
+        if old and old.get("review_key") != row.get("review_key") and old.get("review_key"):
+            invalidate_classroom_approval(old["review_key"])
+        rows[row["submission_id"]] = row
+    active_ids = set(current["active_submission_ids"])
+    for submission_id, row in rows.items():
+        row["is_current"] = submission_id in active_ids
+        if not row["is_current"]:
+            if row.get("review_key"):
+                invalidate_classroom_approval(row["review_key"])
+            # A later resubmission needs a fresh review even if its fingerprint
+            # happens to be unchanged.
+            if processed_revisions is not None:
+                processed_revisions.discard(row.get("revision"))
     return dict(current, processed=list(rows.values()))
 
 
@@ -1979,6 +1963,7 @@ def run_classroom_marking_job(
         coursework["id"],
     )
 
+    active_submission_ids = [s["id"] for s in submissions if s.get("state") == "TURNED_IN"]
     pending = []
     revisions = {}
     for submission in submissions:
@@ -1999,6 +1984,7 @@ def run_classroom_marking_job(
             "pending": 0,
             "processed": [],
             "message": "No new turned-in submissions found.",
+            "active_submission_ids": active_submission_ids,
         }
 
     mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
@@ -2147,16 +2133,22 @@ def run_classroom_marking_job(
                             f"**{row['student']}** — {row['reason']}"
                         )
     
-                    processed.append(new_review_row(row, "classroom"))
+                    reviewed = new_review_row(row, "classroom")
+                    reviewed["revision"] = revisions[row["submission_id"]]
+                    reviewed["is_current"] = True
+                    processed.append(reviewed)
     
                     # Failed/skipped work remains retryable on the next check.
                     if row["status"] == "Marked":
                         already_processed_ids.add(revisions[row["submission_id"]])
+                    else:
+                        already_processed_ids.discard(revisions[row["submission_id"]])
     
         return {
             "pending": len(pending),
             "processed": processed,
             "message": f"Processed {len(processed)} submission(s).",
+            "active_submission_ids": active_submission_ids,
         }
 
     finally:
@@ -2618,53 +2610,29 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Settings")
 
-    saved_key = get_saved_api_key()
-
-    cloud_key_configured = False
-    try:
-        cloud_key_configured = bool(st.secrets.get("GEMINI_API_KEY", ""))
-    except Exception:
-        cloud_key_configured = False
-
-    if cloud_key_configured:
-        api_key = str(st.secrets["GEMINI_API_KEY"]).strip()
-        st.success("🔐 Gemini API key loaded from Streamlit Secrets")
-        st.caption("The API key is hidden from app users.")
+    server_key = get_server_api_key()
+    if server_key:
+        api_key = server_key
+        st.success("🔐 Gemini API key configured on the server")
     else:
         api_key = st.text_input(
             "Gemini API key",
-            value=saved_key,
+            value="",
             type="password",
-            help="For local use, enter a Gemini API key. For Community Cloud, "
-                 "put GEMINI_API_KEY in Streamlit Secrets instead.",
+            key="session_gemini_api_key",
+            help="Used only for this session. For a server key, configure "
+                 "GEMINI_API_KEY in Streamlit Secrets or the server environment.",
         ).strip()
-
-    remember_key = st.checkbox(
-        "Remember this API key on this computer",
-        value=True,
-        help="After a successful test, save the key locally so you do not "
-             "need to enter it every time.",
-    )
 
     if st.button("🔑 Test API key", use_container_width=True):
         ok, message = test_api_key(api_key)
         if ok:
             st.success(message)
-
-            if remember_key and not cloud_key_configured:
-                if save_api_key_locally(api_key):
-                    st.success("✅ API key saved. You will not need to enter it next time.")
-                else:
-                    st.warning(
-                        "The API key works, but I could not save it locally. "
-                        "You may need to enter it again next time."
-                    )
         else:
-            st.error(message)
+            # Provider errors may echo request credentials; keep them server-side.
+            st.error("API key test failed. Check the key, model access and quota.")
 
-    if api_key:
-        st.caption(f"Key loaded: {mask_key(api_key)}")
-    else:
+    if not api_key:
         st.caption("No API key loaded.")
 
     st.caption(f"App version: {APP_VERSION}")
@@ -2913,7 +2881,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 expanded=False,
                                             )
 
-                                        job_state["last_result"] = merge_classroom_results(job_state["last_result"], result)
+                                        job_state["last_result"] = merge_classroom_results(job_state["last_result"], result, processed_ids)
 
                                     except Exception as classroom_error:
                                         message = str(classroom_error)
@@ -2958,7 +2926,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                         details = classroom_grade_details(row, places)
                                         summary_rows.append({
                                             "Student": row["student"],
-                                            "Status": "Marked",
+                                            "Status": "Marked" if details["is_current"] else "Historical",
                                             "Scope": details["sample"],
                                             "Score": details["score"],
                                             "Percentage": details["percentage"],
@@ -3014,6 +2982,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 "I reviewed this result and approve this suggested Classroom grade",
                                                 key=f"classroom_approval_checkbox_{student_key}",
                                                 value=details["approved"],
+                                                disabled=not details["is_current"],
                                                 on_change=lambda k=student_key:
                                                     st.session_state.setdefault("classroom_grade_approvals", {}).__setitem__(
                                                         k, st.session_state[f"classroom_approval_checkbox_{k}"]
@@ -3022,7 +2991,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                             render_student_report(
                                                 row["student"], row["result"], row["totals"],
                                                 row["groups"], row["marking_model"], row["audit_model"],
-                                                student_key=student_key,
+                                                student_key=student_key if details["is_current"] else None,
                                             )
                             elif last_result:
                                 st.info(last_result["message"])
