@@ -17,3 +17,5 @@ venv/
 
 # Isolated local UI-test dependencies
 .test-deps/
+.sdk-test-deps/
+.perf-deps/
