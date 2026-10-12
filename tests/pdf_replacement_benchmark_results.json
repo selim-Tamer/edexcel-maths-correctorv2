@@ -1,0 +1,86 @@
+{
+  "live_api_requests": 0,
+  "python": "3.12.14",
+  "platform": "Windows",
+  "versions": {
+    "pypdf": "6.20.1",
+    "pypdfium2": "5.14.0",
+    "Pillow": "12.3.0",
+    "reportlab": "5.0.1"
+  },
+  "repeats": 20,
+  "cases": {
+    "digital_ink": {
+      "source_bytes": 9669,
+      "source_pages": 6,
+      "selected_pages": [
+        3,
+        1
+      ],
+      "rendered_pixels_preserved": true,
+      "replacement": {
+        "median_ms": 24.063,
+        "min_ms": 22.849,
+        "max_ms": 31.834,
+        "excerpt_bytes": 3489,
+        "preview_bytes": 50917
+      },
+      "pr9_pymupdf_baseline": {
+        "median_ms": 30.33,
+        "min_ms": 28.567,
+        "max_ms": 35.72,
+        "excerpt_bytes": 3423,
+        "preview_bytes": 22477
+      },
+      "pypdf_only_two_page_text_median_ms": 5.619
+    },
+    "image_scan": {
+      "source_bytes": 66779,
+      "source_pages": 6,
+      "selected_pages": [
+        3,
+        1
+      ],
+      "rendered_pixels_preserved": true,
+      "replacement": {
+        "median_ms": 33.184,
+        "min_ms": 31.452,
+        "max_ms": 50.373,
+        "excerpt_bytes": 22430,
+        "preview_bytes": 63499
+      },
+      "pr9_pymupdf_baseline": {
+        "median_ms": 43.008,
+        "min_ms": 41.661,
+        "max_ms": 57.879,
+        "excerpt_bytes": 22402,
+        "preview_bytes": 33415
+      },
+      "pypdf_only_two_page_text_median_ms": 3.425
+    },
+    "form_ink": {
+      "source_bytes": 16100,
+      "source_pages": 6,
+      "selected_pages": [
+        3,
+        1
+      ],
+      "rendered_pixels_preserved": true,
+      "replacement": {
+        "median_ms": 28.654,
+        "min_ms": 26.634,
+        "max_ms": 31.407,
+        "excerpt_bytes": 6641,
+        "preview_bytes": 51699
+      },
+      "pr9_pymupdf_baseline": {
+        "median_ms": 31.792,
+        "min_ms": 29.397,
+        "max_ms": 46.199,
+        "excerpt_bytes": 5614,
+        "preview_bytes": 23076
+      },
+      "pypdf_only_two_page_text_median_ms": 6.827
+    }
+  }
+}

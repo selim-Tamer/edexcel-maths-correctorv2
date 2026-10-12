@@ -1,0 +1,50 @@
+{
+  "live_gemini_requests": 0,
+  "scenario": "Reference metadata only; 15 virtual seconds per generation, zero transfer/processing delay. Marking/audit latency unchanged.",
+  "pdfs": {
+    "digital_with_pen_strokes": {
+      "original_bytes": 9669,
+      "excerpt_bytes": 3489,
+      "digital_characters": 444,
+      "all_page_text_median_ms": 2.779,
+      "two_page_review_with_preview_median_ms": 22.786,
+      "before": {
+        "metadata_generations": 2,
+        "uploads": 2,
+        "virtual_metadata_seconds": 30.0,
+        "completed_repeat_requests": 0
+      },
+      "after": {
+        "metadata_generations": 1,
+        "uploads": 2,
+        "virtual_metadata_seconds": 15.0,
+        "completed_repeat_requests": 0
+      }
+    },
+    "synthetic_scan": {
+      "original_bytes": 66779,
+      "excerpt_bytes": 22430,
+      "digital_characters": 0,
+      "all_page_text_median_ms": 2.1147,
+      "two_page_review_with_preview_median_ms": 32.7786,
+      "before": {
+        "metadata_generations": 2,
+        "uploads": 2,
+        "virtual_metadata_seconds": 30.0,
+        "completed_repeat_requests": 0
+      },
+      "after": {
+        "metadata_generations": 1,
+        "uploads": 2,
+        "virtual_metadata_seconds": 15.0,
+        "completed_repeat_requests": 0
+      }
+    }
+  },
+  "numeric_four_expressions_median_ms": 0.0756,
+  "sympy_four_expressions_median_ms": 0.1038,
+  "sympy_import_ms": 6060.07,
+  "four_equality_checks_before_median_ms": 0.6894,
+  "four_equality_checks_after_median_ms": 0.5644,
+  "validation_profile": "         100401 function calls (96201 primitive calls) in 0.110 seconds\n\n   Ordered by: cumulative time\n   List reduced from 57 to 8 due to restriction <8>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n      300    0.010    0.000    0.110    0.000 app5_1_automated.py:1070(_arithmetic_equals_issues)\n      800    0.001    0.000    0.083    0.000 app5_1_automated.py:1140(number)\n      700    0.002    0.000    0.083    0.000 app5_1_automated.py:1113(parse_number)\n      700    0.003    0.000    0.076    0.000 app5_1_automated.py:1091(exact_value)\n 2300/700    0.006    0.000    0.042    0.000 app5_1_automated.py:1096(evaluate)\n      700    0.003    0.000    0.022    0.000 app5_1_automated.py:1027(_numeric_expression_value)\n     1700    0.009    0.000    0.019    0.000 fractions.py:186(__new__)\n     1500    0.003    0.000    0.014    0.000 ast.py:332(get_source_segment)\n\n\n"
+}

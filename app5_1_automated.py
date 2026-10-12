@@ -52,7 +52,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.15"
+APP_VERSION = "3.3.16"
 AUDIT_MAX_ATTEMPTS = 2
 AUDIT_MAX_OUTPUT_TOKENS = 8192
 # Stable Gemini API models with large context windows.
@@ -166,6 +166,7 @@ def prepare_manual_batch(client, students, scheme, question, audit, random_count
     question_hash = documents.digest(question_data) if question_data is not None else "none"
     config = (APP_VERSION, tuple(PRIMARY_MODELS), tuple(AUDIT_MODELS))
     reference_key = (scope, "manual", scheme_hash, question_hash, config)
+    scheme_key = (scope, "manual:scheme", scheme_hash, APP_VERSION, tuple(PRIMARY_MODELS))
     metadata = session["metadata"]
     results = session["results"]
     remotes = {}
@@ -182,15 +183,17 @@ def prepare_manual_batch(client, students, scheme, question, audit, random_count
                 remotes["question"] = acquire("Question paper", question_data, question.name, "manual:question", True)
 
     selected = None
+    prepared_info = None
     if random_count is not None:
         numbers = metadata.get((reference_key, "question_numbers"))
         if numbers is None:
             references()
             tick = time.monotonic()
-            event("References", "Identify question numbers", 0, False)
-            numbers = discover_question_numbers(client, remotes["mark_scheme"], remotes.get("question"))
-            metadata.put((reference_key, "question_numbers"), numbers)
-            event("References", "Identify question numbers", time.monotonic() - tick)
+            event("References", "Read scheme and identify question numbers", 0, False)
+            prepared_info, numbers = prepare_reference_metadata(
+                client, remotes["mark_scheme"], metadata, scheme_key,
+                (reference_key, "question_numbers"), remotes.get("question"))
+            event("References", "Read scheme and identify question numbers", time.monotonic() - tick)
         selected = select_spread_questions(numbers, random_count)
 
     started = time.monotonic()
@@ -221,13 +224,12 @@ def prepare_manual_batch(client, students, scheme, question, audit, random_count
                                      f"manual:student:{index}:{student.name}")] = f"student_{index}"
             for future in as_completed(jobs):
                 remotes[jobs[future]] = future.result()
-        scheme_info = metadata.get((reference_key, "scheme"))
+        scheme_info = prepared_info or metadata.get((scheme_key, "scheme"))
         if scheme_info is None:
             tick = time.monotonic()
             event("Mark scheme", "Prepare marking evidence", 0, False)
-            scheme_info = extract_scheme_maxima(client, remotes["mark_scheme"])
-            if scheme_info[0] and not scheme_info[2]:
-                metadata.put((reference_key, "scheme"), scheme_info)
+            scheme_info, _ = prepare_reference_metadata(
+                client, remotes["mark_scheme"], metadata, scheme_key)
             event("Mark scheme", "Prepare marking evidence", time.monotonic() - tick)
         else:
             event("Mark scheme", "Reused extracted evidence", 0)
@@ -235,6 +237,32 @@ def prepare_manual_batch(client, students, scheme, question, audit, random_count
         event("Batch", "All student results reused" if remotes else "All results reused; no Gemini requests", 0)
     return {"remotes": remotes, "scheme_info": scheme_info, "selected": selected,
             "keys": keys, "cached": cached, "pending": pending}
+
+
+def render_local_pdf_inspector(uploads):
+    """Opt-in teacher evidence inspection. Never changes documents used for marking."""
+    if not uploads:
+        return
+    with st.expander("Inspect original PDF pages locally"):
+        st.caption("No Gemini requests. Marking still uses the complete original PDFs. Digital text is limited to 20,000 characters per page and can lose mathematical layout; check the page image for handwriting and fractions.")
+        choice = st.selectbox("Document to inspect", range(len(uploads)),
+                              format_func=lambda i: f"{i + 1}. {uploads[i].name}", key="local_pdf_choice")
+        page_text = st.text_input("Original page numbers (up to 10, separated by commas)", "1", key="local_pdf_pages")
+        if st.button("Inspect pages", key="local_pdf_inspect"):
+            started = time.monotonic()
+            try:
+                from local_pdf import inspect_pages
+                pages = [int(n.strip()) for n in page_text.split(",")]
+                result = inspect_pages(uploads[choice].getvalue(), pages)
+                st.caption(f"Local page inspection: {time.monotonic() - started:.2f}s. Original pages: {', '.join(map(str, pages))} of {result['page_count']}.")
+                st.image(result["preview"], caption=f"Original page {pages[0]} (visual evidence)")
+                for item in result["text"]:
+                    st.text(f"Page {item['page']} — digital text only")
+                    st.code(item["text"] or "No digital text. Read the original visual evidence.", language=None)
+                st.download_button("Download original page excerpt for review", result["pdf"],
+                                   file_name="review-pages.pdf", mime="application/pdf", on_click="ignore")
+            except (ValueError, ImportError):
+                st.warning("Local inspection unavailable. Check the PDF and enter 1–10 valid page numbers. The complete PDF can still be used for marking.")
 
 
 def upload_pdf(client, uploaded_file):
@@ -836,7 +864,28 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
 
 
-def extract_scheme_maxima(client, mark_scheme_file):
+def prepare_reference_metadata(client, remote, metadata, scheme_key, inventory_key=None, question_file=None):
+    """One cold reference call when possible; never treat partial maxima as inventory."""
+    info = metadata.get((scheme_key, "scheme"))
+    numbers = metadata.get(inventory_key) if inventory_key is not None else None
+    if info is None:
+        combined = [] if inventory_key is not None and numbers is None else None
+        if combined is None:
+            info = extract_scheme_maxima(client, remote)
+        else:
+            info = extract_scheme_maxima(client, remote, combined, question_file)
+        if info[0] and not info[2]:
+            metadata.put((scheme_key, "scheme"), info)
+        if combined:
+            numbers = combined
+            metadata.put(inventory_key, numbers)
+    if inventory_key is not None and numbers is None:
+        numbers = discover_question_numbers(client, remote, question_file)
+        metadata.put(inventory_key, numbers)
+    return info, numbers
+
+
+def extract_scheme_maxima(client, mark_scheme_file, question_numbers_out=None, question_file=None):
     """One shared extraction of main homework-question totals, for review only."""
     schema = {
         "type": "object",
@@ -860,19 +909,45 @@ def extract_scheme_maxima(client, mark_scheme_file):
         "Use empty answer_summary for unclear answers; never guess. "
         "Only report clear, supported maximum marks. JSON only."
     )
+    contents = [mark_scheme_file]
+    if question_numbers_out is not None:
+        schema["properties"].update({
+            "question_numbers": {"type": "array", "items": {"type": "string"}},
+            "inventory_complete": {"type": "boolean"},
+        })
+        schema["required"] += ["question_numbers", "inventory_complete"]
+        prompt += (
+            " Also list ALL distinct main homework question numbers in original order "
+            "in question_numbers, including questions whose maximum is unclear. "
+            "Exclude page numbers, examples and embedded past-paper identifiers. "
+            "The first PDF is the official mark scheme; the optional second PDF "
+            "is the question paper. Use the question paper too if supplied, but extract maxima and answers "
+            "ONLY from the official mark scheme. Set inventory_complete true only "
+            "if every main question can be identified; otherwise false."
+        )
+        if question_file is not None:
+            contents.append(question_file)
+    contents.append(prompt)
     errors = []
     for model in PRIMARY_MODELS:
         if model_on_quota_cooldown(model):
             continue
         try:
             response = client.models.generate_content(
-                model=model, contents=[mark_scheme_file, prompt],
+                model=model, contents=contents,
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json", response_schema=schema
+                    response_mime_type="application/json", response_json_schema=schema,
+                    max_output_tokens=8192,
+                    http_options={"timeout": 120000, "retry_options": {"attempts": 1}},
                 ),
             )
+            candidates = getattr(response, "candidates", None) or []
+            finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+            if finish is not None and str(getattr(finish, "value", finish)) != "STOP":
+                raise ValueError("Incomplete reference response.")
+            payload = extract_json(response.text)
             maxima, answers, conflicts = {}, {}, set()
-            for q in extract_json(response.text).get("questions", []):
+            for q in payload.get("questions", []):
                 number = str(q.get("question_number", "")).strip()
                 try:
                     maximum = int(q["max_marks"])
@@ -891,6 +966,14 @@ def extract_scheme_maxima(client, mark_scheme_file):
                 answers.pop(number, None)
             if not maxima:
                 raise ValueError("No readable question maximum marks.")
+            if question_numbers_out is not None and payload.get("inventory_complete") is True:
+                numbers = payload.get("question_numbers")
+                # Do not infer an inventory from maxima: unclear totals may omit questions.
+                if (isinstance(numbers, list) and numbers and len(numbers) <= 1000
+                        and all(isinstance(n, str) and re.fullmatch(r"[1-9]\d{0,3}", n.strip()) for n in numbers)):
+                    numbers = [n.strip() for n in numbers]
+                    if len(set(numbers)) == len(numbers) and set(maxima).issubset(numbers):
+                        question_numbers_out.extend(numbers)
             return maxima, answers, None
         except Exception as exc:
             remember_model_failure(model, exc)
@@ -1027,7 +1110,7 @@ def _arithmetic_equals_issues(explanation):
 
         return evaluate(ast.parse(source, mode="eval").body)
 
-    def number(text):
+    def parse_number(text):
         if len(text) > 120:
             return None, None
         repeat = re.fullmatch(r"(-?)(\d+)\.(\d*)\((\d+)\)", text)
@@ -1049,6 +1132,15 @@ def _arithmetic_equals_issues(explanation):
             interval = (value - step, value) if text.startswith("-") else (value, value + step)
             return value, interval
         return exact_value(text), None
+
+    # A chained equality repeats its intermediate operands. Reuse exact parsing
+    # only within this explanation; never retain student text across requests.
+    parsed_numbers = {}
+
+    def number(text):
+        if text not in parsed_numbers:
+            parsed_numbers[text] = parse_number(text)
+        return parsed_numbers[text]
 
     pieces = re.split(r"(=|≈|≃)", explanation.replace("~=", "≈"))
     issues = []
@@ -2141,25 +2233,12 @@ def prepare_classroom_reference(client, upload, session, run, context, random_co
     key = (session["files"].scope, context, documents.digest(data), APP_VERSION, tuple(PRIMARY_MODELS))
     remote = run.acquire(data, upload.name, "classroom:scheme:" + context, True,
                          lambda event: report("Classroom mark scheme", event))
-    info = session["metadata"].get((key, "scheme"))
-    if info is None:
-        started = time.monotonic()
-        report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": 0, "done": False})
-        info = extract_scheme_maxima(client, remote)
-        if info[0] and not info[2]:
-            session["metadata"].put((key, "scheme"), info)
-        report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": time.monotonic() - started, "done": True})
-    else:
-        report("Classroom mark scheme", {"stage": "Reused extracted evidence", "elapsed": 0, "done": True})
-    numbers = None
-    if random_count is not None:
-        numbers = session["metadata"].get((key, "numbers"))
-        if numbers is None:
-            started = time.monotonic()
-            report("Classroom mark scheme", {"stage": "Identify question numbers", "elapsed": 0, "done": False})
-            numbers = discover_question_numbers(client, remote)
-            session["metadata"].put((key, "numbers"), numbers)
-            report("Classroom mark scheme", {"stage": "Identify question numbers", "elapsed": time.monotonic() - started, "done": True})
+    started = time.monotonic()
+    report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": 0, "done": False})
+    info, numbers = prepare_reference_metadata(
+        client, remote, session["metadata"], key,
+        (key, "numbers") if random_count is not None else None)
+    report("Classroom mark scheme", {"stage": "Prepare marking evidence", "elapsed": time.monotonic() - started, "done": True})
     return remote, info, numbers
 
 
@@ -2233,8 +2312,10 @@ def run_classroom_marking_job(
             scheme_maxima, scheme_answers, scheme_warning = info
         else:
             mark_scheme_remote = upload_pdf(client, mark_scheme_upload)
-            scheme_maxima, scheme_answers, scheme_warning = extract_scheme_maxima(client, mark_scheme_remote)
-            numbers = discover_question_numbers(client, mark_scheme_remote) if random_count is not None else None
+            info, numbers = prepare_reference_metadata(
+                client, mark_scheme_remote, documents.Memo(), "single-run",
+                "numbers" if random_count is not None else None)
+            scheme_maxima, scheme_answers, scheme_warning = info
         if scheme_warning:
             st.warning(scheme_warning)
         selected_questions = None
@@ -3474,6 +3555,8 @@ with col4:
         "Grades use provisional percentage bands. Official session-specific "
         "grade boundaries are not supported; check the published boundaries separately."
     )
+
+render_local_pdf_inspector(list(student_pdfs or []) + ([mark_scheme_pdf] if mark_scheme_pdf else []) + ([question_pdf] if question_pdf else []))
 
 ready = bool(student_pdfs and mark_scheme_pdf and api_key)
 
