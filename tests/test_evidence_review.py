@@ -18,7 +18,7 @@ class EvidenceReviewTests(unittest.TestCase):
                     student_evidence="Synthetic answer p1: method shown, final answer differs.",
                     scheme_evidence="Synthetic scheme p1: M1 method; A1 correct answer.",
                     proposed_awarded_marks=total,
-                    proposed_working_summary="2 + 2 = 5",
+                    proposed_working_summary=("2 + 2 = 5" if classification in {"final_answer_error", "intermediate_error"} else "2 + 2 = 4"),
                     proposed_full_mark_solution="2 + 2 = 4",
                     proposed_mark_breakdown=[
                         dict(criterion_id="method", code="M1", awarded=True, reason="Addition shown, scheme allows method credit."),
