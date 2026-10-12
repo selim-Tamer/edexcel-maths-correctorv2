@@ -1,0 +1,5 @@
+# Runtime PDF stack plus synthetic fixture creation only (ReportLab is not deployed).
+pypdf==6.20.1
+pypdfium2==5.14.0
+Pillow==12.3.0
+reportlab==5.0.1

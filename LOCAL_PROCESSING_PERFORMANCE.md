@@ -1,6 +1,9 @@
 # Local processing and reference preparation performance
 
 Baseline: main `78230becbdfb8dcd3a9141c974823a083e623286` (merged PR #8).
+**Licensing revision:** the inspector now uses pypdf + pypdfium2; PyMuPDF is
+removed from runtime, fixtures and CI. See `PDF_LICENSING.md` for the licence
+assessment, preserved functionality and same-input replacement benchmark.
 All measurements below are offline, using synthetic data. No live Gemini requests,
 paid services, Classroom changes, student files or published grades were used.
 
@@ -31,22 +34,26 @@ incorrect chains to the frozen PR #8 implementation, including recurring decimal
 rounding, zero division and missing parentheses. Arithmetic warnings, method marks,
 original scores and mandatory teacher review remain unchanged.
 
-PyMuPDF adds an **opt-in local original-page inspector** under manual uploads.
+pypdf and pypdfium2 provide an **opt-in local original-page inspector** under manual uploads.
 Teachers explicitly choose 1–10 pages, see a visual preview and digital text, and
 can download a PDF excerpt for review. The excerpt preserves page content and ink
 annotations; synthetic digital and image-only fixtures render pixel-identically
 before and after extraction. The original uploaded bytes are never replaced by
 the excerpt. Text-only scans correctly return no digital text, not invented OCR.
 Inspection is lazy, bounded to 50 MB/2,000 source pages, serialized across sessions
-for PyMuPDF safety, and has no persistent text cache or Gemini calls. Parser errors
+for PDFium safety, and has no persistent text cache or Gemini calls. Parser errors
 are replaced with a fixed safe message. This is a teacher review improvement,
 not an automatic reduction in model input pages or marking latency.
 
 ## Measured results
 
-Windows local run, Python 3.12.14 runtime, PyMuPDF 1.26.7, SymPy 1.14.0.
+The numbers in this section are the original pre-migration PR #9 measurements:
+Windows, Python 3.12.14, PyMuPDF 1.26.7, SymPy 1.14.0. They remain historical
+context, not current PDF-stack timings. `PDF_LICENSING.md` compares the two stacks
+on identical newer fixtures. The regenerated `tests/local_benchmark_results.json`
+records the current permissive stack; fixture encoding and sizes have changed.
 CPU medians: 20 iterations for PDF operations, 200 for arithmetic. Full output and
-profile are in `tests/local_benchmark_results.json`; timings vary by machine/load.
+profile were recorded with that original run; timings vary by machine/load.
 
 | Measurement | Before | After |
 |---|---:|---:|
@@ -95,26 +102,26 @@ Streamlit upload latency, provider processing time, or live model throughput.
   Its existing model fallback list remains bounded; combined metadata introduces
   no additional generation retries. Large/unclear schemes may need fallback and
   teacher review; there is no live coverage of model output quality yet.
-- PyMuPDF's [license](https://pymupdf.io/licensing) is AGPL/commercial dual licensing.
-  This PR uses the free package and does not change the repository's license or
-  purchase a commercial license. Review its deployment obligations for this app.
+- The optional inspector's AGPL dependency was replaced with permissive packages;
+  no commercial licence was purchased. Preserve the installed packages' notices
+  when redistributing them. See `PDF_LICENSING.md` for the exact scope and versions.
 - The inspector is a convenience for manual uploads. Classroom's marking path uses
   the shared metadata optimization and original files; Classroom student downloads
   are not retained for inspection.
 
 ## Verification and next checks
 
-Passed locally: **152 regression tests, 8 real Streamlit interaction tests, 4 real
+Passed locally after replacement: **154 regression tests, 8 real Streamlit interaction tests, 4 real
 SDK tests with intercepted HTTP**, syntax validation, both PDF benchmarks, and
 visual inspection of the synthetic page preview. Existing reliability tests from
-PRs #4–#8 run in the full suite. CI installs the pinned PDF dependency and runs the
-new benchmark on Linux as well as the existing checks. No expected outcome is
+PRs #4–#8 run in the full suite. CI installs the pinned permissive PDF dependencies
+and runs the inspection benchmark on Linux as well as the existing checks. No expected outcome is
 substituted for application parsing, preparation, validation or PDF operations.
 
 Reproduce with `python -m unittest discover -s tests -p 'test_*.py' -v`, the same
 command for `tests/ui` and `tests/sdk`, and
 `python tests/benchmark_document_pipeline.py` / `python tests/benchmark_local_processing.py`.
-Install application requirements plus SymPy 1.14.0 for benchmarks; CI pins the
+Install application requirements, `tests/pdf-requirements.txt` and SymPy 1.14.0 for benchmarks; CI pins the
 Streamlit/SDK test versions explicitly.
 
 Before production adoption, authorize a separate test deployment and free-tier

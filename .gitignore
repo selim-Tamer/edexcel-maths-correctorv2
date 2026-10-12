@@ -19,3 +19,4 @@ venv/
 .test-deps/
 .sdk-test-deps/
 .perf-deps/
+.pdf-deps/

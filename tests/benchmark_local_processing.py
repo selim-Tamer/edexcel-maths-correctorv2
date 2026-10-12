@@ -1,7 +1,8 @@
 """Offline CPU measurements + explicitly SIMULATED Gemini reference latency.
-Run with PyMuPDF 1.26.7 and SymPy 1.14.0 installed. Never contacts Gemini.
+Run with the PDF test requirements and SymPy 1.14.0. Never contacts Gemini.
 """
 import ast
+from contextlib import closing
 import cProfile
 import io
 import json
@@ -68,7 +69,7 @@ def benchmark():
     start = time.perf_counter()
     import sympy
     sympy_import_ms = (time.perf_counter() - start) * 1000
-    import pymupdf
+    import pypdfium2 as pdfium
     f = load_app()
     # Typed AST construction only: never sympify/parse_expr/eval student strings.
     def symbolic(expression):
@@ -94,8 +95,12 @@ def benchmark():
     for scanned in (False, True):
         data = make_pdf(scanned)
         def text_only():
-            with pymupdf.open(stream=data, filetype='pdf') as doc:
-                return [page.get_text('text', sort=True) for page in doc]
+            with pdfium.PdfDocument(data) as doc:
+                values = []
+                for n in range(len(doc)):
+                    with closing(doc[n]) as page, closing(page.get_textpage()) as text:
+                        values.append(text.get_text_range(0, min(20000, text.count_chars())))
+                return values
         texts = text_only()
         excerpt = inspect_pages(data, [1, 3])
         pdfs['synthetic_scan' if scanned else 'digital_with_pen_strokes'] = {

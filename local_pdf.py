@@ -1,8 +1,11 @@
 """Bounded, opt-in local evidence inspection; never a replacement for marking PDFs.
 
-PyMuPDF is imported lazily, and serialized because its document operations must
-not be shared across threads. No document text/bytes are cached globally.
+pypdf copies page objects; PDFium extracts digital text and renders the preview.
+PDFium calls are serialized across sessions (its native API is not thread-safe).
+No document text/bytes are cached globally. Imports are lazy.
 """
+from io import BytesIO
+from contextlib import closing
 from threading import Lock
 
 _lock = Lock()
@@ -20,30 +23,43 @@ def inspect_pages(data, page_numbers):
     if (not pages or len(pages) > 10 or len(set(pages)) != len(pages)
             or any(type(n) is not int or n < 1 for n in pages)):
         raise ValueError("Choose 1 to 10 distinct original page numbers.")
-    import pymupdf
+    from pypdf import PdfReader, PdfWriter
+    import pypdfium2 as pdfium
     with _lock:
         try:
-            with pymupdf.open(stream=data, filetype="pdf") as source:
-                if source.needs_pass or source.page_count > 2000:
+            with closing(PdfReader(BytesIO(data), strict=True)) as reader, pdfium.PdfDocument(data) as source:
+                if reader.is_encrypted:
+                    raise ValueError("Encrypted document.")
+                source.init_forms()
+                count = len(source)
+                if count > 2000 or len(reader.pages) != count:
                     raise ValueError("Unsupported document.")
-                if max(pages) > source.page_count:
+                if max(pages) > count:
                     raise ValueError("Page outside document.")
                 texts = []
-                with pymupdf.open() as excerpt:
-                    for n in pages:
-                        page = source[n - 1]
-                        # Bound returned text and page count; never log PDF contents.
-                        texts.append({"page": n, "text": page.get_text("text", sort=True)[:20000]})
-                        excerpt.insert_pdf(source, from_page=n - 1, to_page=n - 1,
-                                           links=False, annots=True, widgets=True)
-                    pdf = excerpt.tobytes()
-                page = source[pages[0] - 1]
-                longest = max(page.rect.width, page.rect.height)
-                if longest <= 0:
-                    raise ValueError("Invalid page dimensions.")
-                preview = page.get_pixmap(matrix=pymupdf.Matrix(1200 / longest, 1200 / longest),
-                                          alpha=False, annots=True).tobytes("png")
-                return {"page_count": source.page_count, "pages": pages,
+                preview = None
+                for n in pages:
+                    with closing(source[n - 1]) as page:
+                        with closing(page.get_textpage()) as textpage:
+                            # Bound extraction before converting native text to Python.
+                            text = textpage.get_text_range(0, min(20000, textpage.count_chars()))
+                            texts.append({"page": n, "text": text})
+                        if preview is None:
+                            longest = max(page.get_size())
+                            if longest <= 0:
+                                raise ValueError("Invalid page dimensions.")
+                            with closing(page.render(scale=1200 / longest, draw_annots=True)) as bitmap:
+                                with bitmap.to_pil() as image, BytesIO() as output:
+                                    image.save(output, format="PNG", compress_level=1)
+                                    preview = output.getvalue()
+                # append preserves form fields and annotations, unlike add_page alone.
+                # Keep vector/text/image streams; never rasterize the excerpt.
+                with closing(PdfWriter()) as writer, BytesIO() as output:
+                    writer.append(reader, pages=[n - 1 for n in pages], import_outline=False,
+                                  excluded_fields=["/B"])
+                    writer.write(output)
+                    pdf = output.getvalue()
+                return {"page_count": count, "pages": pages,
                         "text": texts, "pdf": pdf, "preview": preview}
         except Exception:
             # Parser errors can contain document text or paths. Keep the UI safe.
