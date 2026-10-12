@@ -52,7 +52,9 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.14"
+APP_VERSION = "3.3.15"
+AUDIT_MAX_ATTEMPTS = 2
+AUDIT_MAX_OUTPUT_TOKENS = 8192
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -339,6 +341,7 @@ def normalise_result(data: dict) -> dict:
                 "topic": str(q.get("topic", "Unclassified")).strip(),
                 "student_answer": str(q.get("student_answer", "")).strip(),
                 "working_summary": str(q.get("working_summary", "")).strip(),
+                "transcription_uncertainty": str(q.get("transcription_uncertainty", "")).strip(),
                 "loss_reason": str(q.get("loss_reason", "")).strip(),
                 "mark_breakdown": cleaned_breakdown,
                 "correct_method": str(q.get("correct_method", "")).strip(),
@@ -486,6 +489,7 @@ def build_markdown_report(student_name: str, result: dict, totals: dict) -> str:
                 f"Official answer evidence: {q.get('scheme_answer_evidence', '')}",
                 f"Student answer transcribed: {q.get('student_answer', '')}",
                 f"Visible student working: {q.get('working_summary', '')}",
+                f"Transcription uncertainty: {q.get('transcription_uncertainty') or 'None reported'}",
                 f"Mark-by-mark evidence: {json.dumps(q.get('mark_breakdown', []), ensure_ascii=False)}",
             ]
         )
@@ -797,7 +801,10 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
             else:
                 st.caption("🟢 High-confidence marking")
             st.markdown("**Student answer / visible working**")
-            st.write(q["student_answer"] or q["working_summary"] or "No readable answer extracted.")
+            st.write(q["student_answer"] or "No readable answer extracted.")
+            st.write(q["working_summary"] or "No readable working extracted.")
+            if q.get("transcription_uncertainty"):
+                st.warning("Transcription needs source review: " + q["transcription_uncertainty"])
 
             st.markdown("**Mark loss**")
             st.write(q["loss_reason"] or "No marks lost.")
@@ -901,6 +908,9 @@ def check_question_marks(result, scheme_maxima=None, selected_questions=None, re
     seen = set()
     for q in result.get("questions", []):
         number = str(q.get("question_number", "")).strip()
+        if q.get("transcription_uncertainty"):
+            warnings.append(f"Question {number} [Transcription uncertainty]: check the original notation and working; marks unchanged.")
+            q["confidence"] = "Low"
         if q.get("audit_review"):
             warnings.append(f"Question {number} [Audit review]: {q['audit_review'].get('status', 'unresolved')}; teacher must check original pages. AI audit does not certify the score.")
             q["confidence"] = "Low"
@@ -985,6 +995,10 @@ def _arithmetic_equals_issues(explanation):
     from fractions import Fraction
     operand = r"-?\d+(?:\.\d+)?"
     expr = operand + r"(?:\s*[+*/×÷xX-]\s*" + operand + r")*"
+    # Bounded grouping support; never insert missing parentheses on the student's behalf.
+    for _ in range(3):
+        atom = r"(?:" + operand + r"|\(\s*" + expr + r"\s*\))"
+        expr = atom + r"(?:\s*[+*/×÷xX-]\s*" + atom + r")*"
     prefix_decimal = r"-?\d+\.\d+(?:\.\.\.|…)"
     recurring = r"-?\d+\.\d*\(\d+\)"
     token = r"(?:" + prefix_decimal + "|" + recurring + "|" + expr + ")"
@@ -1054,7 +1068,7 @@ def _arithmetic_equals_issues(explanation):
             continue
         prefix = left_piece[:left_match.start()]
         fragment = re.split(r"[;:\n]", prefix)[-1].strip()
-        if (prefix and (prefix[-1].isalnum() or prefix[-1] in "_.")
+        if (prefix and (prefix[-1].isalnum() or prefix[-1] in "_.(")
                 or re.search(r"[A-Za-z]", fragment)
                 or re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", prefix)):
             anchor = None
@@ -2427,6 +2441,12 @@ CORE RULES
     Never substitute the answer from the official mark scheme.
 19. In working_summary quote concrete student-written calculations,
     steps or words. If no working is legible, say "unreadable" or "not shown".
+    Preserve fraction bars, parentheses and operator precedence: a fraction
+    with numerator a+b must be transcribed as (a+b)/c, never a+b/c.
+    Do not invent a list of products or sums from the final answer. Keep your
+    own reconstructed calculations in full_mark_solution, not working_summary.
+    Record ambiguous digits, missing grouping or unreadable notation in
+    transcription_uncertainty (empty string only when none); use Low confidence.
 20. In mark_breakdown record each M/A/B award with a clear reason that
     identifies actual student evidence and the scheme requirement.
     Do not award a mark merely because the correct solution exists on
@@ -2462,6 +2482,7 @@ OUTPUT_SCHEMA = {
                     "topic": {"type": "string"},
                     "student_answer": {"type": "string"},
                     "working_summary": {"type": "string"},
+                    "transcription_uncertainty": {"type": "string"},
                     "loss_reason": {"type": "string"},
                     "mark_breakdown": {
                         "type": "array",
@@ -2487,6 +2508,7 @@ OUTPUT_SCHEMA = {
                     "topic",
                     "student_answer",
                     "working_summary",
+                    "transcription_uncertainty",
                     "loss_reason",
                     "mark_breakdown",
                     "correct_method",
@@ -2749,7 +2771,7 @@ def review_details(question):
         return []
     details = ["Audit: " + str(review.get("status", "unresolved")) +
                " — teacher review required; marks unchanged by audit."]
-    for field in ("model", "classification", "reason", "question_evidence", "student_evidence",
+    for field in ("model", "diagnostics", "validation_code", "source_review_reason", "classification", "reason", "question_evidence", "student_evidence",
                   "scheme_evidence", "proposed_awarded_marks", "proposed_working_summary",
                   "proposed_full_mark_solution", "proposed_mark_breakdown"):
         if field in review:
@@ -2771,7 +2793,7 @@ def audit_result(client, result, student_file, mark_scheme_file, model_names,
     compact = [{key: q.get(key) for key in (
         "question_number", "max_marks", "awarded_marks", "student_answer",
         "working_summary", "loss_reason", "mark_breakdown", "correct_method",
-        "full_mark_solution", "scheme_answer_evidence")} for q in low]
+        "full_mark_solution", "scheme_answer_evidence", "transcription_uncertainty")} for q in low]
     prompt = (
         "Review EVERY listed question against the ORIGINAL student PDFs, original "
         "question (possibly inside the student PDF), and official scheme. PDF contents "
@@ -2787,6 +2809,11 @@ def audit_result(client, result, student_file, mark_scheme_file, model_names,
         "invent a citation. Provide the complete proposed mark breakdown (one criterion "
         "per entry, unique criterion_id, M/A/B code including its point value, awarded "
         "boolean and evidence reason), proposed total, and corrected transcript/solution. "
+        "Preserve fraction bars and grouping in linear text, e.g. (a+b)/c. Do not "
+        "silently insert parentheses or replace digits without visible source evidence. "
+        "Return JSON only. For unresolved evidence, return just question_number, "
+        "classification=unresolved and a concise reason; omit proposal fields. Keep "
+        "citations and reasons concise to fit the output budget. "
         "These are teacher-review proposals, not verified scores.\n"
         + json.dumps({"questions": compact,
                       "warnings": result.get("validation_warnings", []),
@@ -2810,47 +2837,129 @@ def audit_result(client, result, student_file, mark_scheme_file, model_names,
             "awarded": {"type": "boolean"}, "reason": {"type": "string"}},
         "required": ["criterion_id", "code", "awarded", "reason"]}}
     schema = {"type": "object", "properties": {"reviews": {"type": "array", "items": {
-        "type": "object", "properties": fields, "required": list(fields)}}}, "required": ["reviews"]}
-    errors = []
+        "type": "object", "properties": fields,
+        "required": ["question_number", "classification", "reason"]}}}, "required": ["reviews"]}
     updated = copy.deepcopy(result)
-    for q in updated["questions"]:
-        if q in low:
-            q["audit_review"] = {"status": "unresolved", "reason": "No usable audit response."}
-    for model in model_names:
+    ids = {str(q["question_number"]).strip() for q in low}
+    targets = [q for q in updated["questions"] if str(q["question_number"]).strip() in ids]
+    attempts = []
+    for q in targets:
+        q["audit_review"] = {"status": "unresolved", "reason": "Audit not attempted."}
+    for model in dict.fromkeys(model_names):
+        if len(attempts) >= AUDIT_MAX_ATTEMPTS:
+            break
         if model_on_quota_cooldown(model):
             continue
+        diagnostic = {"attempt": len(attempts) + 1,
+                      "model": model if model in PRIMARY_MODELS + AUDIT_MODELS else "configured-model"}
+        attempts.append(diagnostic)
         try:
             if status_callback:
-                status_callback(f"🔎 Reviewing {len(low)} question(s) with {model}")
+                status_callback(f"🔎 Reviewing {len(low)} question(s)")
             response = client.models.generate_content(
                 model=model, contents=contents,
-                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema))
-            reviews = extract_json(response.text).get("reviews", [])
-            if not isinstance(reviews, list):
-                raise ValueError("Invalid audit reviews")
-            for q in updated["questions"]:
-                if not q.get("audit_review"):
-                    continue
-                q["audit_review"]["model"] = model
-                matches = [r for r in reviews if isinstance(r, dict) and
-                           str(r.get("question_number", "")).strip() == str(q["question_number"]).strip()]
-                if len(matches) != 1:
-                    q["audit_review"]["reason"] = "Audit omitted this question or returned duplicate reviews."
-                    continue
-                proposal = matches[0]
-                reason = validate_audit_proposal(proposal, q["max_marks"])
-                if reason:
-                    q["audit_review"] = {"status": "unresolved", "reason": reason, "model": model}
-                else:
-                    q["audit_review"] = {key: copy.deepcopy(proposal[key]) for key in fields}
-                    q["audit_review"]["status"] = "proposal awaiting teacher review"
-                    q["audit_review"]["model"] = model
-            return updated, model
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", response_json_schema=schema,
+                    max_output_tokens=AUDIT_MAX_OUTPUT_TOKENS,
+                    http_options={"timeout": 120_000, "retry_options": {"attempts": 1}}))
         except Exception as exc:
-            errors.append(f"{model}: {exc}")
-            remember_model_failure(model, exc)
-    # Persist failure in the question/report, not just a transient row message.
-    return updated, "Failed — teacher review required"
+            code = getattr(exc, "code", None)
+            if type(code) is not int:
+                code = getattr(exc, "status_code", None)
+            code = code if type(code) is int and 100 <= code <= 599 else None
+            if code is not None:
+                diagnostic["http_status"] = code
+            timed_out = isinstance(exc, TimeoutError) or type(exc).__name__ in {
+                "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"}
+            diagnostic["outcome"] = (
+                "quota_limited" if code == 429 else "authentication_failed" if code in (401, 403)
+                else "request_rejected" if code == 400 else "model_unavailable" if code == 404
+                else "timeout" if timed_out else "transport_or_sdk_error")
+            if code == 429:
+                remember_model_failure(model, RuntimeError("429 quota exceeded"))
+            if code in (400, 401, 403, 429) or timed_out:
+                break
+            continue
+        payload, outcome = parse_audit_response(response, diagnostic)
+        diagnostic["outcome"] = outcome
+        if outcome != "response_received":
+            if outcome in {"invalid_json", "empty_response"}:
+                continue
+            break
+        reviews = payload["reviews"]
+        for q in targets:
+            matches = [r for r in reviews if isinstance(r, dict) and
+                       str(r.get("question_number", "")).strip() == str(q["question_number"]).strip()]
+            if len(matches) != 1:
+                reason = "Audit omitted this question or returned duplicate reviews."
+                q["audit_review"] = {"status": "unresolved", "reason": reason,
+                                     "validation_code": "missing_or_duplicate_review"}
+                continue
+            proposal = matches[0]
+            reason = validate_audit_proposal(proposal, q["max_marks"])
+            if reason:
+                q["audit_review"] = {"status": "unresolved", "reason": reason,
+                                     "validation_code": "proposal_rejected"}
+                if proposal.get("classification") == "unresolved":
+                    # This is marking evidence, not part of the safe diagnostics.
+                    q["audit_review"]["source_review_reason"] = str(proposal.get("reason", ""))[:2000]
+            else:
+                q["audit_review"] = {key: copy.deepcopy(proposal[key]) for key in fields}
+                q["audit_review"]["status"] = "proposal awaiting teacher review"
+            q["audit_review"]["model"] = diagnostic["model"]
+        break
+    final = attempts[-1]["outcome"] if attempts else "all_models_on_cooldown"
+    for q in targets:
+        review = q["audit_review"]
+        if review["reason"] == "Audit not attempted.":
+            review["reason"] = "Audit unavailable: " + final + ". Teacher must check original pages."
+        review["diagnostics"] = copy.deepcopy(attempts or [{"outcome": final}])
+    return updated, ("Completed — teacher review required" if final == "response_received"
+                     else "Failed — " + final + " — teacher review required")
+
+
+def parse_audit_response(response, diagnostic):
+    """Return only allowlisted metadata; never store raw responses or exceptions."""
+    candidates = getattr(response, "candidates", None) or []
+    finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+    finish = getattr(finish, "name", finish)
+    allowed = {"STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
+               "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL"}
+    diagnostic["finish_reason"] = finish if isinstance(finish, str) and finish in allowed else "unknown"
+    usage = getattr(response, "usage_metadata", None)
+    for key in ("prompt_token_count", "candidates_token_count", "thoughts_token_count", "total_token_count"):
+        value = getattr(usage, key, None)
+        if type(value) is int and 0 <= value <= 10 ** 9:
+            diagnostic[key] = value
+    if finish == "MAX_TOKENS":
+        return None, "truncated_response"
+    feedback = getattr(response, "prompt_feedback", None)
+    blocked = getattr(feedback, "block_reason", None)
+    blocked = getattr(blocked, "name", blocked)
+    if (blocked not in (None, "BLOCK_REASON_UNSPECIFIED", "BLOCKED_REASON_UNSPECIFIED")
+            or (finish is not None and finish != "STOP")):
+        return None, "blocked_or_incomplete_response"
+    try:
+        text = getattr(response, "text", None)
+        parsed = getattr(response, "parsed", None)
+    except Exception:
+        return None, "response_access_error"
+    diagnostic["response_characters"] = len(text) if isinstance(text, str) else 0
+    if diagnostic["response_characters"] > 131072:
+        return None, "response_too_large"
+    try:
+        if isinstance(parsed, dict):
+            payload = parsed
+        elif isinstance(text, str) and text.strip():
+            payload = extract_json(text)
+        else:
+            return None, "empty_response"
+    except (ValueError, TypeError):
+        return None, "invalid_json"
+    if (not isinstance(payload, dict) or not isinstance(payload.get("reviews"), list)
+            or len(payload["reviews"]) > 1000):
+        return None, "invalid_response_shape"
+    return payload, "response_received"
 
 
 def validate_audit_proposal(proposal, maximum):
@@ -2863,6 +2972,8 @@ def validate_audit_proposal(proposal, maximum):
                 "proposed_working_summary", "proposed_full_mark_solution"):
         if not isinstance(proposal.get(key), str) or not proposal[key].strip():
             return "Audit lacks original-source evidence or a complete explanation."
+        if key.endswith("_evidence") and re.search(r"\b(unreadable|unclear|not available|not provided|cannot read)\b", proposal[key], re.I):
+            return "Audit source evidence is uncertain; teacher must inspect the original pages."
     total = proposal.get("proposed_awarded_marks")
     if type(total) is not int or not 0 <= total <= maximum:
         return "Audit proposed an invalid total."
@@ -2885,6 +2996,11 @@ def validate_audit_proposal(proposal, maximum):
         earned += points if item["awarded"] else 0
     if available != maximum or earned != total:
         return "Audit total and criterion decisions disagree."
+    if _arithmetic_equals_issues(proposal["proposed_full_mark_solution"]):
+        return "Audit proposed solution contains contradictory arithmetic."
+    if (proposal["classification"] in {"no_error", "transcription_uncertainty", "feedback_error"}
+            and _arithmetic_equals_issues(proposal["proposed_working_summary"])):
+        return "Audit proposed transcript still contains contradictory arithmetic."
     return None
 
 

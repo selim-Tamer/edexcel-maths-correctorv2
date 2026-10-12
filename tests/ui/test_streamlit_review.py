@@ -47,6 +47,22 @@ exec(compile(ast.Module(body=block, type_ignores=[]), str(SOURCE), "exec"), f)
 """
 
 class StreamlitReviewTests(unittest.TestCase):
+    def test_working_grouping_and_transcription_uncertainty_are_visible(self):
+        script = BOOTSTRAP.replace('state = st.session_state["review_fixture"]', '''
+state = st.session_state["review_fixture"]
+row = state["last_result"]["processed"][0]
+q = row["ai_result"]["questions"][0]
+q["student_answer"] = "34"
+q["working_summary"] = "(67 + 1) / 2 = 34"
+q["transcription_uncertainty"] = "Synthetic fraction bar needs checking"
+f["check_question_marks"](row["ai_result"], {"1": 2})
+''')
+        app = AppTest.from_string(script, default_timeout=20).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("(67 + 1) / 2 = 34", " ".join(str(x.value) for x in app.markdown))
+        self.assertIn("Synthetic fraction bar needs checking", " ".join(str(x.value) for x in app.warning))
+        self.assertFalse(app.checkbox[0].value)
+
     def app(self):
         app = AppTest.from_string(BOOTSTRAP, default_timeout=20).run()
         self.assertEqual(len(app.exception), 0)

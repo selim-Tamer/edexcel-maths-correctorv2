@@ -23,7 +23,7 @@ python -m unittest discover -s tests/ui -p 'test_*.py' -v
 python tests/benchmark_document_pipeline.py
 ```
 
-These tests establish application behavior under mocked responses, not real-world model marking accuracy. Generated narrative can still be wrong. Existing cached reports are not retroactively repaired; version 3.3.14 invalidates versioned result-cache identities for subsequent marking.
+These tests establish application behavior under mocked responses, not real-world model marking accuracy. Generated narrative can still be wrong. Existing cached reports are not retroactively repaired; version 3.3.15 invalidates versioned result-cache identities for subsequent marking. See [AUDIT_RELIABILITY.md](AUDIT_RELIABILITY.md) for transcription uncertainty, structured response diagnostics and the strict two-attempt audit limit (with SDK retries disabled).
 
 ## Decimal approximation checks
 
