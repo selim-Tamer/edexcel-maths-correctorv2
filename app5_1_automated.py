@@ -52,7 +52,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.13"
+APP_VERSION = "3.3.14"
 # Stable Gemini API models with large context windows.
 # Multiple fallbacks are kept so a temporary quota/unavailability issue
 # on one model does not stop a student's marking run.
@@ -975,54 +975,123 @@ def _numeric_expression_value(expression):
 
 
 def _arithmetic_equals_issues(explanation):
-    """Check complete, unambiguous numerical equalities (no labels mistaken for operands).
+    """Check numeric chains without confusing truncation with completed rounding.
 
-    Skip the first '=' in 'Sum of 5 = 5*398 = 1990', 'Q1 = 6',
-    'Divided by 80 = 66.375', etc. The genuine subsequent arithmetic
-    equality '5*398 = 1990' is still checked.
+    Ellipses specify a decimal prefix, not a rounded endpoint. Keep the original
+    numeric value across a chain so an intermediate approximation cannot hide an
+    incorrect final answer (or introduce double rounding). Unsupported symbolic
+    expressions and prose are deliberately left for source-based review.
     """
+    from fractions import Fraction
     operand = r"-?\d+(?:\.\d+)?"
     expr = operand + r"(?:\s*[+*/×÷xX-]\s*" + operand + r")*"
-    trailing = re.compile(r"(" + expr + r")\s*$")
-    # Never backtrack into part of a decimal or a longer arithmetic expression.
-    leading = re.compile(r"^\s*(" + expr + r")(?!\d|\.\d|\s*[+*/×÷-])(?=$|[\s,;.)?!])")
-    pieces = explanation.split("=")
+    prefix_decimal = r"-?\d+\.\d+(?:\.\.\.|…)"
+    recurring = r"-?\d+\.\d*\(\d+\)"
+    token = r"(?:" + prefix_decimal + "|" + recurring + "|" + expr + ")"
+    trailing = re.compile(r"(" + token + r")\s*$")
+    leading = re.compile(r"^\s*(" + token + r")(?!\d|\.\d|\s*[+*/×÷-])(?=$|[\s,;.)?!])")
+
+    def exact_value(text):
+        if _numeric_expression_value(text) is None:
+            return None
+        source = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", text.replace("×", "*").replace("÷", "/"))
+
+        def evaluate(node):
+            if isinstance(node, ast.Constant):
+                return Fraction(ast.get_source_segment(source, node))
+            if isinstance(node, ast.UnaryOp):
+                value = evaluate(node.operand)
+                return -value if isinstance(node.op, ast.USub) else value
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            return left / right
+
+        return evaluate(ast.parse(source, mode="eval").body)
+
+    def number(text):
+        if len(text) > 120:
+            return None, None
+        repeat = re.fullmatch(r"(-?)(\d+)\.(\d*)\((\d+)\)", text)
+        if repeat:
+            sign, whole, initial, cycle = repeat.groups()
+            # Bound conversion/work just like the numeric expression evaluator.
+            value = (int(whole) + Fraction(int(initial) if initial else 0, 10 ** len(initial))
+                     + Fraction(int(cycle), (10 ** len(cycle) - 1) * 10 ** len(initial)))
+            if value > 10 ** 12:
+                return None, None
+            return (-value if sign else value), None
+        partial = re.fullmatch(r"(-?\d+\.\d+)(?:\.\.\.|…)", text)
+        if partial:
+            value = exact_value(partial.group(1))
+            if value is None:
+                return None, None
+            step = Fraction(1, 10 ** len(partial.group(1).split(".")[1]))
+            # Truncation is towards zero, including a written negative zero.
+            interval = (value - step, value) if text.startswith("-") else (value, value + step)
+            return value, interval
+        return exact_value(text), None
+
+    pieces = re.split(r"(=|≈|≃)", explanation.replace("~=", "≈"))
     issues = []
-    for i in range(len(pieces) - 1):
-        if pieces[i].rstrip().endswith(("<", ">", "!", "=")):
+    anchor = None
+    anchor_interval = None
+    approximate_chain = False
+    for i in range(0, len(pieces) - 2, 2):
+        left_piece, operator, right_piece = pieces[i:i + 3]
+        if (left_piece.rstrip().endswith(("<", ">", "!", "="))
+                or right_piece.lstrip().startswith("=")):
+            anchor = None
             continue
-        if pieces[i + 1].lstrip().startswith("="):
-            continue
-        left_match = trailing.search(pieces[i])
-        right_match = leading.match(pieces[i + 1])
+        left_match = trailing.search(left_piece)
+        right_match = leading.match(right_piece)
         if not left_match or not right_match:
+            anchor = None
             continue
-        # Reject numbers embedded in labels: Q1, Q3, M2, and so on.
-        left_piece = pieces[i]
         prefix = left_piece[:left_match.start()]
-        if prefix and (prefix[-1].isalnum() or prefix[-1] in "_."):
-            continue
-        # If the numerical LHS has a prose prefix, evaluate only when it
-        # clearly follows punctuation that introduces a calculation.
-        # A prior '=' is already separated into another piece.
         fragment = re.split(r"[;:\n]", prefix)[-1].strip()
-        if re.search(r"[A-Za-z]", fragment):
-            continue
-        if re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", prefix):
+        if (prefix and (prefix[-1].isalnum() or prefix[-1] in "_.")
+                or re.search(r"[A-Za-z]", fragment)
+                or re.search(r"[A-Za-z)]\s*[+*/×÷-]\s*$", prefix)):
+            anchor = None
             continue
         left_text, right_text = left_match.group(1), right_match.group(1)
-        lhs = _numeric_expression_value(left_text)
-        rhs = _numeric_expression_value(right_text)
+        lhs, lhs_interval = number(left_text)
+        rhs, rhs_interval = number(right_text)
         if lhs is None or rhs is None:
+            anchor = None
             continue
-        shown = right_text.strip()
-        if re.fullmatch(r"-?\d+\.\d+", shown):
-            decimals = len(shown.split(".")[1])
-            tolerance = 0.5 * 10 ** (-decimals) + 1e-8
+        # Continue only through a whole numeric middle piece, never across prose.
+        if anchor is None or left_piece.strip() != left_text:
+            anchor, anchor_interval = lhs, lhs_interval
+            approximate_chain = lhs_interval is not None
+        approximate_chain = approximate_chain or operator != "=" or rhs_interval is not None
+        if rhs_interval is not None:
+            lo, hi = rhs_interval
+            if anchor_interval is None:
+                # Include the endpoint: an infinite tail of nines can reach it
+                # (0.4999... = 0.5). Ellipses do not reveal the hidden digits.
+                valid = lo <= anchor <= hi
+            else:
+                valid = max(lo, anchor_interval[0]) <= min(hi, anchor_interval[1])
         else:
-            tolerance = 1e-8
-        if abs(lhs - rhs) > tolerance:
-            issues.append(f"{left_text.strip()} = {shown}")
+            decimal = re.fullmatch(r"-?\d+\.(\d+)", right_text)
+            tolerance = (Fraction(1, 2 * 10 ** len(decimal.group(1))) if decimal else
+                         Fraction(1, 2) if approximate_chain and re.fullmatch(r"-?\d+", right_text) else 0)
+            if anchor_interval is None:
+                valid = abs(anchor - rhs) <= tolerance
+            else:
+                # Without an exact origin, only flag disjoint possible values.
+                valid = (anchor_interval[0] <= rhs + tolerance
+                         and anchor_interval[1] >= rhs - tolerance)
+        if not valid:
+            issues.append(f"{left_text.strip()} {operator} {right_text.strip()}")
+        if right_piece.strip() != right_text:
+            anchor = None
     return list(dict.fromkeys(issues))
 
 

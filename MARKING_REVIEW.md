@@ -23,4 +23,12 @@ python -m unittest discover -s tests/ui -p 'test_*.py' -v
 python tests/benchmark_document_pipeline.py
 ```
 
-These tests establish application behavior under mocked responses, not real-world model marking accuracy. Generated narrative can still be wrong. Existing cached reports are not retroactively repaired; version 3.3.13 invalidates versioned result-cache identities for subsequent marking.
+These tests establish application behavior under mocked responses, not real-world model marking accuracy. Generated narrative can still be wrong. Existing cached reports are not retroactively repaired; version 3.3.14 invalidates versioned result-cache identities for subsequent marking.
+
+## Decimal approximation checks
+
+The arithmetic validator treats `...` and `…` after a decimal as a truncated prefix. Thus `1690 / 60 = 28.16... = 28.2` is valid, while an incorrect prefix or final rounded value still produces a warning. Explicit recurring notation such as `0.(3)` and `0.1(6)` is evaluated as an exact fraction. Ellipses alone do not assert a particular repeating cycle.
+
+Finite decimal results use half a unit in the last displayed decimal place; an exact halfway case is accepted without choosing a tie-breaking convention. Integers retain exact comparison unless an approximate operator (`≈`, `≃`, `~=`) or an unfinished decimal explicitly indicates approximation. Exact fractions avoid floating-point boundary errors. The original value is retained across a numeric equality chain to detect incorrect final rounding and double rounding. If only an unfinished decimal is available, overlapping possible values are treated conservatively rather than inventing hidden digits.
+
+These checks support short, plain numeric expressions and the notations above. They are not a general symbolic proof system or a LaTeX parser. Existing independent final-answer comparisons, marking evidence checks and teacher-review rules remain in place. The rounding regressions exercise both the arithmetic helper and the complete explanation/award validators; warnings never directly change marks.
