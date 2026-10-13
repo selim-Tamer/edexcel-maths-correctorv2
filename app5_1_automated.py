@@ -559,29 +559,74 @@ def build_csv_rows(student_name: str, result: dict) -> list:
     return rows
 
 
-def preserve_result_snapshot(rows, namespace):
-    """Keep one displaced successful batch per path, session-local and read-only.
+def result_owner():
+    """Bind reports to an authenticated subject, or this anonymous manual session."""
+    if google_logged_in():
+        subject = getattr(st.user, "sub", "")
+        if isinstance(subject, str) and subject:
+            return "google:" + subject
+        return None  # authenticated but unidentified: do not expose history
+    return "session:" + st.session_state.setdefault("manual_report_owner", uuid.uuid4().hex)
 
-    Never match students by filename or promote a previous grade to current.
-    Materialize teacher overrides before taking an independent snapshot.
+
+def preserve_result_snapshot(rows, namespace, context="", label=""):
+    """Archive distinct displaced successes; never promote history to current.
+
+    Retain up to 200 reports per path, rather than losing other students when a
+    later batch only contains some successful rows. No matching by filename.
     """
-    saved = [copy.deepcopy(prepare_review_row(copy.deepcopy(row)))
-             for row in rows if row.get("status") == "Marked"]
+    owner = result_owner()
+    if owner is None or (namespace == "classroom" and not owner.startswith("google:")):
+        return
+    history = st.session_state.setdefault("previous_result_snapshots", {})
+    saved = list(history.get(namespace, []))
+    for original in rows:
+        if original.get("status") != "Marked" or original.get("report_owner") != owner:
+            continue
+        row = copy.deepcopy(prepare_review_row(copy.deepcopy(original)))
+        identity = row["review_key"]
+        if any(item.get("review_key") == identity for item in saved):
+            continue
+        row.update(is_current=False, status="Historical", report_owner=owner,
+                   snapshot_context=context, snapshot_label=label or namespace,
+                   historical=True)
+        if namespace == "classroom":
+            # is_current=False intentionally suppresses proposed grades. Keep
+            # only final score/percentage; no stale AI grade or approval flag.
+            row.pop("suggested_classroom_grade", None)
+            row.pop("approved", None)
+        saved.append(row)
     if saved:
-        for row in saved:
-            row["is_current"] = False
-        st.session_state.setdefault("previous_result_snapshots", {})[namespace] = saved
+        if len(saved) > 200:
+            st.session_state["snapshot_history_trimmed"] = True
+        history[namespace] = saved[-200:]
 
 
 def render_result_snapshots():
-    for namespace, rows in st.session_state.get("previous_result_snapshots", {}).items():
+    owner = result_owner()
+    if owner is None:
+        return
+    for namespace, history in st.session_state.get("previous_result_snapshots", {}).items():
+        if namespace == "classroom" and not owner.startswith("google:"):
+            continue
+        rows = [row for row in history if row.get("report_owner") == owner]
+        if not rows:
+            continue
         with st.expander(f"Previous successful results ({namespace})"):
-            st.caption("Snapshot of the most recently replaced successful results, including teacher overrides. "
-                       "These are historical results, not current grade suggestions. "
-                       "Download to retain them beyond this session; a later successful batch may replace this snapshot.")
-            st.download_button("Download previous results", data=json.dumps(rows, ensure_ascii=False, indent=2),
+            st.caption("These are historical results, not current grade suggestions. "
+                       "Final marks include teacher overrides. Download to retain them beyond this session. "
+                       "Up to 200 reports are retained per path; older reports may be removed.")
+            if namespace == "manual" and owner.startswith("session:"):
+                st.caption("Manual reports belong to this browser session; Google authentication is not required for manual marking.")
+            contexts = list(dict.fromkeys(row.get("snapshot_label", namespace) for row in rows))
+            st.caption("Saved contexts: " + "; ".join(contexts))
+            # Ownership is enforced server-side; do not export the OIDC subject.
+            exported = [{k: v for k, v in row.items() if k != "report_owner"} for row in rows]
+            st.download_button("Download previous results", data=json.dumps(exported, ensure_ascii=False, indent=2),
                                file_name=f"previous_{namespace}_results.json", mime="application/json",
                                key=f"previous_results_{namespace}")
+    if st.session_state.get("snapshot_history_trimmed"):
+        st.caption("Older historical reports were removed because the session history limit was reached.")
 
 
 def new_review_row(row, namespace):
@@ -589,6 +634,7 @@ def new_review_row(row, namespace):
     reviewed = copy.deepcopy(row)
     if reviewed.get("status") == "Marked":
         reviewed["review_key"] = namespace + "_" + uuid.uuid4().hex
+        reviewed["report_owner"] = result_owner()
         reviewed["ai_result"] = copy.deepcopy(row.get("ai_result", row["result"]))
     return reviewed
 
@@ -727,7 +773,7 @@ def classroom_grade_details(row, rounding_places=2):
         "display_grade": f"{proposed:.{rounding_places}f}" if proposed is not None else "—",
         "ai_grade": f"{original:.{rounding_places}f}" if original is not None else "—",
         "approved": approval,
-        "approval_status": ("Historical — no longer turned in" if not is_current
+        "approval_status": (row.get("historical_reason", "Historical — no longer turned in") if not is_current
                             else "Teacher approved" if approval else "Pending review"),
         "is_current": is_current,
         "sample": f"Sampled ({len(questions)}/{total_questions or '?'})" if selected else "Entire homework",
@@ -2247,11 +2293,11 @@ def classroom_submission_revision(token, submission):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
-def merge_classroom_results(previous, current, processed_revisions=None):
+def merge_classroom_results(previous, current, processed_revisions=None, context="", label=""):
     """Reconcile history against a complete, successful turned-in listing."""
     rows = {row["submission_id"]: row for row in (previous or {}).get("processed", [])}
     replaced = {row["submission_id"] for row in current["processed"]}
-    preserve_result_snapshot([row for sid, row in rows.items() if sid in replaced], "classroom")
+    preserve_result_snapshot([row for sid, row in rows.items() if sid in replaced], "classroom", context, label)
     for row in current["processed"]:
         old = rows.get(row["submission_id"])
         if old and old.get("review_key") != row.get("review_key") and old.get("review_key"):
@@ -2268,6 +2314,18 @@ def merge_classroom_results(previous, current, processed_revisions=None):
             if processed_revisions is not None:
                 processed_revisions.discard(row.get("revision"))
     return dict(current, processed=list(rows.values()))
+
+
+def retire_classroom_rows(previous, submission_ids, context, label):
+    """Revoke stale approvals as soon as a new revision is queued, before APIs."""
+    rows = [row for row in (previous or {}).get("processed", [])
+            if row.get("submission_id") in submission_ids]
+    preserve_result_snapshot(rows, "classroom", context, label)
+    for row in rows:
+        row["is_current"] = False
+        row["historical_reason"] = "Historical — re-mark pending or failed"
+        if row.get("review_key"):
+            invalidate_classroom_approval(row["review_key"])
 
 
 def prepare_classroom_reference(client, upload, session, run, context, random_count, report):
@@ -2343,6 +2401,10 @@ def run_classroom_marking_job(
             "active_submission_ids": active_submission_ids,
         }
 
+    # A preparation/upload failure must not leave an older revision approved.
+    previous = st.session_state.get("classroom_jobs", {}).get(document_context, {}).get("last_result")
+    retire_classroom_rows(previous, {s["id"] for s in pending}, document_context,
+                          course_id + " / " + str(coursework.get("title", coursework["id"])))
     mark_scheme_remote = None
     reference_run = None
     processed = []
@@ -3356,7 +3418,9 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 expanded=False,
                                             )
 
-                                        job_state["last_result"] = merge_classroom_results(job_state["last_result"], result, processed_ids)
+                                        job_state["last_result"] = merge_classroom_results(
+                                            job_state["last_result"], result, processed_ids, context_key,
+                                            selected_course_id + " / " + str(selected_assignment.get("title", selected_assignment["id"])))
 
                                     except Exception as classroom_error:
                                         message = str(classroom_error)
@@ -3641,8 +3705,12 @@ if st.button(
                         )
 
             # Store for download/re-render.
-            preserve_result_snapshot(st.session_state.get("last_batch_results", []), "manual")
+            preserve_result_snapshot(
+                st.session_state.get("last_batch_results", []), "manual",
+                st.session_state.get("last_manual_context", ""),
+                st.session_state.get("last_mark_scheme_name", "Manual submission"))
             st.session_state["last_batch_results"] = [new_review_row(row, "manual") for row in batch_results]
+            st.session_state["last_manual_context"] = documents.digest(mark_scheme_pdf.getvalue())
             st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
 
             marked_count = sum(1 for r in batch_results if r["status"] == "Marked")
