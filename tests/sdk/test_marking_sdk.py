@@ -10,6 +10,7 @@ from google.genai import types
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from support import load_app, benchmark, model_question
 import marking_requests as mr
+from pipeline_fakes import quota_failure, model_unavailable
 
 
 class MarkingSDKTests(unittest.TestCase):
@@ -56,3 +57,32 @@ class MarkingSDKTests(unittest.TestCase):
             self.assertEqual(mr.state_for(client)['last']['attempts'][0]['outcome'], 'timeout')
         self.assertEqual(len(calls), 1)
         self.assertNotIn('private provider', str(error.exception))
+
+    def test_structured_provider_errors_and_fresh_client_recovery(self):
+        f = load_app(); f['types'] = types
+        payload = {'questions': [model_question(benchmark()['questions'][0], 'partial')]}
+        for scenario, expected in (('model', 2), ('shared', 1), ('unknown', 1), ('404', 3), ('503', 2), ('504', 1)):
+            for fresh_run in range(2):
+                seen = []
+                def handler(request):
+                    seen.append(request.url.path)
+                    model = request.url.path.rsplit('/', 1)[-1].split(':')[0]
+                    if (scenario == '404' and len(seen) <= 2) or len(seen) == 1:
+                        if scenario == '404':
+                            return httpx.Response(404, json=model_unavailable(model).details)
+                        if scenario in ('model', 'shared', 'unknown'):
+                            return httpx.Response(429, json=quota_failure(model, scenario).details)
+                        return httpx.Response(int(scenario), json={'error': {'code': int(scenario), 'message': 'synthetic'}})
+                    return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
+                        'role': 'model', 'parts': [{'text': json.dumps(payload)}]}}]})
+                with self.subTest(scenario=scenario, fresh_run=fresh_run), genai.Client(
+                        api_key='synthetic-not-real', http_options=types.HttpOptions(
+                            retry_options=types.HttpRetryOptions(attempts=5),
+                            client_args={'transport': httpx.MockTransport(handler)})) as client:
+                    if scenario in ('shared', 'unknown', '504'):
+                        with self.assertRaises(RuntimeError):
+                            f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+                    else:
+                        result, _ = f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+                        self.assertEqual(result, payload)
+                    self.assertEqual(len(seen), expected)

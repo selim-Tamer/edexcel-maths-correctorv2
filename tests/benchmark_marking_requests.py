@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from support import load_app, fake_client, remote, model_question, benchmark as fixtures
-from pipeline_fakes import Clock, ApiError
+from pipeline_fakes import Clock, ApiError, model_unavailable, quota_failure
 
 
 def run(old, scenario):
@@ -15,6 +15,13 @@ def run(old, scenario):
     client = fake_client()
     sample = {'questions': [model_question(q, 'partial') for q in fixtures()['questions'][:10]]}
     def reply(**kwargs):
+        index = f['PRIMARY_MODELS'].index(kwargs['model'])
+        if scenario == 'model_quota_recovery' and index == 0:
+            clock.sleep(1)
+            raise quota_failure(kwargs['model'])
+        if scenario == 'unavailable_recovery' and index < 2:
+            clock.sleep(1)
+            raise model_unavailable(kwargs['model'])
         if scenario == 'timeout':
             clock.sleep(120)
             raise TimeoutError('synthetic timeout')
@@ -47,7 +54,7 @@ def benchmark():
     return {'live_requests': 0, 'timing': 'SIMULATED: success 60s, timeout 120s, failure 1s per generation; no SDK retry assumption',
             'token_note': 'Character counts are exact; not tokenizer counts or measured model speed.',
             'cases': {name: {'before': run(True, name), 'after': run(False, name)}
-                      for name in ('success', 'timeout', 'unavailable', 'quota')}}
+                      for name in ('success', 'timeout', 'unavailable', 'quota', 'model_quota_recovery', 'unavailable_recovery')}}
 
 
 if __name__ == '__main__':

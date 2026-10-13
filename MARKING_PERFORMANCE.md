@@ -8,9 +8,9 @@ The main request already batches all selected questions for one student, with th
 
 The client already had a 120-second timeout. The tested minimum SDK (google-genai 1.40.0) defaults to one attempt, so hidden SDK retries are not an established cause. The application, however, could try four models after failures, including ambiguous timeouts and quota errors. We cannot attribute the reported three-minute run to this without live diagnostics.
 
-The new controller preserves the 120-second request timeout, sets SDK attempts explicitly to one, and allows at most two generations with a 180-second scheduling budget. It stops on timeouts, quota/auth/request rejection and truncated/blocked responses. One fallback remains for unavailable services or unusable JSON. Known 404 models are skipped on subsequent students using the same client. Client-local cooldowns respect Retry-After without sleeping; clients never share account state. Cooldowns expire with the client and do not persist across fresh runs. The deadline is checked between calls/responses; the SDK HTTP timeout is not a hard process cancellation guarantee.
+The new controller preserves the 120-second request timeout, sets SDK attempts explicitly to one, and allows at most four HTTP generation requests (three fallbacks), at most two non-fast-rejection attempts, and a 180-second scheduling budget. A confirmed model-unavailable 404 or explicitly model-specific quota rejection taking at most ten seconds does not consume the two-attempt budget, but always consumes the four-request budget. Slower rejections consume both. It stops on timeouts, shared/unknown quota, auth/request rejection and truncated/blocked responses. One costly fallback remains for unavailable services or unusable JSON. Only 404 responses explicitly naming the requested model as unavailable are cached; missing-file/unidentified 404s stop conservatively. Known unavailable models are skipped on subsequent students using the same client. Quota classification reads the SDK structured QuotaFailure violations. Every violation must name the requested model, a PerModel quota ID and a Gemini generation quota metric; mixed, incomplete or unfamiliar scopes fail closed. Shared/unknown quota blocks the client; confirmed model quota blocks only that model. Error text alone never authorizes quota fallback. Client-local cooldowns respect Retry-After without sleeping; clients never share account state. Cooldowns expire with the client and do not persist across fresh runs. The deadline is checked between calls/responses; the SDK HTTP timeout is not a hard process cancellation guarantee.
 
-This deliberately trades some fallback availability for bounded latency and request consumption. A teacher may need to retry manually when another model might have succeeded. Faster failure is not faster completed marking.
+This deliberately trades some fallback availability for bounded latency and request consumption. A teacher may need to retry manually after ambiguous timeouts or shared/unknown quota errors. All four configured models remain reachable after quick, confirmed unavailable/model-quota responses; fresh clients obey the same finite limits. Faster failure is not faster completed marking.
 
 Duplicate user instructions were removed. The full system instructions, response schema, official scheme evidence, student working, mark breakdown, correct method and full solution remain. No thinking reduction or output token cap is imposed. No automatic marks change is introduced. Arithmetic/transcription review and Classroom pathways retain their existing behavior.
 
@@ -30,9 +30,13 @@ Run python tests/benchmark_marking_requests.py. It executes the frozen original 
 | Simulated successful response | 60 s | 60 s |
 | All-timeout failure calls / simulated time | 4 / 480 s | 1 / 120 s |
 | All-503 failure calls / simulated time | 4 / 4 s | 2 / 2 s |
-| All-429 failure calls / simulated time | 4 / 4 s | 1 / 1 s |
+| Unknown-quota 429 failure calls / simulated time | 4 / 4 s | 1 / 1 s |
+| Model-quota then successful fallback | 2 / 61 s | 2 / 61 s |
+| Two unavailable models then success | 3 / 62 s | 3 / 62 s |
 
 The user prompt shrinks 45.4%; total text above shrinks 14.8%. These are exact character counts, not tokenizer measurements, and exclude potentially dominant PDF tokens. Synthetic response length is unchanged. Failure timings are controlled simulations, not observed service latency. No successful-marking speedup is claimed.
+
+Recovery regressions exercise model-specific/shared/unknown/mixed/malformed quotas, two unavailable models followed by success, repeated fresh clients, all four configured models, duplicate inputs, a 20-model list capped at four calls, slow rejections, 503 recovery, 504 stopping and content-free quota diagnostics. Intercepted real-SDK tests verify the actual provider error shape and disable inherited retries.
 
 Existing digital and raster handwriting-style PDF benchmarks also completed. Original uploads and inspection behavior are unchanged; the existing metadata optimization remains two generations to one, and completed repeat runs make no requests. This is a preserved PR #9 benefit, not a new improvement here. Local PDF timing varies with machine load; it does not explain cloud generation latency.
 
@@ -46,7 +50,7 @@ Interpret a single slow successful call as provider/model/context work, then com
 
 ## Validation and remaining work
 
-Local validation: 165 regression tests, 8 Streamlit interaction tests and 6 real-SDK/intercepted-HTTP tests passed, plus syntax validation and all four benchmark scripts. One initial Streamlit cold-start timed out at 20 seconds; the full unchanged UI suite passed on rerun in 11.7 seconds. CI independently runs these suites.
+Local validation: 176 regression tests, 8 Streamlit interaction tests and 7 real-SDK/intercepted-HTTP tests passed, plus syntax validation and all four benchmark scripts. The earlier revision had one local cold-start timeout; its rerun and the fallback-fix validation passed. CI independently runs these suites.
 
 Tests exercise the real controller, original attachment/schema retention, correct/incorrect/partial score normalization, evidence safeguards, bounded errors/fallbacks, privacy, cooldown isolation, serialization, SDK timeout/retry configuration and completed-run caching. Synthetic model responses test application handling; they do not establish Gemini accuracy after prompt changes.
 

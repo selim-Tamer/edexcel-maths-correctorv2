@@ -82,6 +82,46 @@
         "schema_characters": 1544,
         "response_characters": 0
       }
+    },
+    "model_quota_recovery": {
+      "before": {
+        "outcome": "completed",
+        "generation_calls": 2,
+        "virtual_seconds": 61.0,
+        "prompt_characters": 2370,
+        "system_characters": 3335,
+        "schema_characters": 1544,
+        "response_characters": 5262
+      },
+      "after": {
+        "outcome": "completed",
+        "generation_calls": 2,
+        "virtual_seconds": 61.0,
+        "prompt_characters": 1295,
+        "system_characters": 3335,
+        "schema_characters": 1544,
+        "response_characters": 5262
+      }
+    },
+    "unavailable_recovery": {
+      "before": {
+        "outcome": "completed",
+        "generation_calls": 3,
+        "virtual_seconds": 62.0,
+        "prompt_characters": 2370,
+        "system_characters": 3335,
+        "schema_characters": 1544,
+        "response_characters": 5262
+      },
+      "after": {
+        "outcome": "completed",
+        "generation_calls": 3,
+        "virtual_seconds": 62.0,
+        "prompt_characters": 1295,
+        "system_characters": 3335,
+        "schema_characters": 1544,
+        "response_characters": 5262
+      }
     }
   }
 }

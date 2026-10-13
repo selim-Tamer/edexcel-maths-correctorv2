@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from support import load_app, fake_client, benchmark, model_question, remote
-from pipeline_fakes import Clock, ApiError
+from pipeline_fakes import Clock, ApiError, model_unavailable, quota_failure
 import marking_requests as mr
 
 
@@ -68,7 +68,7 @@ class MarkingRequestTests(unittest.TestCase):
         self.run_grade(client)
 
     def test_unavailable_model_skipped_on_next_student_without_wait(self):
-        client = fake_client([ApiError(404), self.payload, self.payload])
+        client = fake_client([model_unavailable('gemini-3.8-flash'), self.payload, self.payload])
         self.assertEqual(self.run_grade(client)[1], 'gemini-3.6-flash')
         self.assertEqual(self.run_grade(client)[1], 'gemini-3.6-flash')
         self.assertEqual(client.models.generate_content.call_count, 3)
@@ -103,7 +103,7 @@ class MarkingRequestTests(unittest.TestCase):
             self.assertEqual(client.models.generate_content.call_count, 2)
 
     def test_no_technical_details_in_progress_or_default_logs(self):
-        client = fake_client([ApiError(404), self.payload])
+        client = fake_client([model_unavailable('gemini-3.8-flash'), self.payload])
         progress = Mock()
         with patch.dict(os.environ, {'MATH_MARKER_DIAGNOSTICS': ''}), patch.object(mr.logging, 'getLogger') as logger:
             self.run_grade(client, status_callback=progress)
@@ -155,3 +155,122 @@ class MarkingRequestTests(unittest.TestCase):
         self.assertEqual(new['response_characters'], old['response_characters'])
         self.assertEqual(new['generation_calls'], 1)
         self.assertEqual(measured['cases']['timeout']['after']['generation_calls'], 1)
+        for case, calls in [('model_quota_recovery', 2), ('unavailable_recovery', 3)]:
+            self.assertEqual(measured['cases'][case]['after']['outcome'], 'completed')
+            self.assertEqual(measured['cases'][case]['after']['generation_calls'], calls)
+
+    def test_model_quota_recovers_and_only_blocks_affected_model(self):
+        client = fake_client([quota_failure('gemini-3.8-flash', retry_after='130'), self.payload, self.payload])
+        self.assertEqual(self.run_grade(client)[1], 'gemini-3.6-flash')
+        state = mr.state_for(client)
+        self.assertEqual(state['account_until'], 0)
+        self.assertEqual(state['blocked'], {'gemini-3.8-flash': 130})
+        self.assertEqual(self.run_grade(client)[1], 'gemini-3.6-flash')
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.run_grade(fake_client([self.payload]))
+        self.clock.sleep(131)
+        client.models.generate_content.side_effect = [SimpleNamespace(text=json.dumps(self.payload))]
+        self.assertEqual(self.run_grade(client)[1], 'gemini-3.8-flash')
+
+    def test_shared_unknown_and_message_only_quota_stop(self):
+        for error in (quota_failure('gemini-3.8-flash', 'shared'),
+                      quota_failure('gemini-3.8-flash', 'unknown'),
+                      RuntimeError('429 PerModel quota for gemini-3.8-flash')):
+            client = fake_client([error, self.payload])
+            with self.assertRaises(RuntimeError): self.run_grade(client)
+            self.assertEqual(client.models.generate_content.call_count, 1)
+            self.assertGreater(mr.state_for(client)['account_until'], 0)
+
+    def test_mixed_mismatched_and_malformed_quota_fail_closed(self):
+        import copy
+        base = quota_failure('gemini-3.8-flash')
+        variants = []
+        mixed = copy.deepcopy(base.details)
+        mixed['error']['details'][0]['violations'].append(
+            quota_failure('gemini-3.8-flash', 'shared').details['error']['details'][0]['violations'][0])
+        variants.append(mixed)
+        variants.extend([{}, {'error': {'details': [None]}}, {'error': {'details': 'bad'}},
+                         quota_failure('different-model').details])
+        for field in ('quotaDimensions', 'quotaId', 'quotaMetric'):
+            malformed = copy.deepcopy(base.details)
+            malformed['error']['details'][0]['violations'][0][field] = None
+            variants.append(malformed)
+        unfamiliar = copy.deepcopy(base.details)
+        unfamiliar['error']['details'].append({'@type': 'unknown'})
+        variants.append(unfamiliar)
+        for details in variants:
+            error = ApiError(429); error.details = details
+            client = fake_client([error, self.payload])
+            with self.assertRaises(RuntimeError): self.run_grade(client)
+            self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_two_unavailable_models_reach_third_on_every_fresh_client(self):
+        for _ in range(3):
+            client = fake_client([model_unavailable('gemini-3.8-flash'),
+                                  model_unavailable('gemini-3.6-flash'), self.payload])
+            self.assertEqual(self.run_grade(client)[1], 'gemini-3.5-flash')
+            self.assertEqual(client.models.generate_content.call_count, 3)
+            self.assertEqual(mr.state_for(client)['last']['generation_attempt_count'], 1)
+
+    def test_absolute_cap_and_duplicate_models(self):
+        for kind in ('404', '429'):
+            names = ['gemini-test-' + str(i) for i in range(20)]
+            client = fake_client([model_unavailable(n) if kind == '404' else quota_failure(n) for n in names])
+            with self.assertRaises(RuntimeError):
+                self.f['grade_with_model'](client, names, remote(), remote())
+            self.assertEqual(client.models.generate_content.call_count, 4)
+        client = fake_client([model_unavailable('gemini-test')])
+        with self.assertRaises(RuntimeError):
+            self.f['grade_with_model'](client, ['gemini-test'] * 20, remote(), remote())
+        self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_fourth_model_reachable_after_three_fast_rejections(self):
+        names = self.f['PRIMARY_MODELS']
+        client = fake_client([model_unavailable(names[0]), quota_failure(names[1]),
+                              model_unavailable(names[2]), self.payload])
+        self.assertEqual(self.f['grade_with_model'](client, names, remote(), remote())[1], names[3])
+        self.assertEqual(client.models.generate_content.call_count, 4)
+
+    def test_slow_rejections_consume_generation_and_elapsed_budget(self):
+        for duration in (11, 90):
+            client = fake_client()
+            def reply(**kwargs):
+                self.clock.sleep(duration)
+                raise model_unavailable(kwargs['model'])
+            client.models.generate_content.side_effect = reply
+            with self.assertRaises(RuntimeError): self.run_grade(client)
+            self.assertEqual(client.models.generate_content.call_count, 2)
+            self.assertEqual(mr.state_for(client)['last']['generation_attempt_count'], 2)
+
+    def test_unidentified_or_file_404_does_not_poison_model(self):
+        for message in ('files/private-file not found', 'not found',
+                        'files/private-file not found while using models/gemini-3.8-flash'):
+            error = ApiError(404)
+            error.details = {'error': {'message': message}}
+            client = fake_client([error, self.payload])
+            with self.assertRaises(RuntimeError): self.run_grade(client)
+            self.assertEqual(client.models.generate_content.call_count, 1)
+            self.assertEqual(mr.state_for(client)['blocked'], {})
+
+    def test_503_recovers_but_504_never_retries(self):
+        client = fake_client([ApiError(503), self.payload])
+        self.assertEqual(self.run_grade(client)[1], 'gemini-3.6-flash')
+        client = fake_client([ApiError(504), self.payload])
+        with self.assertRaises(RuntimeError): self.run_grade(client)
+        self.assertEqual(client.models.generate_content.call_count, 1)
+
+    def test_fast_skip_does_not_extend_two_expensive_attempts(self):
+        names = self.f['PRIMARY_MODELS']
+        client = fake_client([model_unavailable(names[0]), ApiError(503), ApiError(503), self.payload])
+        with self.assertRaises(RuntimeError):
+            self.f['grade_with_model'](client, names, remote(), remote())
+        self.assertEqual(client.models.generate_content.call_count, 3)
+
+    def test_quota_diagnostics_do_not_record_structured_error_content(self):
+        error = quota_failure('gemini-3.8-flash')
+        client = fake_client([error, self.payload])
+        with patch.dict(os.environ, {'MATH_MARKER_DIAGNOSTICS': '1'}), self.assertLogs('math_marker.marking', level='INFO') as logs:
+            self.run_grade(client)
+        self.assertNotIn('synthetic private quota response', str(logs.output))
+        self.assertNotIn('quotaDimensions', str(logs.output))
+        self.assertEqual(mr.state_for(client)['last']['attempts'][0]['quota_scope'], 'model')
