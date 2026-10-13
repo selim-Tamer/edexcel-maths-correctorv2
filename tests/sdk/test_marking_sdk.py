@@ -1,0 +1,58 @@
+"""Real SDK wire requests intercepted locally; no API key or network required."""
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+import httpx
+from google import genai
+from google.genai import types
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from support import load_app, benchmark, model_question
+import marking_requests as mr
+
+
+class MarkingSDKTests(unittest.TestCase):
+    def test_wire_schema_usage_and_inherited_retries_disabled(self):
+        for failure, expected in ((429, 1), (503, 2), (None, 1)):
+            seen = []
+            payload = {'questions': [model_question(benchmark()['questions'][0], 'partial')]}
+            def handler(request):
+                seen.append((json.loads(request.content), request.extensions['timeout']))
+                if failure:
+                    return httpx.Response(failure, json={'error': {'code': failure, 'message': 'synthetic private provider detail'}})
+                return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
+                    'role': 'model', 'parts': [{'text': json.dumps(payload)}]}}],
+                    'usageMetadata': {'promptTokenCount': 8000, 'candidatesTokenCount': 900, 'thoughtsTokenCount': 1000}})
+            f = load_app(); f['types'] = types
+            # Even an operator's inherited SDK retry configuration is overridden.
+            with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
+                    retry_options=types.HttpRetryOptions(attempts=5),
+                    client_args={'transport': httpx.MockTransport(handler)})) as client:
+                if failure:
+                    with self.assertRaises(RuntimeError):
+                        f['grade_with_model'](client, f['PRIMARY_MODELS'], 'synthetic student', 'synthetic scheme')
+                else:
+                    result, _ = f['grade_with_model'](client, f['PRIMARY_MODELS'], 'synthetic student', 'synthetic scheme')
+                    self.assertEqual(result['questions'][0]['awarded_marks'], 1)
+                    self.assertEqual(mr.state_for(client)['last']['attempts'][0]['thoughts_token_count'], 1000)
+            self.assertEqual(len(seen), expected)
+            self.assertLessEqual(seen[0][1]['read'], 120)
+            config = seen[0][0]['generationConfig']
+            self.assertIn('mark_breakdown', config['responseSchema']['properties']['questions']['items']['properties'])
+            self.assertNotIn('thinkingConfig', config)
+            self.assertNotIn('maxOutputTokens', config)
+
+    def test_timeout_does_not_trigger_second_provider_request(self):
+        calls = []
+        def handler(request):
+            calls.append(request)
+            raise httpx.ReadTimeout('synthetic private provider detail')
+        f = load_app(); f['types'] = types
+        with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
+                client_args={'transport': httpx.MockTransport(handler)})) as client:
+            with self.assertRaises(RuntimeError) as error:
+                f['grade_with_model'](client, f['PRIMARY_MODELS'], 'synthetic student', 'synthetic scheme')
+            self.assertEqual(mr.state_for(client)['last']['attempts'][0]['outcome'], 'timeout')
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('private provider', str(error.exception))

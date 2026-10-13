@@ -52,7 +52,7 @@ st.markdown(
 )
 
 
-APP_VERSION = "3.3.16"
+APP_VERSION = "3.3.17"
 AUDIT_MAX_ATTEMPTS = 2
 AUDIT_MAX_OUTPUT_TOKENS = 8192
 # Stable Gemini API models with large context windows.
@@ -1580,6 +1580,22 @@ def discover_question_numbers(client, mark_scheme_file, question_file=None):
     raise RuntimeError("Could not identify questions for random marking. " + " | ".join(errors))
 
 
+def wait_for_marking(futures):
+    """Simple main-thread progress; no request diagnostics in the browser."""
+    remaining = set(futures)
+    started = time.monotonic()
+    display = st.empty()
+    try:
+        while remaining:
+            done, remaining = wait(remaining, timeout=0.5, return_when=FIRST_COMPLETED)
+            if remaining:
+                display.info(f"Marking and checking the original work… {int(time.monotonic() - started)}s elapsed")
+            for future in done:
+                yield future
+    finally:
+        display.empty()
+
+
 def mark_one_submission(
     client,
     student_name: str,
@@ -2703,35 +2719,12 @@ def grade_with_model(
     useful for Google Classroom submissions containing multiple pages/files.
     """
     prompt = """
-Mark the student's work in the uploaded file(s) against the uploaded mark scheme.
-
-The student file(s) may contain multiple pages/files belonging to one submission.
-Treat them as ONE student's complete submission.
-
-The files are:
-- Student submission: the actual work to mark.
-- Official mark scheme: the source of marking rules and maximum marks.
-- Optional question paper: use it only to improve question identification/context.
-
-Return ONLY the requested JSON structure.
-
-Before returning:
-- identify every question you can,
-- assign max marks from the mark scheme,
-- assign earned marks question-by-question,
-- include an M/A/B breakdown for EVERY awarded mark with visible handwriting evidence,
-- student_answer must transcribe what the student wrote, not the mark scheme,
-- working_summary must identify actual visible working, or say unreadable/not shown,
-- do not write your own self-corrections or guessed alternate steps in working_summary; if unreadable report uncertainty instead,
-- cross-check each part of the full-mark solution with the official mark scheme,
-- if the answer cannot be read from the student PDF, mark Low confidence; never invent evidence,
-- explain lost marks,
-- provide a full-mark solution,
-- flag any unreadable or genuinely ambiguous evidence,
-- inspect handwriting, diagrams, graphs, annotations, and page orientation carefully,
-- if image quality prevents reliable marking, mark the question confidence as Low rather than guessing.
-
-Do not calculate the final total as a free-form narrative. The application will calculate it from the individual question marks.
+Mark ONE student's complete submission against the official scheme using all system rules.
+Files in order: student file(s), official mark scheme, then optional question paper.
+Return the requested JSON only. Keep topic, method and summary concise; avoid repeating
+explanations across fields. Preserve every relevant student-written step, official answer,
+M/A/B criterion and award/loss reason. Give a complete, concise full-mark solution.
+Do not shorten evidence, guess unreadable notation or omit uncertainty to save space.
 """
 
     if selected_questions is not None:
@@ -2775,68 +2768,10 @@ Do not calculate the final total as a free-form narrative. The application will 
         contents_base.append(question_file)
     contents_base.append(prompt)
 
-    errors = []
-
-    for model_name in model_names:
-        if model_on_quota_cooldown(model_name):
-            continue
-        for attempt in range(1):
-            try:
-                if status_callback:
-                    status_callback(
-                        f"🧠 Marking with {model_name}"
-                        + (f" (attempt {attempt + 1}/2)" if attempt else "")
-                    )
-
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents_base,
-                    config=types.GenerateContentConfig(
-                        system_instruction=MARKING_SYSTEM,
-                        response_mime_type="application/json",
-                        response_schema=OUTPUT_SCHEMA,
-                    ),
-                )
-
-                if response and response.text:
-                    return extract_json(response.text), model_name
-
-                raise RuntimeError(f"{model_name} returned an empty response.")
-
-            except Exception as exc:
-                errors.append(f"{model_name}: {exc}")
-
-                remember_model_failure(model_name, exc)
-
-                # Daily free-tier quota exhaustion will not be fixed by waiting
-                # a couple of seconds or retrying this same model. Skip straight
-                # to the next candidate to avoid wasting time.
-                if is_daily_quota_exhausted_error(exc):
-                    if status_callback:
-                        status_callback(
-                            f"⏭️ Skipping {model_name}: daily quota exhausted"
-                        )
-                    break
-
-                # A 429 caused by a short-window quota should not trigger a
-                # retry against the same model; move to the next candidate.
-                if is_quota_error(exc):
-                    if status_callback:
-                        status_callback(
-                            f"⏭️ Skipping {model_name}: Gemini quota limit reached"
-                        )
-                    break
-
-                # Do not repeat a costly generation after a timeout; try the next model.
-                if is_model_unavailable_error(exc) and status_callback:
-                    status_callback(f"⏭️ Skipping unavailable model {model_name}")
-
-                break
-
-    raise RuntimeError(
-        "All configured Gemini models failed. "
-        + " | ".join(errors)
-    )
+    import marking_requests
+    return marking_requests.generate(
+        client, model_names, contents_base, MARKING_SYSTEM, OUTPUT_SCHEMA,
+        types.GenerateContentConfig, extract_json, status_callback, clock=time)
 
 
 def review_required(result):
@@ -3639,7 +3574,7 @@ if st.button(
                         f"**{cached['student_name']}** — no new AI marking needed"
                     )
 
-                for future in as_completed(marking_futures):
+                for future in wait_for_marking(marking_futures):
                     sp_name, cache_key = marking_futures[future]
                     completed += 1
 
