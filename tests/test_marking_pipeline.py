@@ -172,33 +172,36 @@ class GeminiBoundaryTests(unittest.TestCase):
         return self.f["grade_with_model"](client, ["fake-a", "fake-b"],
                                          remote(), remote(name="scheme"))
 
-    def test_quota_fallback_has_no_same_model_retry_or_sleep(self):
+    def test_quota_stops_without_cross_model_retry_or_sleep(self):
         client = fake_client([RuntimeError("429 perday quota exceeded"), {"questions": []}])
-        clock = SimpleNamespace(monotonic=lambda: 100, sleep=Mock())
+        clock = SimpleNamespace(monotonic=lambda: 100, time=lambda: 100, sleep=Mock())
         self.f["time"] = clock
-        self.assertEqual(self.grade(client)[1], "fake-b")
+        with self.assertRaisesRegex(RuntimeError, 'Marking did not complete'):
+            self.grade(client)
         self.assertEqual([c.kwargs["model"] for c in client.models.generate_content.call_args_list],
-                         ["fake-a", "fake-b"])
+                         ["fake-a"])
         clock.sleep.assert_not_called()
-        self.assertTrue(self.f["model_on_quota_cooldown"]("fake-a"))
+        self.assertEqual(client._math_marking_state['account_until'], 21700)
 
     def test_cooldown_skips_model_and_expires(self):
         self.f["time"] = SimpleNamespace(monotonic=lambda: 100)
-        self.f["remember_model_failure"]("fake-a", RuntimeError("429 quota exceeded"))
-        client = fake_client([{"questions": []}])
+        import marking_requests
+        client = fake_client([{"questions": [{"question_number": "1"}]}])
+        marking_requests.state_for(client)['blocked']['fake-a'] = 190
         self.assertEqual(self.grade(client)[1], "fake-b")
         self.assertEqual(client.models.generate_content.call_count, 1)
         self.f["time"] = SimpleNamespace(monotonic=lambda: 191)
-        self.assertFalse(self.f["model_on_quota_cooldown"]("fake-a"))
+        client.models.generate_content.side_effect = [SimpleNamespace(text='{"questions":[{"question_number":"1"}]}')]
+        self.assertEqual(self.grade(client)[1], 'fake-a')
 
     def test_all_models_failing_is_bounded(self):
         client = fake_client([RuntimeError("503 unavailable"), RuntimeError("503 unavailable")])
-        with self.assertRaisesRegex(RuntimeError, "All configured"):
+        with self.assertRaisesRegex(RuntimeError, "Marking did not complete"):
             self.grade(client)
         self.assertEqual(client.models.generate_content.call_count, 2)
 
     def test_malformed_response_falls_back_once(self):
-        client = fake_client([SimpleNamespace(text="not JSON"), {"questions": []}])
+        client = fake_client([SimpleNamespace(text="not JSON"), {"questions": [{"question_number": "1"}]}])
         self.assertEqual(self.grade(client)[1], "fake-b")
         self.assertEqual(client.models.generate_content.call_count, 2)
 

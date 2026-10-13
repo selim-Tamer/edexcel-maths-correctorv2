@@ -48,3 +48,24 @@ class Provider:
 
 def uploaded(data=b"%PDF-synthetic", name="synthetic.pdf"):
     return SimpleNamespace(name=name, size=len(data), getvalue=lambda: data)
+
+
+def model_unavailable(model):
+    error = ApiError(404)
+    error.details = {'error': {'message': f'models/{model} is not found for API version v1beta, or is not supported for generateContent.'}}
+    return error
+
+
+def quota_failure(model, scope='model', retry_after=None):
+    error = ApiError(429, retry_after)
+    violation = {'quotaMetric': 'generativelanguage.googleapis.com/generate_content_free_tier_requests',
+                 'quotaId': 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier',
+                 'quotaDimensions': {'model': model, 'location': 'global'}}
+    if scope == 'shared':
+        violation['quotaId'] = 'GenerateRequestsPerMinutePerProject-FreeTier'
+        violation['quotaDimensions'].pop('model')
+    details = [{'@type': 'type.googleapis.com/google.rpc.QuotaFailure', 'violations': [violation]}]
+    error.details = {'error': {'message': 'synthetic private quota response', 'details': details}}
+    if scope == 'unknown':
+        error.details['error']['details'] = []
+    return error
