@@ -19,6 +19,35 @@ FAST_REJECTION_SECONDS = 10
 _creation_lock = Lock()
 
 
+class MarkingFailure(RuntimeError):
+    """Only allowlisted explanations and a random support reference reach UI."""
+    def __init__(self, category, request_id):
+        explanations = {
+            'quota_limited': 'The marking service is rate-limited. Try again later.',
+            'timeout': 'The marking service timed out. Review the original PDFs or try again later.',
+            'deadline_exceeded': 'The marking time budget was reached. Try again later.',
+            'request_rejected': 'The marking service rejected the request. Check API access and uploaded files.',
+            'model_unavailable': 'The configured marking services were unavailable. Check model access.',
+            'service_unavailable': 'The marking service was temporarily unavailable. Try again later.',
+            'invalid_response': 'The marking service returned an unusable result. Review the original PDFs or try again later.',
+            'empty_response': 'The marking service returned no result. Review the original PDFs or try again later.',
+            'truncated_response': 'The marking response was incomplete. Review the original PDFs.',
+            'blocked_response': 'The marking service could not provide a complete response. Review the original PDFs.',
+            'cooldown': 'The marking services are temporarily on cooldown. Try again later.',
+            'no_models': 'No marking service was configured. Check the app configuration.',
+            'transport_or_client_error': 'The marking service could not be reached or the client failed. Try again later.',
+        }
+        self.category = category if category in explanations else 'transport_or_client_error'
+        self.request_id = request_id
+        super().__init__('Marking did not complete. No new marks were saved. '
+                         + explanations[self.category] + ' Reference: ' + request_id)
+
+
+def failure(record, category, stop_reason):
+    record.update(outcome='failed', failure_category=category, stop_reason=stop_reason)
+    return MarkingFailure(category, record['request_id'])
+
+
 def state_for(client):
     with _creation_lock:
         state = getattr(client, '_math_marking_state', None)
@@ -145,7 +174,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
         try:
             if state['account_until'] > started:
                 record['cooldown_remaining_seconds'] = round(state['account_until']-started, 3)
-                raise RuntimeError('The marking service is temporarily rate-limited. Please try again later.')
+                raise failure(record, 'quota_limited', 'account_cooldown')
             for model in dict.fromkeys(models):
                 safe_model = model if re.fullmatch(r'gemini-[a-z0-9.-]{1,80}', model) else 'configured-model'
                 blocked = state['blocked'].get(model, 0)
@@ -189,6 +218,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                         attempt['outcome'] = 'invalid_response'
                         continue
                     attempt['outcome'] = 'success'
+                    record.update(outcome='success', stop_reason='success')
                     return result, model
                 except Exception as exc:
                     code = status_code(exc)
@@ -219,7 +249,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                         attempt['quota_scope'] = 'shared_or_unknown'
                         state['account_until'] = clock.monotonic() + seconds
                         break
-                    if code in (401, 403, 400):
+                    if code in (401, 403, 400, 404):
                         attempt['outcome'] = 'request_rejected'
                         break
                     if isinstance(exc, TimeoutError) or code in (408, 504) or 'timeout' in type(exc).__name__.lower():
@@ -235,10 +265,31 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                     break
                 finally:
                     attempt['response_seconds'] = round(clock.monotonic()-tick, 3)
-            raise RuntimeError('Marking did not complete. No marks were saved. Please try again later or review the original PDFs.')
+            last = record['attempts'][-1].get('outcome') if record['attempts'] else None
+            terminal = {'timeout', 'request_rejected', 'transport_or_client_error',
+                        'blocked_response', 'truncated_response', 'deadline_exceeded'}
+            if last in terminal or (last == 'quota_limited' and state['account_until'] > clock.monotonic()):
+                stop = last
+            elif clock.monotonic() >= deadline:
+                stop = 'deadline_exceeded'
+            elif len(record['attempts']) >= MAX_REQUESTS:
+                stop = 'request_limit'
+            elif generation_attempts >= MAX_ATTEMPTS:
+                stop = 'attempt_limit'
+            else:
+                stop = 'models_exhausted'
+            category = last or ('cooldown' if record['cooldown_skips'] else 'no_models')
+            if stop == 'deadline_exceeded':
+                category = stop
+            raise failure(record, category, stop)
         finally:
             record['elapsed_seconds'] = round(clock.monotonic()-started, 3)
             record['attempt_count'] = len(record['attempts'])
             record['generation_attempt_count'] = generation_attempts
             state['last'] = record  # bounded to one metadata-only run, never added to reports
-            emit(record)
+            # Diagnostics must never replace either successful marks or the
+            # classified failure if a deployment logging handler fails.
+            try:
+                emit(record)
+            except Exception:
+                pass

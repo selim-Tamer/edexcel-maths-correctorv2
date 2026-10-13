@@ -559,6 +559,31 @@ def build_csv_rows(student_name: str, result: dict) -> list:
     return rows
 
 
+def preserve_result_snapshot(rows, namespace):
+    """Keep one displaced successful batch per path, session-local and read-only.
+
+    Never match students by filename or promote a previous grade to current.
+    Materialize teacher overrides before taking an independent snapshot.
+    """
+    saved = [copy.deepcopy(prepare_review_row(copy.deepcopy(row)))
+             for row in rows if row.get("status") == "Marked"]
+    if saved:
+        for row in saved:
+            row["is_current"] = False
+        st.session_state.setdefault("previous_result_snapshots", {})[namespace] = saved
+
+
+def render_result_snapshots():
+    for namespace, rows in st.session_state.get("previous_result_snapshots", {}).items():
+        with st.expander(f"Previous successful results ({namespace})"):
+            st.caption("Snapshot of the most recently replaced successful results, including teacher overrides. "
+                       "These are historical results, not current grade suggestions. "
+                       "Download to retain them beyond this session; a later successful batch may replace this snapshot.")
+            st.download_button("Download previous results", data=json.dumps(rows, ensure_ascii=False, indent=2),
+                               file_name=f"previous_{namespace}_results.json", mime="application/json",
+                               key=f"previous_results_{namespace}")
+
+
 def new_review_row(row, namespace):
     """Keep cached AI output separate from this run's teacher review."""
     reviewed = copy.deepcopy(row)
@@ -2225,6 +2250,8 @@ def classroom_submission_revision(token, submission):
 def merge_classroom_results(previous, current, processed_revisions=None):
     """Reconcile history against a complete, successful turned-in listing."""
     rows = {row["submission_id"]: row for row in (previous or {}).get("processed", [])}
+    replaced = {row["submission_id"] for row in current["processed"]}
+    preserve_result_snapshot([row for sid, row in rows.items() if sid in replaced], "classroom")
     for row in current["processed"]:
         old = rows.get(row["submission_id"])
         if old and old.get("review_key") != row.get("review_key") and old.get("review_key"):
@@ -3614,6 +3641,7 @@ if st.button(
                         )
 
             # Store for download/re-render.
+            preserve_result_snapshot(st.session_state.get("last_batch_results", []), "manual")
             st.session_state["last_batch_results"] = [new_review_row(row, "manual") for row in batch_results]
             st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
 
@@ -3659,6 +3687,8 @@ if st.button(
 
 
 
+
+render_result_snapshots()
 
 if "last_batch_results" in st.session_state:
     batch_results = [prepare_review_row(row) for row in st.session_state["last_batch_results"]]
