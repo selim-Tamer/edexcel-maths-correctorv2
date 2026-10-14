@@ -7,9 +7,10 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
-from threading import Lock
+from threading import Lock, RLock
 
 REQUEST_TIMEOUT = 120
 TOTAL_BUDGET = 180
@@ -17,6 +18,9 @@ MAX_ATTEMPTS = 2  # non-fast-rejection attempts
 MAX_REQUESTS = 4  # absolute cap, including unavailable/quota responses
 FAST_REJECTION_SECONDS = 10
 _creation_lock = Lock()
+_diagnostics_lock = RLock()
+_diagnostics_enabled = None
+_startup_enabled = None
 
 
 class MarkingFailure(RuntimeError):
@@ -57,11 +61,62 @@ def state_for(client):
         return state
 
 
-def emit(record):
-    if os.getenv('MATH_MARKER_DIAGNOSTICS') == '1':
+def diagnostics_enabled():
+    # The app resolves Streamlit Secrets on its script thread. Standalone tests
+    # and CLI callers can still use the environment without importing Streamlit.
+    return (_diagnostics_enabled if _diagnostics_enabled is not None
+            else os.getenv('MATH_MARKER_DIAGNOSTICS') == '1')
+
+
+def _console_logger():
+    """Own one INFO stderr handler; do not rely on root/Streamlit configuration."""
+    with _diagnostics_lock:
         logger = logging.getLogger('math_marker.marking')
         logger.setLevel(logging.INFO)
-        logger.info('marking_metrics %s', json.dumps(record, sort_keys=True))
+        logger.disabled = False
+        logger.propagate = False
+        owned = [h for h in logger.handlers if getattr(h, '_math_marker_console', False)]
+        if not owned or owned[0].stream is not sys.stderr:
+            for handler in owned:
+                logger.removeHandler(handler)
+                handler.close()
+            handler = logging.StreamHandler(sys.stderr)
+            handler._math_marker_console = True
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(logging.Formatter('%(message)s'))
+            logger.addHandler(handler)
+        return logger
+
+
+def configure_diagnostics(secrets=None):
+    """Resolve only the diagnostic switch, then emit a boolean-only startup check.
+
+    Top-level Streamlit Secrets take precedence. Missing/unavailable secrets
+    fall back to the environment. Never echo values, errors or other secrets.
+    Called on app startup/rerun, not from marking workers.
+    """
+    global _diagnostics_enabled, _startup_enabled
+    value = os.getenv('MATH_MARKER_DIAGNOSTICS', '')
+    if secrets is not None:
+        try:
+            value = secrets.get('MATH_MARKER_DIAGNOSTICS', value)
+        except Exception:
+            pass
+    enabled = type(value) in (str, int) and str(value).strip() == '1'
+    with _diagnostics_lock:
+        _diagnostics_enabled = enabled
+        if _startup_enabled != enabled:
+            try:
+                _console_logger().info('marking_diagnostics_startup %s', json.dumps({'enabled': enabled}))
+                _startup_enabled = enabled
+            except Exception:
+                pass  # logging failure must not prevent startup or marking
+    return enabled
+
+
+def emit(record):
+    if diagnostics_enabled():
+        _console_logger().info('marking_metrics %s', json.dumps(record, sort_keys=True))
 
 
 def status_code(exc):

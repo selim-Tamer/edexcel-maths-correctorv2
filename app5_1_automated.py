@@ -18,6 +18,11 @@ import requests
 import streamlit as st
 from google import genai
 from google.genai import types
+import marking_requests
+
+# Resolve top-level Streamlit Secrets before worker threads and configure only
+# the private marking logger. This emits no browser output or secret values.
+marking_requests.configure_diagnostics(st.secrets)
 
 
 # ============================================================
