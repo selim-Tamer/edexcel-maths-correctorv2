@@ -5,6 +5,7 @@ credentials are recorded. State is owned by the SDK client (one account/batch).
 """
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -17,6 +18,8 @@ TOTAL_BUDGET = 180
 MAX_ATTEMPTS = 2  # non-fast-rejection attempts
 MAX_REQUESTS = 4  # absolute cap, including unavailable/quota responses
 FAST_REJECTION_SECONDS = 10
+SERVICE_RETRY_DELAY = 5
+MAX_SERVICE_WAIT = 30
 _creation_lock = Lock()
 _diagnostics_lock = RLock()
 _diagnostics_enabled = None
@@ -213,23 +216,36 @@ def response_stats(response, record):
     return finish
 
 
+def service_retry_delay(exc, now):
+    """Honor finite Retry-After seconds/dates; never retain header contents."""
+    from document_pipeline import retry_delay
+    seconds = retry_delay(exc, SERVICE_RETRY_DELAY, now)
+    if not math.isfinite(seconds):
+        return SERVICE_RETRY_DELAY
+    return max(SERVICE_RETRY_DELAY, seconds)
+
+
 def generate(client, models, contents, system, schema, config_factory, parse, progress=None, clock=time):
     state = state_for(client)
     queued = clock.monotonic()
     # Do not increase marking concurrency even if a caller submits parallel jobs.
     with state['lock']:
         started = clock.monotonic()
-        record = {'request_id': uuid.uuid4().hex, 'queue_seconds': round(started-queued, 3),
+        record = {'request_id': uuid.uuid4().hex, 'stage': 'marking', 'queue_seconds': round(started-queued, 3),
                   'input_text_characters': len(system) + sum(len(c) for c in contents if isinstance(c, str)),
                   'schema_characters': len(json.dumps(schema, separators=(',', ':'))),
                   'document_count': sum(not isinstance(c, str) for c in contents),
                   'attempts': [], 'cooldown_skips': [], 'sleep_seconds': 0}
         deadline = started + TOTAL_BUDGET
         generation_attempts = 0
+        service_wait_until = 0
         try:
             if state['account_until'] > started:
                 record['cooldown_remaining_seconds'] = round(state['account_until']-started, 3)
                 raise failure(record, 'quota_limited', 'account_cooldown')
+            if state.get('service_until', 0) > started:
+                record['cooldown_remaining_seconds'] = round(state['service_until']-started, 3)
+                raise failure(record, 'service_unavailable', 'service_cooldown')
             for model in dict.fromkeys(models):
                 safe_model = model if re.fullmatch(r'gemini-[a-z0-9.-]{1,80}', model) else 'configured-model'
                 blocked = state['blocked'].get(model, 0)
@@ -239,6 +255,21 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                 if (len(record['attempts']) >= MAX_REQUESTS or generation_attempts >= MAX_ATTEMPTS
                         or clock.monotonic() >= deadline):
                     break
+                delay = max(0, service_wait_until - clock.monotonic())
+                if delay:
+                    previous = record['attempts'][-1]
+                    if delay > MAX_SERVICE_WAIT or delay >= deadline-clock.monotonic():
+                        previous['retry_decision'] = 'deferred_to_manual_retry'
+                        raise failure(record, 'service_unavailable', 'retry_wait_limit')
+                    previous['retry_decision'] = 'delayed_fallback'
+                    if progress:
+                        progress('The marking service is busy. Waiting briefly before trying again…')
+                    wait_started = clock.monotonic()
+                    clock.sleep(delay)
+                    record['sleep_seconds'] += round(clock.monotonic()-wait_started, 3)
+                    # A scheduler can oversleep; never launch after the budget.
+                    if clock.monotonic() >= deadline:
+                        raise failure(record, 'deadline_exceeded', 'deadline_exceeded')
                 timeout = min(REQUEST_TIMEOUT, deadline-clock.monotonic())
                 attempt = {'model': safe_model, 'attempt': len(record['attempts'])+1,
                            'timeout_seconds': round(timeout, 3)}
@@ -313,8 +344,14 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                         break
                     if code in (500, 502, 503):
                         attempt['outcome'] = 'service_unavailable'
-                        state['blocked'][model] = clock.monotonic() + 30
-                        attempt['cooldown_seconds'] = 30
+                        seconds = service_retry_delay(exc, clock.time()) if code == 503 else 0
+                        state['blocked'][model] = clock.monotonic() + max(30, seconds)
+                        attempt['cooldown_seconds'] = max(30, seconds)
+                        if code == 503:
+                            service_wait_until = clock.monotonic() + seconds
+                            state['service_until'] = service_wait_until
+                            attempt['retry_after_seconds'] = seconds
+                            attempt['retry_decision'] = 'no_eligible_fallback'
                         continue
                     attempt['outcome'] = 'transport_or_client_error'
                     break
@@ -333,6 +370,8 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                 stop = 'attempt_limit'
             else:
                 stop = 'models_exhausted'
+            if record['attempts'] and record['attempts'][-1].get('http_status') == 503:
+                record['attempts'][-1]['retry_decision'] = stop
             category = last or ('cooldown' if record['cooldown_skips'] else 'no_models')
             if stop == 'deadline_exceeded':
                 category = stop
