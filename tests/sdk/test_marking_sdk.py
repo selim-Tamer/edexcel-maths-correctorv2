@@ -14,8 +14,30 @@ from pipeline_fakes import quota_failure, model_unavailable, Clock
 
 
 class MarkingSDKTests(unittest.TestCase):
+    def test_connection_establishment_retries_but_read_write_errors_do_not(self):
+        for error_type, expected in ((httpx.ConnectTimeout, 2), (httpx.ConnectError, 2),
+                                     (httpx.PoolTimeout, 2), (httpx.ReadTimeout, 1),
+                                     (httpx.WriteError, 1), (httpx.RemoteProtocolError, 1)):
+            seen = []
+            def handler(request):
+                seen.append(request)
+                if len(seen) == 1:
+                    raise error_type('PRIVATE', request=request)
+                return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
+                    'role': 'model', 'parts': [{'text': '{"questions":[{"awarded_marks":1}]}'}]}}]})
+            f = load_app(); f['types'] = types; f['time'] = Clock()
+            with self.subTest(error=error_type.__name__), genai.Client(api_key='synthetic-not-real',
+                    http_options=types.HttpOptions(client_args={'transport': httpx.MockTransport(handler)})) as client:
+                if expected == 2:
+                    f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+                else:
+                    with self.assertRaises(mr.MarkingFailure):
+                        f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+                self.assertEqual(len(seen), expected)
+                self.assertNotIn('PRIVATE', json.dumps(mr.state_for(client)['last']))
+
     def test_wire_schema_usage_and_inherited_retries_disabled(self):
-        for failure, expected in ((429, 1), (503, 2), (None, 1)):
+        for failure, expected in ((429, 1), (503, 3), (None, 1)):
             seen = []
             payload = {'questions': [model_question(benchmark()['questions'][0], 'partial')]}
             def handler(request):

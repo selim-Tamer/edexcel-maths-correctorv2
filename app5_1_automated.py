@@ -23,6 +23,7 @@ import marking_requests
 # Resolve top-level Streamlit Secrets before worker threads and configure only
 # the private marking logger. This emits no browser output or secret values.
 marking_requests.configure_diagnostics(st.secrets)
+marking_requests.configure_recovery(st.secrets)
 
 
 # ============================================================

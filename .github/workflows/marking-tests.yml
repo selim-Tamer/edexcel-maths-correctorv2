@@ -37,6 +37,8 @@ jobs:
         run: python tests/benchmark_marking_requests.py
       - name: Offline service recovery benchmark
         run: python tests/benchmark_service_recovery.py
+      - name: Offline automatic recovery benchmark
+        run: python tests/benchmark_automatic_recovery.py
       - name: Run marking regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 

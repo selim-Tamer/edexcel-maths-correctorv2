@@ -11,6 +11,11 @@ import marking_requests as mr
 
 class MarkingRequestTests(unittest.TestCase):
     def setUp(self):
+        # Preserve coverage of the supported conservative two-attempt setting.
+        self.limit = patch.object(mr, 'configured_attempts', return_value=2)
+        self.limit.start(); self.addCleanup(self.limit.stop)
+        self.jitter = patch.object(mr.random, 'uniform', return_value=0)
+        self.jitter.start(); self.addCleanup(self.jitter.stop)
         self.f = load_app()
         self.clock = Clock()
         self.f['time'] = self.clock

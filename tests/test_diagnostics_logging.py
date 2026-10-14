@@ -74,7 +74,7 @@ class ConsoleDiagnosticsTests(unittest.TestCase):
                 if failed:
                     self.assertEqual(record['request_id'], error.exception.request_id)
                     self.assertEqual(record['failure_category'], 'service_unavailable')
-                    self.assertEqual(record['stop_reason'], 'attempt_limit')
+                    self.assertEqual(record['stop_reason'], 'models_exhausted')
                     self.assertEqual(record['attempt_count'], 2)
                     self.assertEqual([a['http_status'] for a in record['attempts']], [503, 503])
                     self.assertEqual([a['model'] for a in record['attempts']], ['gemini-test-a', 'gemini-test-b'])

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from support import load_app, fake_client, remote, benchmark, model_question
 from pipeline_fakes import Clock, ApiError
 import marking_requests as mr
@@ -12,6 +12,11 @@ import marking_requests as mr
 
 class ServiceRecoveryTests(unittest.TestCase):
     def setUp(self):
+        # Regression coverage for operators retaining the PR13 attempt limit.
+        limit = patch.object(mr, 'configured_attempts', return_value=2)
+        limit.start(); self.addCleanup(limit.stop)
+        jitter = patch.object(mr.random, 'uniform', return_value=0)
+        jitter.start(); self.addCleanup(jitter.stop)
         self.f = load_app()
         self.clock = Clock()
         self.f['time'] = self.clock
@@ -41,11 +46,9 @@ class ServiceRecoveryTests(unittest.TestCase):
         self.assertEqual(record['attempt_count'], 2)
         self.assertEqual(record['stop_reason'], 'attempt_limit')
         self.assertEqual(self.clock.sleeps, [5])
-        # No immediate request from the same client while Retry-After is active.
-        with self.assertRaises(mr.MarkingFailure): self.grade(client)
-        self.assertEqual(client.models.generate_content.call_count, 2)
-        self.clock.sleep(31)
+        # Next student waits for the service cooldown, then can use the third model.
         self.assertEqual(self.grade(client)[0], self.payload)
+        self.assertEqual(client.models.generate_content.call_count, 3)
 
     def test_retry_after_seconds_and_http_date(self):
         for header in ('12', format_datetime(datetime.fromtimestamp(self.clock.time()+12, timezone.utc))):
@@ -87,6 +90,7 @@ class ServiceRecoveryTests(unittest.TestCase):
 
     def test_other_http_failures_keep_previous_policy(self):
         for status in (400, 401, 403, 404, 429, 500, 502, 504):
+            self.clock.sleeps.clear()
             client = fake_client([ApiError(status), self.payload])
             if status in (500, 502):
                 self.grade(client)
@@ -94,7 +98,7 @@ class ServiceRecoveryTests(unittest.TestCase):
             else:
                 with self.assertRaises(mr.MarkingFailure): self.grade(client)
                 self.assertEqual(client.models.generate_content.call_count, 1)
-            self.assertEqual(self.clock.sleeps, [])
+            self.assertEqual(self.clock.sleeps, [5] if status in (500, 502) else [])
 
     def test_wait_cannot_use_remaining_deadline(self):
         client = fake_client()

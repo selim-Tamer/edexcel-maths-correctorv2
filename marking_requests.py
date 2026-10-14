@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -24,6 +25,41 @@ _creation_lock = Lock()
 _diagnostics_lock = RLock()
 _diagnostics_enabled = None
 _startup_enabled = None
+_recovery_attempts = None
+
+
+def configure_recovery(secrets=None):
+    """Server setting only. Hard caps cannot be raised by configuration."""
+    global _recovery_attempts
+    value = os.getenv('MATH_MARKER_MAX_ATTEMPTS', '3')
+    if secrets is not None:
+        try:
+            value = secrets.get('MATH_MARKER_MAX_ATTEMPTS', value)
+        except Exception:
+            pass
+    _recovery_attempts = parse_attempt_limit(value)
+    return _recovery_attempts
+
+
+def parse_attempt_limit(value):
+    return int(str(value)) if str(value) in ('1', '2', '3') else 3
+
+
+def configured_attempts():
+    return (_recovery_attempts if _recovery_attempts is not None else
+            parse_attempt_limit(os.getenv('MATH_MARKER_MAX_ATTEMPTS', '3')))
+
+
+def safe_connection_failure(exc):
+    # Connection establishment/pool acquisition precedes sending a generation.
+    # Read/write/protocol failures have ambiguous delivery and must not retry.
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    try:
+        import httpx
+        return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout))
+    except ImportError:
+        return False
 
 
 class MarkingFailure(RuntimeError):
@@ -43,6 +79,7 @@ class MarkingFailure(RuntimeError):
             'cooldown': 'The marking services are temporarily on cooldown. Try again later.',
             'no_models': 'No marking service was configured. Check the app configuration.',
             'transport_or_client_error': 'The marking service could not be reached or the client failed. Try again later.',
+            'connection_unavailable': 'The marking service could not be connected to. Try again later.',
         }
         self.category = category if category in explanations else 'transport_or_client_error'
         self.request_id = request_id
@@ -216,13 +253,14 @@ def response_stats(response, record):
     return finish
 
 
-def service_retry_delay(exc, now):
+def service_retry_delay(exc, now, retry_index=0):
     """Honor finite Retry-After seconds/dates; never retain header contents."""
     from document_pipeline import retry_delay
-    seconds = retry_delay(exc, SERVICE_RETRY_DELAY, now)
+    fallback = min(20, SERVICE_RETRY_DELAY * 2 ** min(retry_index, 2)) + random.uniform(0, 1)
+    seconds = retry_delay(exc, fallback, now)
     if not math.isfinite(seconds):
-        return SERVICE_RETRY_DELAY
-    return max(SERVICE_RETRY_DELAY, seconds)
+        return fallback
+    return max(fallback, seconds)
 
 
 def generate(client, models, contents, system, schema, config_factory, parse, progress=None, clock=time):
@@ -239,37 +277,62 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
         deadline = started + TOTAL_BUDGET
         generation_attempts = 0
         service_wait_until = 0
+        recovery_limit = configured_attempts()
+        record['configured_attempt_limit'] = recovery_limit
+        transient_failures = 0
+        model_list = list(dict.fromkeys(models))
+
+        def attempt_limit():
+            # Extra capacity is only for transport/server recovery, not repeated
+            # invalid output. Fast model rejections do not consume this budget.
+            previous = record['attempts'][-1] if record['attempts'] else {}
+            retryable = previous.get('outcome') in ('service_unavailable', 'connection_unavailable', 'model_unavailable', 'quota_limited')
+            return recovery_limit if retryable or not previous else min(MAX_ATTEMPTS, recovery_limit)
+
+        def wait_until(until):
+            delay = max(0, until-clock.monotonic())
+            if not delay:
+                return
+            # All waits combined, including inherited cooldowns, stay bounded.
+            if delay > MAX_SERVICE_WAIT-record['sleep_seconds'] or delay >= deadline-clock.monotonic():
+                if record['attempts']:
+                    record['attempts'][-1]['retry_decision'] = 'deferred_to_manual_retry'
+                raise failure(record, 'service_unavailable', 'retry_wait_limit')
+            if progress:
+                progress('The marking service is busy. Waiting briefly before trying again…')
+            tick = clock.monotonic()
+            clock.sleep(delay)
+            record['sleep_seconds'] += round(clock.monotonic()-tick, 3)
+            if clock.monotonic() >= deadline:
+                raise failure(record, 'deadline_exceeded', 'deadline_exceeded')
         try:
             if state['account_until'] > started:
                 record['cooldown_remaining_seconds'] = round(state['account_until']-started, 3)
                 raise failure(record, 'quota_limited', 'account_cooldown')
-            if state.get('service_until', 0) > started:
+            if model_list and state.get('service_until', 0) > started:
                 record['cooldown_remaining_seconds'] = round(state['service_until']-started, 3)
-                raise failure(record, 'service_unavailable', 'service_cooldown')
-            for model in dict.fromkeys(models):
+                wait_until(state['service_until'])
+            # A failed student must not make all later students fail immediately.
+            # Wait once for the earliest temporary model cooldown, never quota/404.
+            if model_list and all(state['blocked'].get(m, 0) > clock.monotonic() for m in model_list):
+                temporary = [state['blocked'][m] for m in model_list
+                             if state.get('temporary', {}).get(m) == state['blocked'][m]]
+                if temporary:
+                    wait_until(min(temporary))
+            for model in model_list:
                 safe_model = model if re.fullmatch(r'gemini-[a-z0-9.-]{1,80}', model) else 'configured-model'
                 blocked = state['blocked'].get(model, 0)
                 if blocked > clock.monotonic():
                     record['cooldown_skips'].append({'model': safe_model, 'remaining_seconds': round(blocked-clock.monotonic(), 3)})
                     continue
-                if (len(record['attempts']) >= MAX_REQUESTS or generation_attempts >= MAX_ATTEMPTS
+                if (len(record['attempts']) >= MAX_REQUESTS or generation_attempts >= attempt_limit()
                         or clock.monotonic() >= deadline):
                     break
                 delay = max(0, service_wait_until - clock.monotonic())
                 if delay:
                     previous = record['attempts'][-1]
-                    if delay > MAX_SERVICE_WAIT or delay >= deadline-clock.monotonic():
-                        previous['retry_decision'] = 'deferred_to_manual_retry'
-                        raise failure(record, 'service_unavailable', 'retry_wait_limit')
                     previous['retry_decision'] = 'delayed_fallback'
-                    if progress:
-                        progress('The marking service is busy. Waiting briefly before trying again…')
-                    wait_started = clock.monotonic()
-                    clock.sleep(delay)
-                    record['sleep_seconds'] += round(clock.monotonic()-wait_started, 3)
-                    # A scheduler can oversleep; never launch after the budget.
-                    if clock.monotonic() >= deadline:
-                        raise failure(record, 'deadline_exceeded', 'deadline_exceeded')
+                    wait_until(service_wait_until)
                 timeout = min(REQUEST_TIMEOUT, deadline-clock.monotonic())
                 attempt = {'model': safe_model, 'attempt': len(record['attempts'])+1,
                            'timeout_seconds': round(timeout, 3)}
@@ -311,6 +374,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                     if code is not None:
                         attempt['http_status'] = code
                     if code == 404 and unavailable_model(exc, model):
+                        state.get('temporary', {}).pop(model, None)
                         attempt['outcome'] = 'model_unavailable'
                         state['blocked'][model] = clock.monotonic() + 86400
                         attempt['cooldown_seconds'] = 86400
@@ -327,6 +391,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                             seconds = max(seconds, 21600)
                         attempt['cooldown_seconds'] = seconds
                         if model_quota(exc, model):
+                            state.get('temporary', {}).pop(model, None)
                             attempt['quota_scope'] = 'model'
                             state['blocked'][model] = clock.monotonic() + seconds
                             if clock.monotonic() - tick <= FAST_REJECTION_SECONDS:
@@ -338,20 +403,22 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                     if code in (401, 403, 400, 404):
                         attempt['outcome'] = 'request_rejected'
                         break
-                    if isinstance(exc, TimeoutError) or code in (408, 504) or 'timeout' in type(exc).__name__.lower():
+                    connection_failure = code is None and safe_connection_failure(exc)
+                    if not connection_failure and (isinstance(exc, TimeoutError) or code in (408, 504) or 'timeout' in type(exc).__name__.lower()):
                         attempt['outcome'] = 'timeout'
                         # Ambiguous timeout may already have consumed generation quota.
                         break
-                    if code in (500, 502, 503):
-                        attempt['outcome'] = 'service_unavailable'
-                        seconds = service_retry_delay(exc, clock.time()) if code == 503 else 0
+                    if code in (500, 502, 503) or connection_failure:
+                        attempt['outcome'] = 'connection_unavailable' if connection_failure else 'service_unavailable'
+                        seconds = service_retry_delay(exc, clock.time(), transient_failures)
+                        transient_failures += 1
                         state['blocked'][model] = clock.monotonic() + max(30, seconds)
+                        state.setdefault('temporary', {})[model] = state['blocked'][model]
                         attempt['cooldown_seconds'] = max(30, seconds)
-                        if code == 503:
-                            service_wait_until = clock.monotonic() + seconds
-                            state['service_until'] = service_wait_until
-                            attempt['retry_after_seconds'] = seconds
-                            attempt['retry_decision'] = 'no_eligible_fallback'
+                        service_wait_until = clock.monotonic() + seconds
+                        state['service_until'] = service_wait_until
+                        attempt['retry_after_seconds'] = seconds
+                        attempt['retry_decision'] = 'no_eligible_fallback'
                         continue
                     attempt['outcome'] = 'transport_or_client_error'
                     break
@@ -366,7 +433,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                 stop = 'deadline_exceeded'
             elif len(record['attempts']) >= MAX_REQUESTS:
                 stop = 'request_limit'
-            elif generation_attempts >= MAX_ATTEMPTS:
+            elif generation_attempts >= attempt_limit():
                 stop = 'attempt_limit'
             else:
                 stop = 'models_exhausted'
@@ -380,6 +447,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
             record['elapsed_seconds'] = round(clock.monotonic()-started, 3)
             record['attempt_count'] = len(record['attempts'])
             record['generation_attempt_count'] = generation_attempts
+            record['retry_count'] = max(0, len(record['attempts'])-1)
             state['last'] = record  # bounded to one metadata-only run, never added to reports
             # Diagnostics must never replace either successful marks or the
             # classified failure if a deployment logging handler fails.
