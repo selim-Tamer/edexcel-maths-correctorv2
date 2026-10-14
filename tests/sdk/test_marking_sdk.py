@@ -10,7 +10,7 @@ from google.genai import types
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from support import load_app, benchmark, model_question
 import marking_requests as mr
-from pipeline_fakes import quota_failure, model_unavailable
+from pipeline_fakes import quota_failure, model_unavailable, Clock
 
 
 class MarkingSDKTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class MarkingSDKTests(unittest.TestCase):
                 return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                     'role': 'model', 'parts': [{'text': json.dumps(payload)}]}}],
                     'usageMetadata': {'promptTokenCount': 8000, 'candidatesTokenCount': 900, 'thoughtsTokenCount': 1000}})
-            f = load_app(); f['types'] = types
+            f = load_app(); f['types'] = types; f['time'] = Clock()
             # Even an operator's inherited SDK retry configuration is overridden.
             with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
                     retry_options=types.HttpRetryOptions(attempts=5),
@@ -49,7 +49,7 @@ class MarkingSDKTests(unittest.TestCase):
         def handler(request):
             calls.append(request)
             raise httpx.ReadTimeout('synthetic private provider detail')
-        f = load_app(); f['types'] = types
+        f = load_app(); f['types'] = types; f['time'] = Clock()
         with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
                 client_args={'transport': httpx.MockTransport(handler)})) as client:
             with self.assertRaises(RuntimeError) as error:
@@ -59,7 +59,7 @@ class MarkingSDKTests(unittest.TestCase):
         self.assertNotIn('private provider', str(error.exception))
 
     def test_structured_provider_errors_and_fresh_client_recovery(self):
-        f = load_app(); f['types'] = types
+        f = load_app(); f['types'] = types; f['time'] = Clock()
         payload = {'questions': [model_question(benchmark()['questions'][0], 'partial')]}
         for scenario, expected in (('model', 2), ('shared', 1), ('unknown', 1), ('404', 3), ('503', 2), ('504', 1)):
             for fresh_run in range(2):
@@ -86,3 +86,22 @@ class MarkingSDKTests(unittest.TestCase):
                         result, _ = f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
                         self.assertEqual(result, payload)
                     self.assertEqual(len(seen), expected)
+
+    def test_real_sdk_retry_after_header_and_single_fallback(self):
+        f = load_app(); f['types'] = types; f['time'] = Clock()
+        calls = []
+        def handler(request):
+            calls.append(request)
+            if len(calls) == 1:
+                return httpx.Response(503, headers={'Retry-After': '12'},
+                    json={'error': {'code': 503, 'message': 'synthetic private response'}})
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
+                'role': 'model', 'parts': [{'text': '{"questions": [{"awarded_marks": 1}]}'}]}}]})
+        with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=5),
+                client_args={'transport': httpx.MockTransport(handler)})) as client:
+            f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+            self.assertEqual(f['time'].sleeps, [12])
+            self.assertEqual(mr.state_for(client)['last']['sleep_seconds'], 12)
+            self.assertNotIn('synthetic private response', json.dumps(mr.state_for(client)['last']))
+        self.assertEqual(len(calls), 2)

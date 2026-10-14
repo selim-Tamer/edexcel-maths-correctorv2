@@ -94,7 +94,7 @@ class MarkingRequestTests(unittest.TestCase):
         with self.assertRaises(RuntimeError): self.run_grade(client)
         calls = client.models.generate_content.call_args_list
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1].kwargs['config']['http_options']['timeout'], 90000)
+        self.assertEqual(calls[1].kwargs['config']['http_options']['timeout'], 85000)
 
     def test_invalid_json_and_empty_results_have_only_one_fallback(self):
         for bad in (SimpleNamespace(text='not json'), {'questions': []}):
@@ -225,7 +225,7 @@ class MarkingRequestTests(unittest.TestCase):
         self.assertEqual(client.models.generate_content.call_count, 1)
 
     def test_fourth_model_reachable_after_three_fast_rejections(self):
-        names = self.f['PRIMARY_MODELS']
+        names = ['gemini-test-' + str(i) for i in range(4)]
         client = fake_client([model_unavailable(names[0]), quota_failure(names[1]),
                               model_unavailable(names[2]), self.payload])
         self.assertEqual(self.f['grade_with_model'](client, names, remote(), remote())[1], names[3])
