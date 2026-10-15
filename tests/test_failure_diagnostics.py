@@ -10,6 +10,10 @@ import marking_requests as mr
 
 
 class FailureDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        limit = patch.object(mr, 'configured_attempts', return_value=2)
+        limit.start(); self.addCleanup(limit.stop)
+
     def run_failure(self, responses, models=None):
         client = fake_client(responses)
         with self.assertRaises(mr.MarkingFailure) as caught:
