@@ -2,6 +2,9 @@
 import sys
 import unittest
 from pathlib import Path
+# Import this test dependency before starting AppTest's script deadline. Cold
+# native imports on Windows can exceed the UI interaction timeout.
+import pandas as pd
 from streamlit.testing.v1 import AppTest
 TESTS=Path(__file__).resolve().parents[1]
 BOOTSTRAP=f'''
@@ -25,8 +28,10 @@ fixture=st.session_state["doc_fixture"]
 def extract(*args):
     fixture["schemes"]+=1
     return {{"1":2}},{{"1":"4"}},None
-def mark(*args):
+def mark(*args, **kwargs):
     fixture["marks"]+=1
+    if kwargs.get("status_callback"):
+        kwargs["status_callback"]("Checking marking evidence…")
     result=f["normalise_result"]({{"questions":[model_question(benchmark()["questions"][0],"partial")]}})
     return {{"student_name":"synthetic.pdf","status":"Marked","result":result,"audit_warning":None,"totals":{{}},"groups":[]}}
 f["extract_scheme_maxima"]=extract

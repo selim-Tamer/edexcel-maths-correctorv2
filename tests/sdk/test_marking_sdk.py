@@ -14,6 +14,27 @@ from pipeline_fakes import quota_failure, model_unavailable, Clock
 
 
 class MarkingSDKTests(unittest.TestCase):
+    def test_received_provider_deadline_allows_only_one_short_fallback(self):
+        seen = []
+        clock = Clock()
+        def handler(request):
+            seen.append(request)
+            if len(seen) == 1:
+                clock.sleep(120)
+                return httpx.Response(504, json={'error': {'code': 504, 'status': 'DEADLINE_EXCEEDED', 'message': 'PRIVATE'}})
+            clock.sleep(20)
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
+                'role': 'model', 'parts': [{'text': '{"questions":[{"awarded_marks":1}]}'}]}}]})
+        f = load_app(); f['types'] = types; f['time'] = clock
+        with genai.Client(api_key='synthetic-not-real', http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(attempts=5),
+                client_args={'transport': httpx.MockTransport(handler)})) as client:
+            result, _ = f['grade_with_model'](client, f['PRIMARY_MODELS'], 'student', 'scheme')
+            self.assertEqual(result['questions'][0]['awarded_marks'], 1)
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(seen[1].extensions['timeout']['read'], 45)
+            self.assertEqual(mr.state_for(client)['last']['attempts'][0]['timeout_category'], 'provider_deadline')
+
     def test_connection_establishment_retries_but_read_write_errors_do_not(self):
         for error_type, expected in ((httpx.ConnectTimeout, 2), (httpx.ConnectError, 2),
                                      (httpx.PoolTimeout, 2), (httpx.ReadTimeout, 1),
