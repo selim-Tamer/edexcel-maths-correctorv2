@@ -1,0 +1,92 @@
+{
+  "date": "2026-10-16",
+  "baseline_commit": "fb3abfe84346647b555ebabfa336586b29410c8f",
+  "live_api_requests": 0,
+  "production_files_changed": false,
+  "tests": {
+    "regression": {
+      "passed": 239,
+      "seconds": 33.893
+    },
+    "sdk": {
+      "passed": 13,
+      "seconds": 8.618,
+      "google_genai": "2.31.0"
+    },
+    "streamlit": {
+      "passed": 11,
+      "seconds": 26.122,
+      "version": "1.66.0"
+    },
+    "total_distinct": 263
+  },
+  "local_test_environment": {
+    "python": "3.12",
+    "pyarrow": "24.0.0",
+    "note": "Local Windows runtime; Cloud Python 3.14 is covered by CI, not this local run. Final regression uses installed dependencies with required filesystem access; restricted-path runs failed to load complete httpx/sympy libraries."
+  },
+  "profile": {
+    "network_requests": 0,
+    "token_counts": "unknown; no tokenize or generation requests performed",
+    "production": {
+      "models": [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite"
+      ],
+      "base_text_characters": 3861,
+      "schema_characters": 1544,
+      "question_fields": 13,
+      "production_pdf_bytes": null,
+      "thinking_override": null,
+      "output_token_cap": null
+    },
+    "synthetic": {
+      "A": {
+        "text_characters": 47,
+        "schema_characters": 82,
+        "pdf_bytes": []
+      },
+      "B": {
+        "text_characters": 424,
+        "schema_characters": 408,
+        "pdf_bytes": []
+      },
+      "C-digital": {
+        "text_characters": 313,
+        "schema_characters": 408,
+        "pdf_bytes": [
+          1563,
+          1665
+        ]
+      },
+      "C-strokes": {
+        "text_characters": 313,
+        "schema_characters": 408,
+        "pdf_bytes": [
+          2128,
+          1665
+        ]
+      }
+    }
+  },
+  "live_model_accuracy": null,
+  "live_provider_latency": null,
+  "account_access_verified": false,
+  "billing_verified": false,
+  "gold_moderated_by_independent_teacher": false,
+  "synthetic_pdf_visual_review": "Three PDFs rendered and inspected; legible clean glyph fixtures, not realistic handwriting",
+  "benchmarks": {
+    "passed": 6,
+    "live_requests": 0,
+    "note": "Existing baseline benchmarks rerun unchanged; no new production speed improvement claimed.",
+    "scripts": [
+      "benchmark_automatic_recovery",
+      "benchmark_document_pipeline",
+      "benchmark_local_processing",
+      "benchmark_marking_requests",
+      "benchmark_pdf_inspection",
+      "benchmark_service_recovery"
+    ]
+  }
+}
