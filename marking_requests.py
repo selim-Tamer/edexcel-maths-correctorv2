@@ -21,6 +21,8 @@ MAX_REQUESTS = 4  # absolute cap, including unavailable/quota responses
 FAST_REJECTION_SECONDS = 10
 SERVICE_RETRY_DELAY = 5
 MAX_SERVICE_WAIT = 30
+DEADLINE_FALLBACK_TIMEOUT = 45
+MIN_DEADLINE_FALLBACK_WINDOW = 15
 _creation_lock = Lock()
 _diagnostics_lock = RLock()
 _diagnostics_enabled = None
@@ -60,6 +62,19 @@ def safe_connection_failure(exc):
         return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout))
     except ImportError:
         return False
+
+
+def provider_deadline(exc):
+    """Require a received HTTP response plus Gemini's structured deadline status.
+
+    A bare numeric code, exception text, or local transport timeout is insufficient.
+    The failed response contains no usable marks; only one bounded alternative
+    may follow. This does not guarantee zero provider computation/quota cost.
+    """
+    payload = error_payload(exc)
+    return (getattr(getattr(exc, 'response', None), 'status_code', None) == 504
+            and payload.get('code') == 504
+            and payload.get('status') == 'DEADLINE_EXCEEDED')
 
 
 class MarkingFailure(RuntimeError):
@@ -264,12 +279,13 @@ def service_retry_delay(exc, now, retry_index=0):
 
 
 def generate(client, models, contents, system, schema, config_factory, parse, progress=None, clock=time):
+    import pipeline_metrics
     state = state_for(client)
     queued = clock.monotonic()
     # Do not increase marking concurrency even if a caller submits parallel jobs.
     with state['lock']:
         started = clock.monotonic()
-        record = {'request_id': uuid.uuid4().hex, 'stage': 'marking', 'queue_seconds': round(started-queued, 3),
+        record = {'request_id': pipeline_metrics.request_id() or uuid.uuid4().hex, 'stage': 'marking', 'queue_seconds': round(started-queued, 3),
                   'input_text_characters': len(system) + sum(len(c) for c in contents if isinstance(c, str)),
                   'schema_characters': len(json.dumps(schema, separators=(',', ':'))),
                   'document_count': sum(not isinstance(c, str) for c in contents),
@@ -280,6 +296,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
         recovery_limit = configured_attempts()
         record['configured_attempt_limit'] = recovery_limit
         transient_failures = 0
+        deadline_fallback_after = None
         model_list = list(dict.fromkeys(models))
 
         def attempt_limit():
@@ -287,6 +304,8 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
             # invalid output. Fast model rejections do not consume this budget.
             previous = record['attempts'][-1] if record['attempts'] else {}
             retryable = previous.get('outcome') in ('service_unavailable', 'connection_unavailable', 'model_unavailable', 'quota_limited')
+            if deadline_fallback_after is not None:
+                return min(recovery_limit, deadline_fallback_after + 1)
             return recovery_limit if retryable or not previous else min(MAX_ATTEMPTS, recovery_limit)
 
         def wait_until(until):
@@ -328,12 +347,19 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                 if (len(record['attempts']) >= MAX_REQUESTS or generation_attempts >= attempt_limit()
                         or clock.monotonic() >= deadline):
                     break
+                if deadline_fallback_after is not None and len(record['attempts']) > deadline_fallback_after:
+                    break  # even a quick rejection consumes the sole post-504 call
                 delay = max(0, service_wait_until - clock.monotonic())
                 if delay:
                     previous = record['attempts'][-1]
-                    previous['retry_decision'] = 'delayed_fallback'
+                    if deadline_fallback_after is None:
+                        previous['retry_decision'] = 'delayed_fallback'
                     wait_until(service_wait_until)
                 timeout = min(REQUEST_TIMEOUT, deadline-clock.monotonic())
+                if deadline_fallback_after is not None:
+                    if timeout < MIN_DEADLINE_FALLBACK_WINDOW:
+                        raise failure(record, 'timeout', 'insufficient_fallback_budget')
+                    timeout = min(timeout, DEADLINE_FALLBACK_TIMEOUT)
                 attempt = {'model': safe_model, 'attempt': len(record['attempts'])+1,
                            'timeout_seconds': round(timeout, 3)}
                 record['attempts'].append(attempt)
@@ -341,11 +367,13 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                 if progress:
                     progress('Marking the original work…' if len(record['attempts']) == 1 else 'Trying an alternative marking service…')
                 tick = clock.monotonic()
+                api_finished = None
                 try:
                     response = client.models.generate_content(model=model, contents=contents,
                         config=config_factory(system_instruction=system, response_mime_type='application/json',
                             response_schema=schema,
                             http_options={'timeout': max(1, int(timeout*1000)), 'retry_options': {'attempts': 1}}))
+                    api_finished = clock.monotonic()
                     finish = response_stats(response, attempt)
                     if clock.monotonic() >= deadline:
                         attempt['outcome'] = 'deadline_exceeded'
@@ -359,6 +387,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                         attempt['outcome'] = 'empty_response'
                         continue
                     try:
+                        parse_started = clock.monotonic()
                         result = parse(text)
                         if (not isinstance(result, dict) or not isinstance(result.get('questions'), list)
                                 or not result['questions'] or not all(isinstance(q, dict) for q in result['questions'])):
@@ -366,6 +395,8 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                     except (ValueError, TypeError, KeyError):
                         attempt['outcome'] = 'invalid_response'
                         continue
+                    finally:
+                        attempt['parse_seconds'] = round(clock.monotonic()-parse_started, 3)
                     attempt['outcome'] = 'success'
                     record.update(outcome='success', stop_reason='success')
                     return result, model
@@ -404,11 +435,31 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                         attempt['outcome'] = 'request_rejected'
                         break
                     connection_failure = code is None and safe_connection_failure(exc)
+                    if code == 504:
+                        confirmed = provider_deadline(exc)
+                        attempt['timeout_category'] = 'provider_deadline' if confirmed else 'unconfirmed_504'
+                        attempt['outcome'] = 'timeout'
+                        if confirmed:
+                            # Skip the slow model for later students, without waiting
+                            # for this cooldown as though it were a short 503.
+                            state['blocked'][model] = clock.monotonic() + 180
+                            state.get('temporary', {}).pop(model, None)
+                            attempt['cooldown_seconds'] = 180
+                            if deadline_fallback_after is None:
+                                deadline_fallback_after = len(record['attempts'])
+                                service_wait_until = clock.monotonic() + service_retry_delay(exc, clock.time())
+                                attempt['retry_decision'] = 'bounded_deadline_fallback'
+                                continue
+                        attempt['retry_decision'] = 'stop_after_timeout'
+                        break
                     if not connection_failure and (isinstance(exc, TimeoutError) or code in (408, 504) or 'timeout' in type(exc).__name__.lower()):
                         attempt['outcome'] = 'timeout'
+                        attempt['timeout_category'] = 'ambiguous_transport_timeout'
                         # Ambiguous timeout may already have consumed generation quota.
                         break
                     if code in (500, 502, 503) or connection_failure:
+                        if connection_failure:
+                            attempt['timeout_category'] = 'connection_establishment'
                         attempt['outcome'] = 'connection_unavailable' if connection_failure else 'service_unavailable'
                         seconds = service_retry_delay(exc, clock.time(), transient_failures)
                         transient_failures += 1
@@ -423,6 +474,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                     attempt['outcome'] = 'transport_or_client_error'
                     break
                 finally:
+                    attempt['api_response_seconds'] = round((api_finished if api_finished is not None else clock.monotonic())-tick, 3)
                     attempt['response_seconds'] = round(clock.monotonic()-tick, 3)
             last = record['attempts'][-1].get('outcome') if record['attempts'] else None
             terminal = {'timeout', 'request_rejected', 'transport_or_client_error',
