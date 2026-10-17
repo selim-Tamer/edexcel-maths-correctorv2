@@ -231,7 +231,8 @@ class AdditionalRegressionTests(unittest.TestCase):
     def test_gold_identity_reordered_and_prompt_excludes_labels(self):
         from investigation.accuracy import cases, prompt_case
         gold = cases()
-        self.assertEqual(len(gold), 13)
+        self.assertEqual(len(gold), 30)
+        self.assertEqual(len({c['id'] for c in gold}), 30)
         predictions = []
         for case in reversed(gold):
             self.assertEqual(set(prompt_case(case)), {'id', 'topic', 'question', 'student', 'scheme'})
@@ -239,12 +240,105 @@ class AdditionalRegressionTests(unittest.TestCase):
                 {'id': c['id'], 'awarded': v if v is not None else False}
                 for c, v in zip(case['scheme'], case['expected'])]))})
         r = evaluate(predictions)
-        self.assertEqual((r['completed'], r['scorable_cases'], r['criteria']), (13, 12, 27))
+        self.assertEqual((r['completed'], r['scorable_cases'], r['criteria']), (30, 28, 67))
         self.assertEqual(r['exact_score_agreement'], 1)
         self.assertEqual(r['question_level_criterion_accuracy'], 1)
         self.assertEqual(r['criterion_accuracy'], 1)
-        self.assertEqual(r['uncertainty_detected'], 1)
+        self.assertEqual(r['uncertainty_detected'], 2)
         self.assertEqual(r['legacy_positional_completions'], 0)
+
+    def test_expanded_benchmark_counts_and_schema(self):
+        from investigation.accuracy import cases
+        gold = cases()
+        self.assertEqual(len(gold), 30)
+        self.assertEqual(len({c['id'] for c in gold}), 30)
+        crit_ids = [c['id'] for case in gold for c in case['scheme']]
+        self.assertEqual(len(crit_ids), len(set(crit_ids)), 'criterion IDs must be globally unique')
+        uid = ['algebra-correct', 'algebra-partial', 'algebra-invalid-method', 'algebra-alternative',
+               'geometry-area', 'geometry-wrong', 'trigonometry', 'graphs-gradient', 'statistics-grouping',
+               'statistics-arithmetic', 'rounding', 'follow-through', 'unreadable-final']  # Phase A order
+        self.assertEqual([c['id'] for c in gold][:13], uid)
+        raw = [c['id'] for case in gold for c in case['scheme']]
+        for field in ('uncertain',):
+            self.assertTrue(all(type(case[field]) is bool for case in gold), field)
+        for case in gold:
+            for crit, exp in zip(case['scheme'], case['expected']):
+                self.assertTrue(type(crit['id']) is str and crit['id'].strip(), case['id'])
+                self.assertTrue(type(crit['code']) is str and crit['code'].strip(), case['id'])
+                self.assertTrue(type(crit['weight']) is int and not isinstance(crit['weight'], bool)
+                                and crit['weight'] > 0, f"{case['id']}:{crit['id']}")
+                self.assertIn(type(exp), (bool, type(None)), f"{case['id']}:{crit['id']}")
+        self.assertEqual(len(raw), 69)
+        unresolved = [(case['id'], crit['id']) for case in gold for crit, exp
+                      in zip(case['scheme'], case['expected']) if exp is None]
+        self.assertEqual(sorted(unresolved), [('speed-ambiguous-handwriting', 'crit-spd-2'),
+                                             ('unreadable-final', 'crit-unr-2')])
+
+    def test_original_thirteen_expected_awards_preserved(self):
+        from investigation.accuracy import cases
+        original_expected = {
+            'algebra-correct': [True, True], 'algebra-partial': [True, False],
+            'algebra-invalid-method': [False, False], 'algebra-alternative': [True, True],
+            'geometry-area': [True, True], 'geometry-wrong': [False, False],
+            'trigonometry': [True, True], 'graphs-gradient': [True, True, True],
+            'statistics-grouping': [True, True], 'statistics-arithmetic': [True, False],
+            'rounding': [True, True], 'follow-through': [True, False, True],
+            'unreadable-final': [True, None]}
+        by_id = {c['id']: c for c in cases()}
+        for cid, expected in original_expected.items():
+            self.assertIn(cid, by_id)
+            self.assertEqual(by_id[cid]['expected'], expected, cid)
+        self.assertEqual(by_id['unreadable-final']['uncertain'], True)
+
+    def test_expanded_dataset_weights_and_oracle_scoring(self):
+        from investigation.accuracy import cases
+        gold = cases()
+        oracle = [{'id': c['id'], 'uncertain': c['uncertain'], 'failed': False,
+                   'awards': [{'id': cr['id'], 'awarded': v if v is not None else False}
+                              for cr, v in zip(c['scheme'], c['expected'])]} for c in gold]
+        r = evaluate(oracle)
+        self.assertEqual((r['cases'], r['completed'], r['failures']), (30, 30, 0))
+        self.assertEqual((r['scorable_cases'], r['criteria']), (28, 67))
+        self.assertEqual(r['uncertainty_expected'], 2)
+        self.assertEqual(r['exact_score_agreement'], 1)
+        self.assertEqual(r['false_awards'], 0)
+        self.assertEqual(r['incorrect_deductions'], 0)
+        # reordered oracle must still agree: weights apply regardless of award order
+        shuffled = [{'id': p['id'], 'uncertain': p['uncertain'], 'failed': False,
+                     'awards': list(reversed(p['awards']))} for p in oracle]
+        r2 = evaluate(shuffled)
+        self.assertEqual(r2['exact_score_agreement'], 1)
+        self.assertEqual(r2['exact_criterion_vectors'], r['exact_criterion_vectors'])
+
+    def test_unresolved_awards_excluded_from_agreement(self):
+        from investigation.accuracy import cases
+        gold = cases()
+        oracle = [{'id': c['id'], 'uncertain': c['uncertain'], 'failed': False,
+                   'awards': [{'id': cr['id'], 'awarded': v if v is not None else False}
+                              for cr, v in zip(c['scheme'], c['expected'])]} for c in gold]
+        r = evaluate(oracle)
+        # two unresolved criteria reduce scored criteria (69 raw -> 67) and scorable cases (30 -> 28)
+        self.assertEqual(r['criteria'], sum(v is not None for c in gold for v in c['expected']))
+        self.assertEqual(r['scorable_cases'], sum(not any(
+            v is None for v in c['expected']) for c in gold))
+        # completions are still recorded for the unresolved cases
+        self.assertTrue(all(p['id'] in {c['id'] for c in gold} for p in oracle))
+        self.assertEqual(r['legacy_positional_completions'], 0)
+
+    def test_representative_phase_b3_expected_awards(self):
+        from investigation.accuracy import cases
+        by_id = {c['id']: c for c in cases()}
+        self.assertEqual(by_id['simultaneous-equations-ecf']['expected'], [True, False, True, True])
+        self.assertEqual(by_id['quadratics-dependent-method']['expected'], [False, False, False])
+        self.assertEqual(by_id['grouped-mean-dependent-steps']['expected'], [True, False, False])
+        self.assertEqual(by_id['probability-isw']['expected'], [True, True])
+        self.assertEqual(by_id['trigonometry-alternative-method']['expected'], [True, True])
+        self.assertEqual(by_id['geometry-conflicting-methods']['expected'], [False, False])
+        self.assertEqual(by_id['speed-ambiguous-handwriting']['expected'], [True, None])
+        self.assertEqual(by_id['speed-ambiguous-handwriting']['uncertain'], True)
+        self.assertEqual(by_id['cosine-rule-premature-rounding']['expected'], [True, False])
+        self.assertEqual(by_id['expanding-partial-multi-mark']['expected'], [True, False, False])
+        self.assertEqual(by_id['fractions-independent-b-marks']['expected'], [True, True, False])
 
     def test_empty_dataset(self):
         r = evaluate([], [])

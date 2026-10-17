@@ -145,7 +145,7 @@ class AccuracyTests(unittest.TestCase):
     def test_scorer_identity_is_only_a_metric_self_test_not_model_accuracy(self):
         result=a.evaluate(self.predictions())
         self.assertEqual(result['exact_score_agreement'],1)
-        self.assertEqual(result['scorable_cases'],12)
+        self.assertEqual(result['scorable_cases'],28)
         self.assertTrue(result['teacher_review_required'])
 
     def test_same_total_wrong_method_detected(self):
