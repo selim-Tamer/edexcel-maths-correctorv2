@@ -484,11 +484,79 @@ class AdapterIntegration(unittest.TestCase):
         self.assertEqual(versions, {"gemini-3.8-flash-001"})
         # Probe the exact production-mirroring config kwargs (mock capture).
         config = state["last_config"]
+        self.assertEqual(config["system_instruction"], pilot.SYSTEM_PROMPT)
         self.assertEqual(config["response_mime_type"], "application/json")
         self.assertEqual(config["temperature"], 0.0)
         self.assertEqual(config["max_output_tokens"], 2048)
         self.assertEqual(config["http_options"],
                          {"timeout": 120000, "retry_options": {"attempts": 1}})
+
+
+class SystemInstructionDelivery(unittest.TestCase):
+    """Reviewer fix: the system prompt must actually reach the live request."""
+
+    def _opaque_of(self, user_prompt, mapping):
+        return next(o for o in mapping.values()
+                    if f"CASE ID: {o}" in user_prompt)
+
+    def test_live_request_delivers_system_instruction_and_user_prompt(self):
+        state, artifact = _run_pilot({})
+        prompts = pilot.render_prompts(pilot.load_pilot_cases())
+        by_opaque = {p["opaque_case_id"]: p for p in prompts}
+        mapping = {v: k for k, v in pilot.opaque_ids(pilot.load_pilot_cases()).items()}
+        self.assertEqual(len(state["client"].models.calls), 5)
+        derivation_by_id = labels()
+        for call in state["client"].models.calls:
+            user_prompt = call["contents"][0]
+            opaque = self._opaque_of(user_prompt, pilot.opaque_ids(pilot.load_pilot_cases()))
+            case = by_opaque[opaque]
+            self.assertEqual(call["contents"], [case["user_prompt"]])
+            # the marking rules travel as system instructions, not as contents
+            self.assertEqual(call["config"]["system_instruction"],
+                             case["system_prompt"])
+            self.assertEqual(call["model"], pilot.DEFAULT_MODEL)
+            self.assertEqual(call["config"]["temperature"], 0.0)
+            self.assertEqual(call["config"]["max_output_tokens"], 2048)
+            self.assertEqual(call["config"]["http_options"],
+                             {"timeout": 120000, "retry_options": {"attempts": 1}})
+            self.assertEqual(call["config"]["response_mime_type"],
+                             "application/json")
+            self.assertEqual(call["config"]["response_schema"],
+                             pilot.evaluation_response_schema())
+            # neither component leaks golden data; opaque IDs preserved
+            gold = derivation_by_id[mapping[opaque]]
+            for component in (case["user_prompt"], case["system_prompt"]):
+                if gold.get("derivation"):
+                    self.assertNotIn(gold["derivation"], component)
+                self.assertNotIn("expected", component)
+                self.assertNotIn("synthetic_provisional_rubric", component)
+                self.assertNotIn("human_review_required", component)
+            self.assertIn(f"CASE ID: {opaque}", user_prompt)
+            self.assertNotIn("CASE ID: " + mapping[opaque], user_prompt)
+
+    def test_dry_run_and_live_use_identical_prompt_components(self):
+        preview = pilot.build_preview()
+        state, artifact = _run_pilot({})
+        preview_by_opaque = {p["opaque_case_id"]: p
+                             for p in preview["prompts_rendered"]}
+        for call in state["client"].models.calls:
+            user_prompt = call["contents"][0]
+            opaque = self._opaque_of(user_prompt, pilot.opaque_ids(pilot.load_pilot_cases()))
+            rendered = preview_by_opaque[opaque]
+            self.assertEqual(user_prompt, rendered["user_prompt"])
+            self.assertEqual(call["config"]["system_instruction"],
+                             rendered["system_prompt"])
+        # per-ledger reproducibility hashes cover BOTH prompt components
+        for entry in artifact["cases"]:
+            expected_user = _sha256(preview_by_opaque[entry["opaque_case_id"]]["user_prompt"])
+            expected_system = _sha256(preview_by_opaque[entry["opaque_case_id"]]["system_prompt"])
+            self.assertEqual(entry["prompt_fingerprint"], expected_user)
+            self.assertEqual(entry["system_prompt_fingerprint"], expected_system)
+
+
+def _sha256(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":
