@@ -45,17 +45,29 @@ Abstention semantics (never silently reinterpreted):
   - This differs from the legacy accuracy.evaluate() semantics; legacy
     output remains authoritative and untouched.
 
-  exact_score_agreement      cases whose total weighted marks match / cases
-                             with every criterion expected non-null
-                             ("fully scorable") among completed predictions
-  criterion_vector_agreement cases whose known-criterion award vector matches
-                             exactly / fully-scorable completed cases.
-                             A declared abstention on a known criterion
-                             breaks both vector and exact agreement when a
-                             weighted difference results.
-  Partial known-gold cases (some criterion expected null) are excluded from
-  exact metrics and listed separately; they are never treated as fully
-  scoreable.
+  exact metrics use three separate denominators ("exact_denominators"):
+    definitive_completions  fully-scorable completed cases with ZERO
+                            known-reference abstentions
+    abstained_cases         fully-scorable completed cases with one or more
+                            known-reference abstentions
+    failed_attempts         fully-scorable attempted cases that did not
+                            complete (explicit failure, schema-validation
+                            failure, or missing prediction)
+  exact_score_agreement            matches / definitive_completions
+  criterion_vector_agreement       vector matches / definitive_completions
+  strict_all_attempt_exact_score_agreement  matches / (definitive +
+                            abstained + failed) fully-scorable cases;
+                            abstained and failed attempts receive NO
+                            success credit.
+  strict_all_attempt_criterion_vector_agreement  same for award vectors.
+  A fully-scorable case has every criterion expected non-null; partial
+  known-gold cases are excluded from all exact metrics and listed
+  separately. A case with any known-reference abstention is
+  exact-ineligible even when its emitted (partial) totals numerically equal
+  the reference total (e.g. all-negative reference with a complete
+  abstention): its case-level flags report None plus an
+  "exact_score_ineligible_reason" instead of a match. Legacy
+  accuracy.evaluate() semantics are unchanged.
 
 Case statuses (failures are never completions):
   completed | explicit_model_failure | schema_validation_failure |
@@ -232,6 +244,7 @@ def _prediction_status(prediction, scheme_ids):
     if not isinstance(awards, list):
         return "schema_validation_failure"
     seen = set()
+    awards_map = {}
     for award in awards:
         if not isinstance(award, dict):
             return "schema_validation_failure"
@@ -243,12 +256,20 @@ def _prediction_status(prediction, scheme_ids):
         seen.add(award_id)
         if type(award.get("awarded")) is not bool:
             return "schema_validation_failure"
+        awards_map[award_id] = award["awarded"]
     if seen != scheme_ids:
         return "schema_validation_failure"
     declared = prediction.get("declared_unknown")
     declared = [] if declared is None else declared
-    if not isinstance(declared, list) or any(a not in scheme_ids for a in declared):
+    if not isinstance(declared, list):
         return "schema_validation_failure"
+    if any(a not in scheme_ids for a in declared) or len(set(declared)) != len(declared):
+        return "schema_validation_failure"
+    for abstained_id in declared:
+        if awards_map[abstained_id] is not False:
+            # Stage 2A contract: every declared abstention's emitted award
+            # must be the canonical withheld False, never a claimed award.
+            return "schema_validation_failure"
     return "completed"
 
 
@@ -310,7 +331,8 @@ def build_report(gold_cases, predictions, manifest):
                      "false_awards": 0, "incorrect_deductions": 0}
     abstentions = {"known_reference": 0, "gold_null": 0,
                    "by_category": {name: 0 for name in CATEGORIES}}
-    exact_matches = exact_scorable = vector_matches = vector_scorable = 0
+    exact_matches = vector_matches = definitive_scorable = 0
+    abstained_fully_scorable = failed_fully_scorable = 0
     partial_known_gold_case_ids = []
     uncertainty = {"expected": 0, "detected": 0, "unnecessary": 0,
                    "uncertain_completions": 0}
@@ -325,6 +347,8 @@ def build_report(gold_cases, predictions, manifest):
         null_count = len(pairs) - known_count
         if prediction is None:
             status_counts["missing_prediction"] += 1
+            if null_count == 0:
+                failed_fully_scorable += 1
             case_results.append({
                 "id": case_id,
                 "classification": classification,
@@ -355,6 +379,8 @@ def build_report(gold_cases, predictions, manifest):
             latency["non_completed_with_valid_timing"] += 1
 
         if status != "completed":
+            if null_count == 0:
+                failed_fully_scorable += 1
             case_results.append(case_result)
             continue
 
@@ -424,12 +450,22 @@ def build_report(gold_cases, predictions, manifest):
         predicted_marks_total += predicted_score
 
         if not null_ids:
-            exact_scorable += 1
-            vector_scorable += 1
-            exact_matches += 1 if gold_score == predicted_score else 0
-            vector_matches += 1 if vector_match else 0
-            case_result["exact_score_match"] = gold_score == predicted_score
-            case_result["criterion_vector_match"] = vector_match
+            if case_known_abstained:
+                # Definitive-agreement policy: a case with any
+                # known-reference abstention is exact-ineligible even when
+                # its partial emitted totals numerically equal the
+                # reference total; reported in the abstained denominator,
+                # granted NO success credit in strict all-attempt metrics.
+                abstained_fully_scorable += 1
+                case_result["exact_score_match"] = None
+                case_result["criterion_vector_match"] = None
+                case_result["exact_score_ineligible_reason"] = "known_reference_abstention"
+            else:
+                definitive_scorable += 1
+                exact_matches += 1 if gold_score == predicted_score else 0
+                vector_matches += 1 if vector_match else 0
+                case_result["exact_score_match"] = gold_score == predicted_score
+                case_result["criterion_vector_match"] = vector_match
         else:
             partial_known_gold_case_ids.append(case_id)
         case_result["gold_total_marks"] = gold_score
@@ -461,9 +497,19 @@ def build_report(gold_cases, predictions, manifest):
             "predicted_marks_earned": predicted_marks_total,
             "difference": predicted_marks_total - gold_marks_total,
         },
-        "exact_score_agreement": _rate(exact_matches, exact_scorable),
-        "criterion_vector_agreement": _rate(vector_matches, vector_scorable),
-        "fully_scorable_cases": exact_scorable,
+        "exact_score_agreement": _rate(exact_matches, definitive_scorable),
+        "criterion_vector_agreement": _rate(vector_matches, definitive_scorable),
+        "strict_all_attempt_exact_score_agreement": _rate(
+            exact_matches, definitive_scorable + abstained_fully_scorable + failed_fully_scorable),
+        "strict_all_attempt_criterion_vector_agreement": _rate(
+            vector_matches, definitive_scorable + abstained_fully_scorable + failed_fully_scorable),
+        "exact_denominators": {
+            "definitive_completions": definitive_scorable,
+            "abstained_cases": abstained_fully_scorable,
+            "failed_attempts": failed_fully_scorable,
+        },
+        "fully_scorable_cases": definitive_scorable + abstained_fully_scorable
+        + failed_fully_scorable,
         "partial_known_gold_case_ids": partial_known_gold_case_ids,
         "category_accuracy": {name: _finalize(category_counts[name])
                               for name in CATEGORIES},
@@ -500,6 +546,9 @@ def build_report(gold_cases, predictions, manifest):
                 sub_exact += 1 if c["exact_score_match"] else 0
                 sub_vector += 1 if c["criterion_vector_match"] else 0
                 sub_scorable += 1
+        sub_exact_ineligible = sum(
+            1 for c in sub_cases
+            if c.get("exact_score_ineligible_reason") == "known_reference_abstention")
         per_class[classification] = {
             "cases": len(sub_cases),
             "case_ids": sorted(c["id"] for c in sub_cases),
@@ -513,6 +562,7 @@ def build_report(gold_cases, predictions, manifest):
                                            sub_answered + sub_known_abstentions),
             "exact_score_agreement": _rate(sub_exact, sub_scorable),
             "criterion_vector_agreement": _rate(sub_vector, sub_scorable),
+            "exact_ineligible_abstained_cases": sub_exact_ineligible,
         }
 
     return {

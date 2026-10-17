@@ -69,6 +69,205 @@ def _bucket(report, category, *, combined=False):
     return table[category]
 
 
+class ExactAgreementPolicy(unittest.TestCase):
+    """Deterministic tests for the definitive/strict exact-score policy:
+
+    a fully-scorable case with any known-reference abstention is
+    exact-INeligible for definitive agreement and receives NO success
+    credit in strict all-attempt agreement, even when totals match.
+    """
+
+    def _case(self, criteria, expected):
+        return _custom_case("exact-policy", criteria, expected)
+
+    def _report(self, case, awards, abstain, uncertain=True):
+        rows = [{"id": f"{case['id']}-c{n + 1}", "awarded": awards[n]}
+                for n in range(len(awards))]
+        prediction = {"id": case["id"], "uncertain": uncertain,
+                      "awards": rows,
+                      "declared_unknown": abstain}
+        return metrics.build_report([case], [prediction],
+                                    _custom_governance([case["id"]]))
+
+    def test_all_negative_gold_with_complete_abstention_not_a_match(self):
+        # The reported bug's reproduction: allreference False, both abstained;
+        # emitted totals (0) numerically equal gold (0) but the model made no
+        # definitive marking decisions, so no match is granted.
+        case = self._case([("M1", 1), ("A1", 1)], [False, False])
+        report = self._report(case, awards=[False, False],
+                              abstain=["exact-policy-c1", "exact-policy-c2"])
+        summary = report["criteria"]
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 0, "abstained_cases": 1,
+            "failed_attempts": 0})
+        self.assertIsNone(summary["exact_score_agreement"])
+        self.assertIsNone(summary["criterion_vector_agreement"])
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 0.0)
+        self.assertEqual(
+            summary["strict_all_attempt_criterion_vector_agreement"], 0.0)
+        self.assertEqual(summary["fully_scorable_cases"], 1)
+        self.assertEqual(summary["known_reference_abstentions"], 2)
+        result = report["cases"][0]
+        self.assertIsNone(result["exact_score_match"])
+        self.assertIsNone(result["criterion_vector_match"])
+        self.assertEqual(result["exact_score_ineligible_reason"],
+                         "known_reference_abstention")
+        self.assertEqual(result["gold_total_marks"], 0)
+        self.assertEqual(result["predicted_total_marks"], 0)
+
+    def test_partial_abstention_equal_totals_gets_no_credit(self):
+        # Abstaining on a criterion the reference withholds keeps the emitted
+        # weighted total equal to gold, yet no exact match is claimed.
+        case = self._case([("M1", 2), ("A1", 1)], [True, False])
+        report = self._report(case, awards=[True, False],
+                              abstain=["exact-policy-c2"])
+        summary = report["criteria"]
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 0, "abstained_cases": 1,
+            "failed_attempts": 0})
+        self.assertIsNone(summary["exact_score_agreement"])
+        self.assertIsNone(summary["criterion_vector_agreement"])
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 0.0)
+        self.assertEqual(report["cases"][0]["gold_total_marks"],
+                         report["cases"][0]["predicted_total_marks"])
+        self.assertIsNone(report["cases"][0]["exact_score_match"])
+
+    def test_partial_abstention_unequal_totals_no_definitive_match(self):
+        case = self._case([("M1", 1), ("A1", 1)], [True, True])
+        report = self._report(case, awards=[True, False],
+                              abstain=["exact-policy-c2"])
+        summary = report["criteria"]
+        self.assertEqual(summary["exact_denominators"]["abstained_cases"], 1)
+        self.assertEqual(summary["exact_denominators"]["definitive_completions"], 0)
+        self.assertIsNone(summary["exact_score_agreement"])
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 0.0)
+        self.assertEqual(summary["weighted_totals"],
+                         {"gold_marks_earned": 2, "predicted_marks_earned": 1,
+                          "difference": -1})
+
+    def test_fully_answered_matching_totals_different_vector(self):
+        # Definitive completions keep exact-score semantics; the differing
+        # vector breaks only vector agreement. Strict metrics coincide
+        # because no abstentions/failures are present.
+        case = self._case([("M1", 1), ("A1", 1)], [True, False])
+        report = self._report(case, awards=[False, True],
+                              abstain=[], uncertain=False)
+        summary = report["criteria"]
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 1, "abstained_cases": 0,
+            "failed_attempts": 0})
+        self.assertTrue(report["cases"][0]["exact_score_match"])
+        self.assertFalse(report["cases"][0]["criterion_vector_match"])
+        self.assertEqual(summary["exact_score_agreement"], 1.0)
+        self.assertEqual(summary["criterion_vector_agreement"], 0.0)
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 1.0)
+        self.assertEqual(
+            summary["strict_all_attempt_criterion_vector_agreement"], 0.0)
+
+    def test_full_oracle_predictions_definitive_and_strict(self):
+        cases = gold_cases()
+        predictions = [_prediction(c, seconds=1.0) for c in cases]
+        report = metrics.build_report(cases, predictions, metrics.load_governance())
+        summary = report["criteria"]
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 28, "abstained_cases": 0,
+            "failed_attempts": 0})
+        self.assertEqual(summary["fully_scorable_cases"], 28)
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 1.0)
+        self.assertEqual(
+            summary["strict_all_attempt_criterion_vector_agreement"], 1.0)
+        self.assertEqual(summary["exact_score_agreement"], 1.0)
+        self.assertEqual(summary["criterion_vector_agreement"], 1.0)
+
+    def test_mixed_successes_abstentions_and_failures(self):
+        cases = gold_cases()
+        predictions = []
+        for case in cases:
+            if case["id"] == "algebra-correct":
+                # fully-scorable completed case with known abstentions
+                predictions.append({
+                    "id": case["id"], "uncertain": True,
+                    "awards": [{"id": "crit-alg-c-1", "awarded": False},
+                               {"id": "crit-alg-c-2", "awarded": False}],
+                    "declared_unknown": ["crit-alg-c-1", "crit-alg-c-2"]})
+            elif case["id"] == "probability-isw":
+                predictions.append(_failed_prediction(case["id"],
+                                                      "explicit_failure"))
+            elif case["id"] == "trigonometry":
+                continue                       # missing prediction
+            else:
+                predictions.append(_prediction(case))
+        report = metrics.build_report(cases, predictions, metrics.load_governance())
+        summary = report["criteria"]
+        # 28 fully-scorable cases; algebra-correct abstained, isw failed,
+        # trigonometry missing, the other 25 completed definitively.
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 25, "abstained_cases": 1,
+            "failed_attempts": 2})
+        self.assertEqual(summary["fully_scorable_cases"], 28)
+        self.assertEqual(summary["exact_score_agreement"], 1.0)
+        self.assertEqual(summary["criterion_vector_agreement"], 1.0)
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"],
+                         25 / 28)
+        self.assertEqual(
+            summary["strict_all_attempt_criterion_vector_agreement"], 25 / 28)
+        abstained_result = report["cases"][0]
+        self.assertEqual(abstained_result["id"], "algebra-correct")
+        self.assertIsNone(abstained_result["exact_score_match"])
+        self.assertEqual(report["governance"]["synthetic_unambiguous"]
+                         ["exact_ineligible_abstained_cases"], 1)
+
+
+class DuplicateAbstentionValidation(unittest.TestCase):
+    """declared_unknown must be unique, valid, and mirror canonical False."""
+
+    def _completed_prediction(self):
+        case = by_id("algebra-correct")
+        return case, _prediction(case)
+
+    def test_duplicate_declared_unknown_ids_are_schema_failure(self):
+        case, prediction = self._completed_prediction()
+        prediction["declared_unknown"] = ["crit-alg-c-1", "crit-alg-c-1"]
+        report = metrics.build_report([case], [prediction],
+                                      _custom_governance([case["id"]]))
+        self.assertEqual(
+            report["prediction_status"]["schema_validation_failure"], 1)
+        summary = report["criteria"]
+        self.assertEqual(summary["known_reference_abstentions"], 0)
+        self.assertEqual(summary["answered_criteria"], 0)
+        self.assertEqual(summary["coverage"], None)
+
+    def test_declared_unknown_with_claimed_award_is_schema_failure(self):
+        case, prediction = self._completed_prediction()
+        prediction["awards"][0]["awarded"] = True            # crit-alg-c-1
+        prediction["declared_unknown"] = ["crit-alg-c-1"]
+        report = metrics.build_report([case], [prediction],
+                                      _custom_governance([case["id"]]))
+        self.assertEqual(
+            report["prediction_status"]["schema_validation_failure"], 1)
+        self.assertEqual(report["criteria"]["known_reference_abstentions"], 0)
+
+    def test_canonical_false_abstention_remains_completed(self):
+        case, prediction = self._completed_prediction()
+        prediction["awards"][0]["awarded"] = False
+        prediction["declared_unknown"] = ["crit-alg-c-1"]
+        report = metrics.build_report([case], [prediction],
+                                      _custom_governance([case["id"]]))
+        self.assertEqual(report["prediction_status"]["completed"], 1)
+        self.assertEqual(report["cases"][0]["abstentions"],
+                         {"known_reference": ["crit-alg-c-1"],
+                          "gold_null": []})
+
+    def test_duplicate_award_rows_are_schema_failure(self):
+        case, prediction = self._completed_prediction()
+        prediction["awards"] = [prediction["awards"][0],
+                                dict(prediction["awards"][0])]
+        report = metrics.build_report([case], [prediction],
+                                      _custom_governance([case["id"]]))
+        self.assertEqual(
+            report["prediction_status"]["schema_validation_failure"], 1)
+
+
 class ReportingBasics(unittest.TestCase):
     def _oracle_predictions(self, cases, seconds=True):
         return [_prediction(c, seconds=float(i + 1) if seconds else None)
@@ -285,7 +484,9 @@ class AbstentionReporting(unittest.TestCase):
         self.assertEqual(summary["coverage"], 0.0)
         self.assertEqual(summary["conservative_accuracy"], 0.0)
         self.assertEqual(summary["weighted_totals"]["difference"], -2)
-        self.assertFalse(report["cases"][0]["criterion_vector_match"])
+        self.assertIsNone(report["cases"][0]["criterion_vector_match"])
+        self.assertEqual(report["cases"][0]["exact_score_ineligible_reason"],
+                         "known_reference_abstention")
 
     def test_mixed_answered_and_abstained_criteria(self):
         case = _custom_case("mixed-weights", [("M1", 2), ("M1", 1), ("B1", 1)],
@@ -522,8 +723,14 @@ class DenominatorsAndWeights(unittest.TestCase):
             "false_awards": 0, "incorrect_deductions": 1})
         self.assertEqual(summary["weighted_totals"], {
             "gold_marks_earned": 5, "predicted_marks_earned": 2, "difference": -3})
-        self.assertFalse(summary["exact_score_agreement"])
-        self.assertFalse(report["cases"][0]["exact_score_match"])
+        # One abstention on a fully-scorable case: exact-ineligible, no
+        # definitive or strict success credit, counted in the abstained
+        # denominator only.
+        self.assertIsNone(summary["exact_score_agreement"])
+        self.assertEqual(summary["exact_denominators"], {
+            "definitive_completions": 0, "abstained_cases": 1,
+            "failed_attempts": 0})
+        self.assertEqual(summary["strict_all_attempt_exact_score_agreement"], 0.0)
         method = _bucket(report, "method_ordinary")
         self.assertEqual(method["answered"], 2)
         self.assertEqual(method["abstentions"], 1)
