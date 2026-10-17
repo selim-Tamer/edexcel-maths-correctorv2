@@ -256,7 +256,11 @@ class SafetyGates(unittest.TestCase):
         self.assertEqual({c["model"] for c in state["client"].models.calls},
                          {pilot.DEFAULT_MODEL})
 
-    def test_timeout_does_not_abort_or_retry(self):
+    def test_timeout_stops_pilot_fail_closed(self):
+        # Stage 3B-2 review correction: 408/504 and SDK timeouts are
+        # ambiguous transmission outcomes — the request may have been
+        # received and processed — so the pilot stops instead of risking a
+        # duplicate-billed retry. The failed attempt stays consumed.
         responses = {}
         for index, cid in enumerate(pilot.PILOT_CASE_IDS):
             opaque = pilot.opaque_case_id(index)
@@ -266,12 +270,15 @@ class SafetyGates(unittest.TestCase):
             responses[opaque] = ("text", _MockResponse(text=_wrapped(json.dumps(
                 _oracle_response(labels()[cid], opaque), sort_keys=True))))
         state, artifact = _run_pilot(responses)
-        self.assertEqual(len(state["client"].models.calls), 5)  # every case once
-        self.assertIsNone(artifact["aborted_after"])
+        self.assertEqual(len(state["client"].models.calls), 3)       # then stop
+        self.assertEqual(artifact["aborted_after"], "timeout")
         timed_out = next(c for c in artifact["cases"] if c["case_id"]
                          == "probability-tree-arithmetic-error")
         self.assertEqual(timed_out["failure_category"], "timeout")
-        self.assertEqual(artifact["report"]["prediction_status"]["completed"], 4)
+        self.assertEqual(timed_out["outcome"], "failed")
+        skipped = [c for c in artifact["cases"] if not c["attempted"]]
+        self.assertEqual([c["failure_category"] for c in skipped],
+                         ["aborted_after_timeout"] * 2)
 
     def test_no_retry_no_fallback_single_model(self):
         responses = {}
@@ -630,9 +637,15 @@ class StrictAbortPolicy(unittest.TestCase):
         self.assertEqual(len(case2), 1)
         self.assertEqual(case2[0]["outcome"], "failed")
 
+    def test_http_408_timeout_stops_pilot(self):
+        self._assert_stops(408, "timeout")
+
+    def test_http_504_timeout_stops_pilot(self):
+        self._assert_stops(504, "timeout")
+
     def test_service_unavailable_continues_but_never_retries(self):
-        # 5xx is outside the abort list (approved planning) and must never
-        # trigger a second request for the same case.
+        # 5xx is outside the abort set (approved Stage 3B-2 planning) and
+        # must never trigger a second request for the same case.
         behavior = {"PILOT-02": ("raise", _CodedError(503))}
         state, artifact = _run_pilot(behavior)
         self.assertEqual(len(state["client"].models.calls), 5)
@@ -642,11 +655,17 @@ class StrictAbortPolicy(unittest.TestCase):
             counts[call["model"]] = counts.get(call["model"], 0) + 1
         self.assertEqual(counts, {pilot.DEFAULT_MODEL: 5})
 
-    def test_timeout_continues_but_never_retries(self):
+    def test_sdk_timeout_exception_stops_pilot(self):
+        # TimeoutError (no HTTP code): the transmission outcome is
+        # ambiguous, so the pilot aborts while the attempt stays consumed.
         behavior = {"PILOT-02": ("raise", TimeoutError())}
         state, artifact = _run_pilot(behavior)
-        self.assertEqual(len(state["client"].models.calls), 5)
-        self.assertIsNone(artifact["aborted_after"])
+        self.assertEqual(len(state["client"].models.calls), 2)
+        self.assertEqual(artifact["aborted_after"], "timeout")
+        case2 = [c for c in artifact["cases"]
+                 if c["case_id"] == "algebra-partial"]
+        self.assertEqual(len(case2), 1)
+        self.assertEqual(case2[0]["outcome"], "failed")
 
 
 class GenerationSettingsTests(unittest.TestCase):
@@ -858,6 +877,211 @@ class ArtifactSafetyTests(unittest.TestCase):
         self.assertNotIn("GEMINI_API_KEY", blob)
         self.assertNotIn("api_key", blob.lower())
         self.assertNotIn(OPTIN_VALUE := "MATH_MARKER_EVAL_OPT_IN", blob)
+
+
+class AuthorizationBeforeCampaignFiles(unittest.TestCase):
+    """Review correction 2: unauthorized live invocations must not create
+    or modify any campaign ledger or artifact placeholder file."""
+
+    def _forbid_construction(self):
+        """Forbid both live-mode default factories for the caller's patches."""
+        return (mock.patch.object(pilot, "_default_client_factory",
+                                  side_effect=AssertionError(
+                                      "client must not be constructed")),
+                mock.patch.object(pilot, "_default_config_factory",
+                                  side_effect=AssertionError(
+                                      "config must not be constructed")))
+
+    def _assert_no_campaign_files(self, tmp):
+        listing = os.listdir(tmp)
+        self.assertNotIn("evaluation_runs", listing)
+
+    def test_missing_opt_in_creates_no_files_and_no_requests(self):
+        client_patch, config_patch = self._forbid_construction()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.dict(os.environ, {pilot.OPT_IN_ENV: ""}), \
+                        client_patch, config_patch:
+                    with self.assertRaises(RuntimeError):
+                        pilot.main(["--live", "--confirm-request-budget", "5"])
+                self._assert_no_campaign_files(tmp)
+            finally:
+                os.chdir(previous)
+
+    def test_wrong_budget_creates_no_files_and_no_requests(self):
+        client_patch, config_patch = self._forbid_construction()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.dict(os.environ, {pilot.OPT_IN_ENV: "1"}), \
+                        client_patch, config_patch:
+                    with self.assertRaises(RuntimeError):
+                        pilot.main(["--live", "--confirm-request-budget", "4"])
+                self._assert_no_campaign_files(tmp)
+            finally:
+                os.chdir(previous)
+
+    def test_invalid_model_creates_no_files_and_no_requests(self):
+        client_patch, config_patch = self._forbid_construction()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.dict(os.environ, {pilot.OPT_IN_ENV: "1"}), \
+                        client_patch, config_patch:
+                    with self.assertRaises(ValueError):
+                        pilot.main(["--live", "--model", "not a model id",
+                                    "--confirm-request-budget", "5"])
+                self._assert_no_campaign_files(tmp)
+            finally:
+                os.chdir(previous)
+
+
+class MainInterruptionTests(unittest.TestCase):
+    """Review correction 1: interrupted or failed main() runs preserve
+    non-empty per-case checkpoints, record an explicit incomplete status,
+    leave the campaign ledger intact, and never erase recorded results."""
+
+    def _run_main_live(self, behavior, tmp):
+        holder = _MockClient(behavior)
+        previous = os.getcwd()
+        os.chdir(tmp)
+        try:
+            with mock.patch.dict(os.environ, {pilot.OPT_IN_ENV: "1"}), \
+                    mock.patch.object(pilot, "_default_client_factory",
+                                      return_value=holder), \
+                    mock.patch.object(pilot, "_default_config_factory",
+                                      new=lambda **kw: kw):
+                pilot.main(["--live", "--confirm-request-budget", "5"])
+        finally:
+            os.chdir(previous)
+        return holder
+
+    def _runs_dir(self, tmp):
+        return os.path.join(tmp, "evaluation_runs")
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_interrupt_after_first_attempt_preserves_checkpoint_and_ledger(self):
+        behavior = {"PILOT-02": ("raise", KeyboardInterrupt())}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_main_live(behavior, tmp)
+            runs_dir = self._runs_dir(tmp)
+            listing = os.listdir(runs_dir)
+            self.assertIn(pilot.CAMPAIGN_LEDGER_FILENAME, listing)
+            # the single completed attempt survives as an interrupted mark
+            partials = [p for p in listing if p.endswith(".partial.json")]
+            self.assertEqual(len(partials), 1)
+            snapshot = self._read(os.path.join(runs_dir, partials[0]))
+            self.assertEqual(snapshot["run_status"], "interrupted")
+            self.assertEqual(snapshot["attempted_count"], 1)
+            self.assertEqual(snapshot["completed_count"], 1)
+            # nothing complete was promoted over it
+            finals = [p for p in listing
+                      if p.endswith("-gemini-pilot.json")]
+            self.assertEqual(finals, [])
+            # the campaign ledger is intact: one consumed, one reserved
+            ledger = self._read(os.path.join(runs_dir,
+                                             pilot.CAMPAIGN_LEDGER_FILENAME))
+            self.assertEqual(len(ledger["reservations"]), 2)
+            self.assertEqual(ledger["reservations"][0]["outcome"]["outcome"],
+                             "parsed")
+            self.assertIsNone(ledger["reservations"][1]["outcome"])
+            # a restarted process cannot replay into the consumed budget
+            with self.assertRaises(pilot.CampaignLedgerError):
+                pilot.CampaignLedger(runs_dir).check_run_permitted(
+                    list(pilot.PILOT_CASE_IDS))
+
+    def test_interrupt_after_two_completed_attempts(self):
+        behavior = {"PILOT-03": ("raise", KeyboardInterrupt())}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_main_live(behavior, tmp)
+            runs_dir = self._runs_dir(tmp)
+            partials = [p for p in os.listdir(runs_dir)
+                        if p.endswith(".partial.json")]
+            self.assertEqual(len(partials), 1)
+            snapshot = self._read(os.path.join(runs_dir, partials[0]))
+            self.assertEqual(snapshot["run_status"], "interrupted")
+            self.assertEqual(snapshot["attempted_count"], 2)
+            self.assertEqual(snapshot["completed_count"], 2)
+            ledger = self._read(os.path.join(runs_dir,
+                                             pilot.CAMPAIGN_LEDGER_FILENAME))
+            self.assertEqual(len(ledger["reservations"]), 3)
+            self.assertTrue(all(r["outcome"]["outcome"] == "parsed"
+                                for r in ledger["reservations"][:2]))
+            self.assertIsNone(ledger["reservations"][2]["outcome"])
+
+    def test_interrupt_before_first_checkpoint_clears_only_placeholder(self):
+        behavior = {"PILOT-01": ("raise", KeyboardInterrupt())}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_main_live(behavior, tmp)
+            runs_dir = self._runs_dir(tmp)
+            listing = os.listdir(runs_dir)
+            # no checkpoint content existed: only the empty placeholder was
+            # cleared; the reserved-but-interrupted attempt stays consumed
+            self.assertFalse([p for p in listing if p.endswith(".partial.json")])
+            self.assertFalse([p for p in listing
+                              if p.endswith("-gemini-pilot.json")])
+            ledger = self._read(os.path.join(runs_dir,
+                                             pilot.CAMPAIGN_LEDGER_FILENAME))
+            self.assertEqual(len(ledger["reservations"]), 1)
+            self.assertIsNone(ledger["reservations"][0]["outcome"])
+
+    def test_finalization_failure_preserves_all_records(self):
+        behavior = {}          # five perfect responses
+        with tempfile.TemporaryDirectory() as tmp:
+            original_writer = pilot._atomic_write_json
+
+            def flaky(path, payload):
+                name = str(path)
+                if name.endswith("-gemini-pilot.json"):
+                    raise OSError("simulated finalization failure")
+                return original_writer(path, payload)
+
+            with mock.patch.object(pilot, "_atomic_write_json", flaky):
+                with self.assertRaises(OSError):
+                    self._run_main_live(behavior, tmp)
+            runs_dir = self._runs_dir(tmp)
+            listing = os.listdir(runs_dir)
+            partials = [p for p in listing if p.endswith(".partial.json")]
+            self.assertEqual(len(partials), 1)
+            snapshot = self._read(os.path.join(runs_dir, partials[0]))
+            self.assertEqual(snapshot["run_status"], "finalization_failed")
+            self.assertEqual(snapshot["attempted_count"], 5)
+            self.assertEqual(snapshot["completed_count"], 5)
+            # the incomplete final artifact was never promoted
+            finals = [p for p in listing if p.endswith("-gemini-pilot.json")]
+            self.assertEqual(finals, [])
+            # all five attempts stay consumed in the campaign ledger
+            ledger = self._read(os.path.join(runs_dir,
+                                             pilot.CAMPAIGN_LEDGER_FILENAME))
+            self.assertEqual(len(ledger["reservations"]), 5)
+            self.assertTrue(all(r["outcome"]["outcome"] == "parsed"
+                                for r in ledger["reservations"]))
+            with self.assertRaises(pilot.CampaignLedgerError):
+                pilot.CampaignLedger(runs_dir).check_run_permitted(
+                    list(pilot.PILOT_CASE_IDS))
+
+    def test_successful_run_still_cleans_promoted_placeholder(self):
+        behavior = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = self._run_main_live(behavior, tmp)
+            runs_dir = self._runs_dir(tmp)
+            listing = os.listdir(runs_dir)
+            self.assertFalse([p for p in listing if p.endswith(".partial.json")])
+            finals = [p for p in listing if p.endswith("-gemini-pilot.json")]
+            self.assertEqual(len(finals), 1)
+            artifact = self._read(os.path.join(runs_dir, finals[0]))
+            self.assertEqual(artifact["artifact_version"], "3b.2")
+            self.assertEqual(len(holder.models.calls), 5)
 
 
 def _sha256(text):

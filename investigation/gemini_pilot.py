@@ -14,8 +14,10 @@ Safety gates (see run_live()):
 - STRICT abort policy: the remaining requests are aborted immediately after
   401 authentication failures, 403 permission failures, model-unavailable
   404 responses, 429 quota failures, configuration errors (including
-  unsupported generation parameters) and ambiguous transport errors, where
-  a retried or repeated request could duplicate spend;
+  unsupported generation parameters), ambiguous timeouts (408/504) and
+  ambiguous transport errors, where a retried or repeated request could
+  duplicate spend. Only qualified service-side 5xx responses keep the
+  pilot moving to the next case (still without any retry);
 - a wrong opaque-ID echo fails that case instead of guessing an assignment;
 - dry runs never read credentials or environment variables.
 
@@ -109,14 +111,19 @@ PILOT_GENERATION_SETTINGS = {
 }
 
 # Failure categories that abort ALL remaining requests (fail-closed):
-# duplicated spend or predictable repeat failures must be avoided. The two
-# leave-one-out categories (timeout, service_unavailable) came from the
-# approved Stage 3B-2 planning: a timeout or 5xx fails only that case and
-# the pilot continues to the next one; a retry would anyway be forbidden.
+# duplicated spend or predictable repeat failures must be avoided. This
+# includes AMBIGUOUS TRANSMISSION OUTCOMES — timeouts (408/504 and SDK
+# timeout exceptions) and transport errors — because a request that "timed
+# out" may in fact have been received and processed; a retry could double
+# bill, and continuing could repeat an infrastructure failure. Timeouts and
+# transport errors are ALREADY recorded as consumed campaign attempts and
+# never retried. Only qualified service-side 5xx responses remain per-case
+# failures (the pilot proceeds to the next case without a repeat request).
 ABORT_CATEGORIES = frozenset({
     "model_unavailable",       # 404 model-is-not-found for the requested ID
     "request_rejected",        # 400/401/403 errors incl. bad configuration
     "quota_limited",           # 429
+    "timeout",                 # 408/504/SDK timeouts: ambiguous transmission
     "transport_or_client_error",  # ambiguous network layer errors
 })
 
@@ -709,6 +716,29 @@ def _default_config_factory(**kwargs):
     return types.GenerateContentConfig(**kwargs)
 
 
+def _assert_live_authorization(model, case_count, budget_confirmation,
+                               opt_in=None):
+    """Every live-mode authorization gate, enforced BEFORE any campaign
+    state (ledger file, artifact placeholders) can be created or modified.
+
+    Called from both main() (before the CampaignLedger touches the
+    filesystem) and run_live() (idempotent re-check). Raises the historical
+    error types and messages; returns nothing on success.
+    """
+    if not MODEL_ID_PATTERN.fullmatch(model):
+        raise ValueError("Invalid requested model ID")
+    if case_count > MAX_PILOT_REQUESTS:
+        raise ValueError(
+            f"Pilot budget exceeded: at most {MAX_PILOT_REQUESTS} cases per run")
+    if budget_confirmation != case_count:
+        raise RuntimeError(
+            "Request budget must be explicitly confirmed as the exact case count")
+    opt_value = opt_in if opt_in is not None else _read_opt_in()
+    if opt_value != "1":
+        raise RuntimeError(
+            f"Live evaluation requires {OPT_IN_ENV}=1 operator opt-in")
+
+
 def run_live(cases, manifest, *, model=DEFAULT_MODEL,
              client_factory=None, config_factory=None, clock=time,
              opt_in=None, budget_confirmation=None,
@@ -733,18 +763,8 @@ def run_live(cases, manifest, *, model=DEFAULT_MODEL,
     aborts all remaining requests (fail-closed); NO case is ever retried and
     no model is ever substituted.
     """
-    if not MODEL_ID_PATTERN.fullmatch(model):
-        raise ValueError("Invalid requested model ID")
-    if len(cases) > MAX_PILOT_REQUESTS:
-        raise ValueError(
-            f"Pilot budget exceeded: at most {MAX_PILOT_REQUESTS} cases per run")
-    if budget_confirmation != len(cases):
-        raise RuntimeError(
-            "Request budget must be explicitly confirmed as the exact case count")
-    opt_value = opt_in if opt_in is not None else _read_opt_in()
-    if opt_value != "1":
-        raise RuntimeError(
-            f"Live evaluation requires {OPT_IN_ENV}=1 operator opt-in")
+    _assert_live_authorization(model, len(cases), budget_confirmation,
+                               opt_in)
     if not cases:
         raise ValueError("Live run requires at least one case")
 
@@ -955,6 +975,7 @@ def _write_checkpoint(checkpoint_writer, ledger, predictions, stop_reason,
         "checkpoint_version": ARTIFACT_VERSION,
         "campaign_id": campaign_id,
         "mode": "checkpoint",
+        "run_status": "running",
         "requested_model": model,
         "generated_utc": _utc_now_iso(),
         "aborted_after": stop_reason,
@@ -968,6 +989,33 @@ def _write_checkpoint(checkpoint_writer, ledger, predictions, stop_reason,
         checkpoint_writer(snapshot)
     except Exception:
         pass  # progress files are best-effort; the campaign ledger is durable
+
+
+def _clear_placeholder_or_mark(partial_path, run_status):
+    """Preserve durable checkpoints on error paths.
+
+    A genuinely EMPTY zero-byte placeholder may be removed; any non-empty
+    partial checkpoint SURVIVES with an explicit run status recorded
+    ("interrupted" or "finalization_failed"). Unreadable snapshots keep
+    their original bytes untouched.
+    """
+    try:
+        size = partial_path.stat().st_size
+    except OSError:
+        return
+    if size == 0:                 # placeholder claimed, nothing recorded yet
+        with contextlib.suppress(OSError):
+            partial_path.unlink()
+        return
+    try:
+        snapshot = json.loads(partial_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return                    # keep the recorded bytes as-is
+    if isinstance(snapshot, dict):
+        snapshot["run_status"] = run_status
+        snapshot["marked_utc"] = _utc_now_iso()
+        with contextlib.suppress(Exception):
+            _atomic_write_json(partial_path, snapshot)
 
 
 def _sanitize_version(response):
@@ -1037,9 +1085,10 @@ def build_artifact(cases, manifest, *, model, mode, ledger, predictions,
             "retained after budget assessment (small structured responses, "
             "truncation handled as per-case failure).",
             "Strict abort policy: auth (401/403), permission/configuration "
-            "errors (400), model-unavailable 404s, 429 quota errors and "
-            "ambiguous transport errors abort all remaining requests; failed "
-            "cases are never retried and models are never substituted.",
+            "errors (400), model-unavailable 404s, 429 quota errors, "
+            "ambiguous timeouts (408/504) and ambiguous transport errors "
+            "abort all remaining requests; failed cases are never retried "
+            "and models are never substituted.",
             "Campaign budget: at most five requests for the whole pilot "
             "campaign, enforced by a persistent local ledger that reserves "
             "each attempt before its request is sent.",
@@ -1105,6 +1154,11 @@ def main(argv=None):
         print(json.dumps(preview, sort_keys=True, indent=2))
         return 0
 
+    # Authorization FIRST: no campaign file may be created or modified while
+    # opt-in/request-budget/model gates are unsatisfied.
+    _assert_live_authorization(args.model, len(cases),
+                               args.confirm_request_budget)
+
     runs_dir = Path("evaluation_runs")
     # The persistent campaign ledger enforces the five-request ceiling for
     # the WHOLE pilot campaign and must pass identity/manual-review checks
@@ -1120,6 +1174,7 @@ def main(argv=None):
     partial_path = claim_exclusive_path(runs_dir / f"{stamp}-gemini-pilot.partial.json")
     final_path = claim_exclusive_path(runs_dir / f"{stamp}-gemini-pilot.json")
 
+    run_finished = False
     try:
         artifact = run_live(
             cases, governance, model=args.model,
@@ -1127,13 +1182,23 @@ def main(argv=None):
             campaign_ledger=campaign_ledger,
             checkpoint_writer=lambda snapshot: _atomic_write_json(
                 partial_path, snapshot))
+        run_finished = True
         _atomic_write_json(final_path, artifact)
     except BaseException:
-        # Release zero-byte name claims; never leave empty artifacts behind.
-        with contextlib.suppress(OSError):
-            partial_path.unlink()
-        with contextlib.suppress(OSError):
-            final_path.unlink()
+        # NEVER destroy recorded progress: a genuinely empty placeholder may
+        # be cleared, but non-empty partial checkpoints survive and record
+        # their status. The final placeholder is cleared only while it is
+        # still empty (a complete artifact was never promoted). The campaign
+        # ledger is left untouched: reserved attempts stay consumed.
+        _clear_placeholder_or_mark(
+            partial_path, "interrupted" if not run_finished
+            else "finalization_failed")
+        try:
+            if final_path.stat().st_size == 0:
+                with contextlib.suppress(OSError):
+                    final_path.unlink()
+        except OSError:
+            pass
         raise
     with contextlib.suppress(OSError):
         partial_path.unlink()
