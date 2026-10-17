@@ -8,6 +8,9 @@ labels (oracle-in-test convention; the runner itself never reads labels).
 import copy
 import json
 import os
+import re
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -89,11 +92,18 @@ class _MockModels:
         self.calls = []
 
     def generate_content(self, model, contents, config):
-        from_index = len(self.calls) + 1
         self.calls.append({"model": model, "contents": contents, "config": config,
-                           "call_number": from_index})
+                           "call_number": len(self.calls) + 1})
         # Which case is this? Find the opaque ID in the prompt.
-        opaque = next(k for k in self.behavior if f"CASE ID: {k}" in contents[0])
+        opaque = next((k for k in self.behavior
+                       if f"CASE ID: {k}" in contents[0]), None)
+        if opaque is None:
+            # Oracle-in-test default: a label-driven perfect response, so a
+            # bare mocked client still yields well-formed per-case bodies.
+            index = int(re.search(r"PILOT-(\d{2})", contents[0]).group(1)) - 1
+            case = labels()[pilot.PILOT_CASE_IDS[index]]
+            body = json.dumps(_oracle_response(case, f"PILOT-{index + 1:02d}"))
+            return _MockResponse(text=body)
         kind, payload = self.behavior[opaque]
         if kind == "raise":
             raise payload
@@ -123,7 +133,8 @@ def _mock_factories():
     return state, client_factory, config_factory
 
 
-def _run_pilot(behavior, opt_in="1", budget=5, cases_data=None, model=None):
+def _run_pilot(behavior, opt_in="1", budget=5, cases_data=None, model=None,
+               campaign_ledger=None, checkpoint_writer=None):
     cases_data = cases_data if cases_data is not None else pilot.load_pilot_cases()
     manifest = marking_metrics.load_governance()
     state, client_factory, config_factory = _mock_factories()
@@ -133,7 +144,9 @@ def _run_pilot(behavior, opt_in="1", budget=5, cases_data=None, model=None):
                               client_factory=client_factory,
                               config_factory=config_factory,
                               opt_in=opt_in,
-                              budget_confirmation=budget)
+                              budget_confirmation=budget,
+                              campaign_ledger=campaign_ledger,
+                              checkpoint_writer=checkpoint_writer)
     return state, artifact
 
 
@@ -468,7 +481,7 @@ class AdapterIntegration(unittest.TestCase):
         self.assertEqual(artifact["benchmark_sha256"], pilot.benchmark_sha256())
         self.assertEqual(artifact["governance_sha256"], pilot.governance_sha256())
         self.assertEqual(artifact["git_commit_sha"], pilot.git_head_sha())
-        self.assertEqual(artifact["artifact_version"], "3b.1")
+        self.assertEqual(artifact["artifact_version"], "3b.2")
         self.assertEqual(len(artifact["opaque_id_map"]), 5)
         self.assertEqual(artifact["max_requests"], 5)
         # schema included & uses adapter schema minus seconds
@@ -486,8 +499,14 @@ class AdapterIntegration(unittest.TestCase):
         config = state["last_config"]
         self.assertEqual(config["system_instruction"], pilot.SYSTEM_PROMPT)
         self.assertEqual(config["response_mime_type"], "application/json")
-        self.assertEqual(config["temperature"], 0.0)
+        # Stage 3B-2: temperature removed (deprecated for Gemini 3.x models);
+        # determinism comes from the explicit-rules system instruction.
+        self.assertNotIn("temperature", config)
+        self.assertNotIn("top_p", config)
+        self.assertNotIn("top_k", config)
         self.assertEqual(config["max_output_tokens"], 2048)
+        self.assertEqual(config["thinking_config"],
+                         {"thinking_level": "medium"})
         self.assertEqual(config["http_options"],
                          {"timeout": 120000, "retry_options": {"attempts": 1}})
 
@@ -515,7 +534,10 @@ class SystemInstructionDelivery(unittest.TestCase):
             self.assertEqual(call["config"]["system_instruction"],
                              case["system_prompt"])
             self.assertEqual(call["model"], pilot.DEFAULT_MODEL)
-            self.assertEqual(call["config"]["temperature"], 0.0)
+            # temperature deprecated for Gemini 3.x: never sent anymore
+            self.assertNotIn("temperature", call["config"])
+            self.assertEqual(call["config"]["thinking_config"],
+                             {"thinking_level": "medium"})
             self.assertEqual(call["config"]["max_output_tokens"], 2048)
             self.assertEqual(call["config"]["http_options"],
                              {"timeout": 120000, "retry_options": {"attempts": 1}})
@@ -552,6 +574,290 @@ class SystemInstructionDelivery(unittest.TestCase):
             expected_system = _sha256(preview_by_opaque[entry["opaque_case_id"]]["system_prompt"])
             self.assertEqual(entry["prompt_fingerprint"], expected_user)
             self.assertEqual(entry["system_prompt_fingerprint"], expected_system)
+
+
+class _CodedError(Exception):
+    """Provider-shaped exception with an HTTP code (content-free message)."""
+
+    def __init__(self, code, message="content-free provider error"):
+        super().__init__(message)
+        self.code = code
+
+
+class StrictAbortPolicy(unittest.TestCase):
+    """Stage 3B-2: auth/permission/quota/config/ambiguous errors abort."""
+
+    def _assert_stops(self, code, category):
+        behavior = {"PILOT-02": ("raise", _CodedError(code))}
+        state, artifact = _run_pilot(behavior)
+        # one success, one failure, then the remaining cases are skipped
+        self.assertEqual(len(state["client"].models.calls), 2)
+        self.assertEqual(artifact["aborted_after"], category)
+        attempted = [c for c in artifact["cases"] if c["attempted"]]
+        self.assertEqual([c["outcome"] for c in attempted],
+                         ["parsed", "failed"])
+        self.assertEqual([c["failure_category"] for c in attempted[1:]],
+                         [category])
+        skipped = [c for c in artifact["cases"] if not c["attempted"]]
+        self.assertEqual([c["failure_category"] for c in skipped],
+                         [f"aborted_after_{category}"] * 3)
+        self.assertEqual([c["outcome"] for c in skipped], ["skipped"] * 3)
+        # one model only; no substitution and no second attempt
+        self.assertEqual({c["model"] for c in state["client"].models.calls},
+                         {pilot.DEFAULT_MODEL})
+
+    def test_http_401_authentication_stops_pilot(self):
+        self._assert_stops(401, "request_rejected")
+
+    def test_http_403_permission_stops_pilot(self):
+        self._assert_stops(403, "request_rejected")
+
+    def test_http_400_configuration_error_stops_pilot(self):
+        self._assert_stops(400, "request_rejected")
+
+    def test_http_429_quota_stops_pilot(self):
+        self._assert_stops(429, "quota_limited")
+
+    def test_ambiguous_transport_error_stops_pilot_without_retry(self):
+        behavior = {"PILOT-02": ("raise", RuntimeError("connection reset"))}
+        state, artifact = _run_pilot(behavior)
+        self.assertEqual(len(state["client"].models.calls), 2)
+        self.assertEqual(artifact["aborted_after"],
+                         "transport_or_client_error")
+        # The failed case was attempted exactly once: no retry, ever.
+        case2 = [c for c in artifact["cases"]
+                 if c["case_id"] == "algebra-partial"]
+        self.assertEqual(len(case2), 1)
+        self.assertEqual(case2[0]["outcome"], "failed")
+
+    def test_service_unavailable_continues_but_never_retries(self):
+        # 5xx is outside the abort list (approved planning) and must never
+        # trigger a second request for the same case.
+        behavior = {"PILOT-02": ("raise", _CodedError(503))}
+        state, artifact = _run_pilot(behavior)
+        self.assertEqual(len(state["client"].models.calls), 5)
+        self.assertIsNone(artifact["aborted_after"])
+        counts = {}
+        for call in state["client"].models.calls:
+            counts[call["model"]] = counts.get(call["model"], 0) + 1
+        self.assertEqual(counts, {pilot.DEFAULT_MODEL: 5})
+
+    def test_timeout_continues_but_never_retries(self):
+        behavior = {"PILOT-02": ("raise", TimeoutError())}
+        state, artifact = _run_pilot(behavior)
+        self.assertEqual(len(state["client"].models.calls), 5)
+        self.assertIsNone(artifact["aborted_after"])
+
+
+class GenerationSettingsTests(unittest.TestCase):
+    """Stage 3B-2: no temperature; explicit medium thinking; SDK-compatible."""
+
+    def test_no_sampling_parameter_reaches_any_request(self):
+        state, artifact = _run_pilot({})
+        for call in state["client"].models.calls:
+            self.assertNotIn("temperature", call["config"])
+            self.assertNotIn("top_p", call["config"])
+            self.assertNotIn("top_k", call["config"])
+
+    def test_dry_run_preview_carries_no_temperature(self):
+        preview = pilot.build_preview()
+        self.assertNotIn("temperature", json.dumps(preview))
+        self.assertEqual(preview["live_gates"]["explicit_thinking_level"],
+                         "medium")
+
+    def test_installed_sdk_constructs_the_exact_config_offline(self):
+        # Offline construction only (no request): proves the runner's exact
+        # kwargs are valid for the installed google-genai package, including
+        # dict-form thinking_config coercion.
+        from google.genai import types
+        config = types.GenerateContentConfig(
+            system_instruction=pilot.SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=pilot.evaluation_response_schema(),
+            **pilot.PILOT_GENERATION_SETTINGS,
+            http_options={"timeout": 120000, "retry_options": {"attempts": 1}},
+        )
+        self.assertIs(config.thinking_config.thinking_level,
+                      types.ThinkingLevel.MEDIUM)
+        self.assertIsNone(config.temperature)
+        self.assertEqual(config.max_output_tokens, 2048)
+        self.assertEqual(config.http_options.retry_options.attempts, 1)
+
+
+class CampaignBudgetTests(unittest.TestCase):
+    """Persistent ledger: five requests for the whole campaign, not per run."""
+
+    def _fresh_ledger(self, directory):
+        ledger = pilot.CampaignLedger(directory)
+        ledger.ensure_openable()
+        return ledger
+
+    def test_campaign_budget_shared_across_two_consecutive_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            state1, artifact = _run_pilot({}, campaign_ledger=ledger)
+            self.assertEqual(ledger.count_used(), 5)
+            self.assertEqual(artifact["campaign_requests_used"], 5)
+            self.assertEqual(artifact["campaign_requests_remaining"], 0)
+            with self.assertRaises(pilot.CampaignLedgerError):
+                _run_pilot({}, campaign_ledger=ledger)
+        # a truly independent ledger starts fresh: the refusal was campaign
+        # state, not a code-level constant
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger2 = self._fresh_ledger(tmp)
+            state2, artifact2 = _run_pilot({}, campaign_ledger=ledger2)
+            self.assertEqual(artifact2["campaign_requests_used"], 5)
+
+    def test_attempted_cases_cannot_replay_accidentally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            ledger.reserve("algebra-correct", "PILOT-01")
+            # the run refuses EITHER because the budget is short or because
+            # a listed case was already attempted — both fail closed
+            with self.assertRaises(pilot.CampaignLedgerError) as ctx:
+                _run_pilot({}, campaign_ledger=ledger)
+            self.assertRegex(str(ctx.exception),
+                             r"(replay refused|budget exhausted)")
+
+    def test_hard_ceiling_of_five_across_the_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            for i in range(5):
+                ledger.reserve(f"other-benchmark-case-{i}",
+                               f"PILOT-{i + 1:02d}")
+            self.assertEqual(ledger.count_remaining(), 0)
+            with self.assertRaises(pilot.CampaignLedgerError):
+                ledger.reserve("one-more-case", "PILOT-06")
+            with self.assertRaises(pilot.CampaignLedgerError):
+                _run_pilot({}, campaign_ledger=ledger)
+
+    def test_concurrent_launches_cannot_exceed_the_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            barrier = threading.Barrier(8)
+            allowed, refused = [], []
+            def worker(index):
+                barrier.wait()
+                try:
+                    ledger.reserve(f"case-{index}", f"PILOT-{index:02d}")
+                    allowed.append(index)
+                except pilot.CampaignLedgerError:
+                    refused.append(index)
+            threads = [threading.Thread(target=worker, args=(i,))
+                       for i in range(8)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            self.assertEqual(len(allowed), 5)
+            self.assertEqual(len(refused), 3)
+            self.assertEqual(ledger.count_used(), 5)
+
+    def test_interrupted_run_attempts_stay_consumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            # simulate a process death between reserve and complete:
+            ledger.reserve("algebra-correct", "PILOT-01")
+            # a new process re-opens the same ledger directory:
+            reopened = pilot.CampaignLedger(tmp)
+            with self.assertRaises(pilot.CampaignLedgerError):
+                reopened.check_run_permitted(
+                    [c for c in pilot.PILOT_CASE_IDS])
+
+    def test_ledger_identity_mismatch_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = self._fresh_ledger(tmp)
+            forged = json.loads(ledger.path.read_text(encoding="utf-8"))
+            forged["campaign_id"] = "someone-elses-campaign"
+            pilot._atomic_write_json(ledger.path, forged)
+            reopened = pilot.CampaignLedger(tmp)
+            with self.assertRaises(pilot.CampaignLedgerError):
+                reopened.check_run_permitted(list(pilot.PILOT_CASE_IDS))
+
+    def test_missing_ledger_with_existing_artifacts_refuses_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # a previous live artifact exists (a completed run) ...
+            pilot._atomic_write_json(
+                os.path.join(tmp, "20260101T000000Z-gemini-pilot.json"),
+                {"artifact_version": "3b.2", "mode": "live"})
+            # ... but the ledger is gone (deleted/copy mistake). No silent
+            # restart: the runner demands manual review instead.
+            reopened = pilot.CampaignLedger(tmp)
+            with self.assertRaises(pilot.CampaignLedgerError) as ctx:
+                reopened.check_run_permitted(list(pilot.PILOT_CASE_IDS))
+            self.assertIn("manual review required", str(ctx.exception))
+
+    def test_fresh_ledger_without_artifacts_is_openable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = pilot.CampaignLedger(tmp)
+            ledger.check_run_permitted(list(pilot.PILOT_CASE_IDS))
+            self.assertEqual(ledger.count_remaining(), 5)
+
+
+class ArtifactSafetyTests(unittest.TestCase):
+    def test_claim_exclusive_path_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "20260101T000000Z-gemini-pilot.json")
+            pilot._atomic_write_json(base, {"previous": True})
+            claimed = pilot.claim_exclusive_path(
+                os.path.join(tmp, "20260101T000000Z-gemini-pilot.json"))
+            self.assertNotEqual(os.path.abspath(str(claimed)),
+                                os.path.abspath(base))
+            self.assertTrue(claimed.name.startswith(
+                "20260101T000000Z-gemini-pilot"))
+            self.assertTrue(str(claimed).endswith(".json"))
+            self.assertEqual(json.loads(open(base, encoding="utf-8").read()),
+                             {"previous": True})
+
+    def test_atomic_write_json_is_durable_and_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "artifact.json")
+            pilot._atomic_write_json(target, {"n": 1})
+            pilot._atomic_write_json(target, {"n": 2})
+            self.assertEqual(json.loads(open(target, encoding="utf-8").read()),
+                             {"n": 2})
+            leftovers = [f for f in os.listdir(tmp) if ".tmp" in f]
+            self.assertEqual(leftovers, [])
+
+    def test_checkpoint_recorded_after_every_attempted_case(self):
+        snapshots = []
+        behavior = {"PILOT-03": ("raise", _CodedError(429))}
+        state, artifact = _run_pilot(behavior, checkpoint_writer=snapshots.append)
+        aborted_index = 3        # PILOT-03 = third case
+        self.assertEqual(len(snapshots), aborted_index)
+        for order, snapshot in enumerate(snapshots):
+            self.assertEqual(snapshot["attempted_count"], order + 1)
+        self.assertEqual(snapshots[-1]["attempted_count"], 3)
+        self.assertEqual(snapshots[-1]["skipped_count"], 0)
+        self.assertEqual(snapshots[-1]["aborted_after"], "quota_limited")
+        self.assertEqual(snapshots[-1]["completed_count"], 2)
+        # skipped cases are recorded in the final artifact, separately:
+        self.assertEqual([c["outcome"] for c in artifact["cases"]],
+                         ["parsed", "parsed", "failed",
+                          "skipped", "skipped"])
+        self.assertEqual([c["failure_category"] for c in artifact["cases"]
+                          if c["outcome"] == "skipped"],
+                         ["aborted_after_quota_limited"] * 2)
+        # snapshots grow monotonically and never shrink
+        self.assertEqual([s["attempted_count"] for s in snapshots],
+                         [1, 2, 3])
+
+    def test_checkpoints_and_artifact_never_leak_provider_messages(self):
+        canary = "SECRET-CANARY-DO-NOT-LEAK"
+        snapshots = []
+        behavior = {"PILOT-01": ("raise", _CodedError(401,
+                                                      message=canary))}
+        try:
+            _run_pilot(behavior, checkpoint_writer=snapshots.append)
+        except Exception as exc:
+            self.fail(f"run_live must classify errors, not raise them: {exc}")
+        chained = json.dumps(snapshots)
+        self.assertNotIn(canary, chained)
+
+    def test_no_secrets_or_env_values_in_artifacts(self):
+        state, artifact = _run_pilot({})
+        blob = json.dumps(artifact)
+        self.assertNotIn("GEMINI_API_KEY", blob)
+        self.assertNotIn("api_key", blob.lower())
+        self.assertNotIn(OPTIN_VALUE := "MATH_MARKER_EVAL_OPT_IN", blob)
 
 
 def _sha256(text):
