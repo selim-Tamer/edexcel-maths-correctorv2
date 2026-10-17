@@ -13,6 +13,497 @@
     {"id":"statistics-arithmetic","topic":"statistics","question":"Values 0,1,2,3,4 have frequencies 5,6,2,3,2. Find their weighted total.","student":"0x5 + 1x6 + 2x2 + 3x3 + 4x2 = 29","scheme":[{"id": "crit-stat-a-1", "weight": 1, "code":"M1","criterion":"Correct sum of value-frequency products."},{"id": "crit-stat-a-2", "weight": 1, "code":"A1","criterion":"Weighted total 27."}],"expected":[true,false],"uncertain":false,"derivation":"0+6+4+9+8=27. Preserve the valid method."},
     {"id":"rounding","topic":"multi-step","question":"Convert 1690 seconds to minutes, to 1 decimal place.","student":"1690/60 = 28.16... = 28.2 minutes","scheme":[{"id": "crit-rnd-1", "weight": 1, "code":"M1","criterion":"Divide by 60."},{"id": "crit-rnd-2", "weight": 1, "code":"A1","criterion":"28.2 minutes to one decimal place."}],"expected":[true,true],"uncertain":false,"derivation":"28.16666... rounds to 28.2; ellipsis is an approximation."},
     {"id":"follow-through","topic":"multi-step","question":"A rectangle is 5 by 4 cm. Find its area, then double that area.","student":"A=5x4=18 cm^2; double area=2x18=36 cm^2","scheme":[{"id": "crit-ft-1", "weight": 1, "code":"M1","criterion":"Multiply 5 by 4."},{"id": "crit-ft-2", "weight": 1, "code":"A1","criterion":"Area 20 cm^2."},{"id": "crit-ft-3", "weight": 1, "code":"A1ft","criterion":"Double the student's stated area correctly; explicitly allow follow-through."}],"expected":[true,false,true],"uncertain":false,"derivation":"5*4=20 but 2*18=36 correctly follows their error."},
-    {"id":"unreadable-final","topic":"algebra","question":"Solve 2x + 3 = 11.","student":"2x = 8; x = [final digit illegible]","scheme":[{"id": "crit-unr-1", "weight": 1, "code":"M1","criterion":"Correct rearrangement to 2x=8."},{"id": "crit-unr-2", "weight": 1, "code":"A1","criterion":"Legible x=4 supported by working."}],"expected":[true,null],"uncertain":true,"derivation":"M1 is supported. A1 cannot be adjudicated from this synthetic transcription; exclude it from score agreement and require review."}
+    {"id":"unreadable-final","topic":"algebra","question":"Solve 2x + 3 = 11.","student":"2x = 8; x = [final digit illegible]","scheme":[{"id": "crit-unr-1", "weight": 1, "code":"M1","criterion":"Correct rearrangement to 2x=8."},{"id": "crit-unr-2", "weight": 1, "code":"A1","criterion":"Legible x=4 supported by working."}],"expected":[true,null],"uncertain":true,"derivation":"M1 is supported. A1 cannot be adjudicated from this synthetic transcription; exclude it from score agreement and require review."},
+    {
+        "id": "simultaneous-equations-ecf",
+        "topic": "algebra",
+        "question": "Solve the simultaneous equations: 2x + y = 7 and x - y = 5.",
+        "student": "Add them: 3x = 13 so x = 13/3. Sub: 13/3 - y = 5, so y = 13/3 - 15/3 = -2/3.",
+        "scheme": [
+            {
+                "id": "crit-sim-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Valid attempt to eliminate one variable (e.g., adding the equations)."
+            },
+            {
+                "id": "crit-sim-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "x = 4 or y = -1."
+            },
+            {
+                "id": "crit-sim-3",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Substitute their found variable into either equation. Dependent on earning crit-sim-1."
+            },
+            {
+                "id": "crit-sim-4",
+                "code": "A1ft",
+                "weight": 1,
+                "criterion": "Correctly solve for the second variable from their incorrect first variable. Dependent on earning crit-sim-3."
+            }
+        ],
+        "expected": [
+            true,
+            false,
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: (2x+y) + (x-y) = 7+5 -> 3x = 12 -> x=4. Sub x=4 into x-y=5 -> 4-y=5 -> y=-1. Student check: 7+5=13 is an arithmetic error. 13/3 - y = 5 -> y = 13/3 - 15/3 = -2/3 is algebraically perfect based on the error. Assessment: crit-sim-1 (M1) is awarded because adding equations is a valid elimination method. crit-sim-2 (A1) is withheld due to the arithmetic error. crit-sim-3 (M1) is awarded because substitution of their x relies on a valid prior method. crit-sim-4 (A1ft) is awarded. Under this synthetic rubric, A1ft is appropriate because the student applied completely correct mathematical logic to follow through on an intermediate value tainted only by a prior arithmetic mistake."
+    },
+    {
+        "id": "cosine-rule-premature-rounding",
+        "topic": "trigonometry",
+        "question": "In triangle ABC, AB = 8 cm, BC = 7 cm, and angle ABC = 40°. Calculate the length of AC to 2 decimal places.",
+        "student": "AC^2 = 8^2 + 7^2 - 2(8)(7)cos(40). cos(40) = 0.77. AC^2 = 64 + 49 - 112(0.77) = 113 - 86.24 = 26.76. AC = sqrt(26.76) = 5.17 cm.",
+        "scheme": [
+            {
+                "id": "crit-cos-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Correct use of the cosine rule: 8^2 + 7^2 - 2(8)(7)cos(40)."
+            },
+            {
+                "id": "crit-cos-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "5.22. Do not accept 5.21 or other rounded variants without a documented tolerance."
+            }
+        ],
+        "expected": [
+            true,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: AC^2 = 8^2 + 7^2 - 2(8)(7)cos(40) = 113 - 112(0.7660444...) = 27.20302... -> AC = 5.21565... which rounds exactly to 5.22. Student check: 112*0.77 = 86.24; 113 - 86.24 = 26.76; sqrt(26.76) = 5.1730... The student's intermediate arithmetic is perfectly calculated for their prematurely rounded cosine value. Assessment: crit-cos-1 (M1) is awarded for correct substitution into the formula. crit-cos-2 (A1) is withheld. The final answer (5.17) is mathematically incorrect due to premature rounding, failing the required 2 d.p. accuracy. Verified mathematically."
+    },
+    {
+        "id": "cylinder-volume-exact-form",
+        "topic": "geometry",
+        "question": "Calculate the volume of a cylinder with radius 3 cm and height 10 cm.",
+        "student": "Volume = pi * 3^2 * 10 = 90pi.",
+        "scheme": [
+            {
+                "id": "crit-vol-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "pi * 3^2 * 10."
+            },
+            {
+                "id": "crit-vol-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "90pi or 282.74..."
+            }
+        ],
+        "expected": [
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: V = pi * r^2 * h = pi * 9 * 10 = 90pi. Exact decimal equivalent: 282.743338823... Student check: 90pi is mathematically exact. Assessment: crit-vol-1 (M1) awarded for correct volume formula. crit-vol-2 (A1) awarded because 90pi is a correct equivalent form. Provisional note: Award relies on the assumption that Pearson does not penalize exact pi forms unless a specific decimal/sig-fig format is strictly commanded by the question."
+    },
+    {
+        "id": "probability-isw",
+        "topic": "probability",
+        "question": "A bag contains 4 red balls and 6 blue balls. One ball is chosen at random. Find the probability it is red.",
+        "student": "P(Red) = 4/10. This simplifies to 2/3.",
+        "scheme": [
+            {
+                "id": "crit-prob-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Numerator 4 or denominator 10."
+            },
+            {
+                "id": "crit-prob-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "4/10 or 2/5 or 0.4."
+            }
+        ],
+        "expected": [
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: 4 / (4+6) = 4/10 = 2/5. Student check: 4/10 is correct. The arithmetic simplification 4/10 = 2/3 is incorrect. Assessment: crit-prob-1 (M1) awarded. crit-prob-2 (A1) expected award is Provisional. While Pearson generally applies ISW (Ignore Subsequent Working) to incorrectly cancelled probability fractions once a correct probability is seen, this specific A1 award remains provisionally true pending strict confirmation from a 4MA1 mark scheme."
+    },
+    {
+        "id": "mean-via-median-method",
+        "topic": "statistics",
+        "question": "Find the mean of these five numbers: 2, 4, 6, 8, 10.",
+        "student": "The middle number is 6, so the mean is 6.",
+        "scheme": [
+            {
+                "id": "crit-mean-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "(2 + 4 + 6 + 8 + 10) / 5 or 30 / 5."
+            },
+            {
+                "id": "crit-mean-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "6. Dependent on earning crit-mean-1."
+            }
+        ],
+        "expected": [
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: Mean = 30/5 = 6. Median = 6. Student check: Student explicitly calculated the median. Assessment: crit-mean-1 (M1) is withheld (Method Eligibility = 0) because calculating the median is not a valid method for finding the mean. crit-mean-2 (A1) is withheld (Answer Eligibility = 0). Under Pearson rules, an A mark typically depends on earning the M mark. Furthermore, the rule 'Correct answers obtained from clearly invalid working score 0' overrides the fact that 6 is numerically correct. This outcome does not apply universally; if the student had simply written '6' with NO working, implied method marks might allow full credit. Because invalid working was explicitly shown, it invalidates the answer. Provisional rubric note applied."
+    },
+    {
+        "id": "inequalities-conceptual-error",
+        "topic": "algebra",
+        "question": "Solve the inequality 5 - 2x > 11.",
+        "student": "5 - 2x > 11 => -2x > 6 => x > -3",
+        "scheme": [
+            {
+                "id": "crit-ineq-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Isolate the x term, reaching -2x > 6 or 2x < -6."
+            },
+            {
+                "id": "crit-ineq-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "x < -3"
+            }
+        ],
+        "expected": [
+            true,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: -2x > 6 requires dividing by -2, which flips the inequality sign to x < -3. Student check: The student isolated the term correctly but failed to flip the sign. Assessment: crit-ineq-1 (M1) awarded for valid isolation step. crit-ineq-2 (A1) withheld due to conceptual algebraic error. ISW does not apply to fundamental errors in algebraic manipulation."
+    },
+    {
+        "id": "trigonometry-alternative-method",
+        "topic": "trigonometry",
+        "question": "In triangle PQR, angle PQR = 90 degrees, PQ = 5 cm, and angle PRQ = 30 degrees. Find the length of PR.",
+        "student": "Using Sine Rule: PR / sin(90) = 5 / sin(30). So PR = 5 * 1 / 0.5 = 10.",
+        "scheme": [
+            {
+                "id": "crit-trig2-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Valid trigonometric ratio setup (e.g., sin(30) = 5 / PR or PR / sin(90) = 5 / sin(30))."
+            },
+            {
+                "id": "crit-trig2-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "10"
+            }
+        ],
+        "expected": [
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: sin(30) = 5 / PR -> PR = 10. Student check: The sine rule is applied correctly to a right-angled triangle. Assessment: crit-trig2-1 (M1) and crit-trig2-2 (A1) awarded. Valid alternative mathematical methods must be credited fully."
+    },
+    {
+        "id": "quadratics-dependent-method",
+        "topic": "algebra",
+        "question": "Solve x^2 - 5x + 6 = 0 by factorising.",
+        "student": "x^2 - 5x + 6 = 0, so x=2 or x=3.",
+        "scheme": [
+            {
+                "id": "crit-quad-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Correct factorisation to (x-2)(x-3)."
+            },
+            {
+                "id": "crit-quad-2",
+                "code": "dM1",
+                "weight": 1,
+                "criterion": "Solve their factors to find x. Dependent on earning crit-quad-1."
+            },
+            {
+                "id": "crit-quad-3",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "x=2 and x=3"
+            }
+        ],
+        "expected": [
+            false,
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: (x-2)(x-3) = 0 -> x=2, x=3. Student check: The correct final answers are provided without the explicitly commanded working ('by factorising'). Assessment: crit-quad-1 (M1) withheld because no factorisation is shown. crit-quad-2 (dM1) strictly withheld because its prerequisite M1 was not earned. crit-quad-3 (A1) withheld because the correct answer stems from missing mandatory working. Provisional note: Awarding zero marks for an unsupported correct answer here is enforced as a provisional synthetic rubric for benchmark testing, simulating strict method-command enforcement."
+    },
+    {
+        "id": "expanding-partial-multi-mark",
+        "topic": "algebra",
+        "question": "Expand and simplify 3(x + 4) - 2(x - 5).",
+        "student": "3x + 12 - 2x - 10 = x + 2",
+        "scheme": [
+            {
+                "id": "crit-exp-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Expand at least one bracket correctly (e.g., 3x + 12 or -2x + 10)."
+            },
+            {
+                "id": "crit-exp-2",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Expand both brackets correctly to get all 4 terms with correct signs."
+            },
+            {
+                "id": "crit-exp-3",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "x + 22"
+            }
+        ],
+        "expected": [
+            true,
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: 3x + 12 - 2x + 10 = x + 22. Student check: 3x + 12 is correct. -2x - 10 contains a sign error. Assessment: crit-exp-1 (M1) awarded for one correct expansion. crit-exp-2 (M1) withheld due to the sign error on the second expansion. crit-exp-3 (A1) withheld as final answer is wrong. Provisional note: Splitting an M2 block into two M1 criteria to support evaluator schema limitations."
+    },
+    {
+        "id": "probability-tree-arithmetic-error",
+        "topic": "probability",
+        "question": "The probability of rain is 0.3. If it rains, the probability the bus is late is 0.8. If it does not rain, the probability the bus is late is 0.1. Find the probability the bus is late.",
+        "student": "(0.3 * 0.8) + (0.7 * 0.1) = 0.24 + 0.7 = 0.94",
+        "scheme": [
+            {
+                "id": "crit-tree-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Identify correct products: 0.3 * 0.8 or 0.7 * 0.1."
+            },
+            {
+                "id": "crit-tree-2",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Add their two probability branch products together, even if a product was evaluated incorrectly."
+            },
+            {
+                "id": "crit-tree-3",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "0.31"
+            }
+        ],
+        "expected": [
+            true,
+            true,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: P(Late) = (0.3*0.8) + (0.7*0.1) = 0.24 + 0.07 = 0.31. Student check: The method is perfectly set up, but 0.7 * 0.1 is miscalculated as 0.7. Assessment: Both method marks (crit-tree-1, crit-tree-2) awarded for demonstrating the fully correct probability logic, as combining the evaluated branches explicitly satisfies the second method step. crit-tree-3 (A1) withheld due to the subsequent arithmetic slip."
+    },
+    {
+        "id": "geometry-area-crossed-out",
+        "topic": "geometry",
+        "question": "Calculate the area of a circle with radius 5 cm. Give your answer to 1 decimal place.",
+        "student": "[Crossed out text: Area = pi * 5^2 = 78.5]",
+        "scheme": [
+            {
+                "id": "crit-circ-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Use pi * 5^2 or 25pi."
+            },
+            {
+                "id": "crit-circ-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "78.5. Dependent on earning crit-circ-1."
+            }
+        ],
+        "expected": [
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: Area = pi * r^2 = pi * 25 = 78.5398... which rounds to 78.5. Student check: The student wrote the exact correct method and answer, but crossed it out. Assessment: crit-circ-1 (M1) and crit-circ-2 (A1) are both awarded. Official Pearson guidance states: 'Crossed out work should be marked UNLESS the candidate has replaced it with an alternative response.' Since no replacement exists, the crossed-out work is fully credited. Mathematically and procedurally verified."
+    },
+    {
+        "id": "geometry-conflicting-methods",
+        "topic": "geometry",
+        "question": "Find the perimeter of a rectangle with length 8 cm and width 3 cm.",
+        "student": "Attempt 1: 8 + 3 = 11. OR Attempt 2: 8 + 8 + 3 + 3 = 22.",
+        "scheme": [
+            {
+                "id": "crit-rect-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Valid method for perimeter (e.g., 2*(8+3) or 8+8+3+3)."
+            },
+            {
+                "id": "crit-rect-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "22. Dependent on earning crit-rect-1."
+            }
+        ],
+        "expected": [
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: Perimeter = 2*(8+3) = 22. Attempt 1 is wrong (calculates semi-perimeter). Attempt 2 is correct. Assessment: crit-rect-1 (M1) and crit-rect-2 (A1) are withheld. Official Pearson 4MA1 guidance dictates: 'If there is a choice of methods shown, then mark the method that leads to the answer on the answer line; where no answer is given on the answer line, award the lowest mark from the methods shown.' Because the synthetic format lacks an answer line, the lowest mark (Attempt 1: 0 marks) is awarded. Provisional synthetic rubric noted."
+    },
+    {
+        "id": "percentages-correct-no-working",
+        "topic": "number",
+        "question": "Calculate 15% of $80.",
+        "student": "12",
+        "scheme": [
+            {
+                "id": "crit-perc-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "0.15 * 80 or equivalent method."
+            },
+            {
+                "id": "crit-perc-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "12"
+            }
+        ],
+        "expected": [
+            true,
+            true
+        ],
+        "uncertain": false,
+        "derivation": "Math check: 0.15 * 80 = 12. Student check: The correct answer is present with no working. Assessment: crit-perc-1 (M1) and crit-perc-2 (A1) are both awarded. Official Pearson guidance states: 'If no working is shown then correct answers normally score full marks.' Because the question does not mandate working, the correct final answer earns the implied method mark."
+    },
+    {
+        "id": "indices-correct-no-working-demanded",
+        "topic": "algebra",
+        "question": "Show that (a^3)^4 / a^2 = a^10. You must show all your working.",
+        "student": "a^10",
+        "scheme": [
+            {
+                "id": "crit-ind-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Simplify the numerator to a^12."
+            },
+            {
+                "id": "crit-ind-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "Show a^12 / a^2 = a^10. Dependent on earning crit-ind-1."
+            }
+        ],
+        "expected": [
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: (a^3)^4 = a^12. Then a^12 / a^2 = a^(12-2) = a^10. Student check: The final answer is merely repeated. Assessment: crit-ind-1 (M1) is withheld because the intermediate algebraic step is missing. crit-ind-2 (A1) is withheld. The prompt explicitly commands 'You must show all your working' (and is a 'Show that' question, meaning the answer is already given). A naked answer here earns zero marks. Verified mathematically and procedurally."
+    },
+    {
+        "id": "speed-ambiguous-handwriting",
+        "topic": "number",
+        "question": "A car travels 120 km in 2.5 hours. Calculate its average speed in km/h.",
+        "student": "120 / 2.5 = [illegible digit]8",
+        "scheme": [
+            {
+                "id": "crit-spd-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "120 / 2.5"
+            },
+            {
+                "id": "crit-spd-2",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "48. Dependent on earning crit-spd-1."
+            }
+        ],
+        "expected": [
+            true,
+            null
+        ],
+        "uncertain": true,
+        "derivation": "Math check: Speed = D / T = 120 / 2.5 = 48. Student check: The method '120 / 2.5' is clearly visible. The final answer's tens digit cannot be read. Assessment: crit-spd-1 (M1) is awarded for the visible correct method. crit-spd-2 (A1) expected award is set to null and uncertain is set to true. This represents a genuinely unresolved marking decision; the AI must not guess the illegible digit and must flag the paper for human teacher review."
+    },
+    {
+        "id": "grouped-mean-dependent-steps",
+        "topic": "statistics",
+        "question": "The table shows the time t (mins) spent by 20 students. 0 < t <= 10 (freq 4), 10 < t <= 20 (freq 10), 20 < t <= 30 (freq 6). Estimate the mean time.",
+        "student": "150 + 150 + 20 = 320. 320 / 3 = 106.6.",
+        "scheme": [
+            {
+                "id": "crit-grp-1",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Find midpoints (5, 15, 25) and multiply by frequencies. Implied by at least two correct products (20, 150, 150)."
+            },
+            {
+                "id": "crit-grp-2",
+                "code": "dM1",
+                "weight": 1,
+                "criterion": "Divide sum of their products by 20. Dependent on earning crit-grp-1."
+            },
+            {
+                "id": "crit-grp-3",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "16"
+            }
+        ],
+        "expected": [
+            true,
+            false,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: Products = 5*4=20, 15*10=150, 25*6=150. Sum = 320. Mean = 320 / 20 = 16. Student check: The student correctly found the sum of the products (320), implying the correct midpoint method. However, they divided by the number of classes (3) instead of total frequency (20). Assessment: crit-grp-1 (M1) awarded for correct implied products. crit-grp-2 (dM1) withheld because they divided by 3, not 20. crit-grp-3 (A1) withheld due to incorrect final answer."
+    },
+    {
+        "id": "fractions-independent-b-marks",
+        "topic": "number",
+        "question": "Write 3 1/4 as an improper fraction. Then calculate 3 1/4 * 2/5, giving your answer in its simplest form.",
+        "student": "3 1/4 = 13/4. 13/4 * 2/5 = 26/20. Done.",
+        "scheme": [
+            {
+                "id": "crit-frac-1",
+                "code": "B1",
+                "weight": 1,
+                "criterion": "13/4 stated independently."
+            },
+            {
+                "id": "crit-frac-2",
+                "code": "M1",
+                "weight": 1,
+                "criterion": "Multiply numerators and denominators (e.g., 26/20 or 13*2 / 4*5)."
+            },
+            {
+                "id": "crit-frac-3",
+                "code": "A1",
+                "weight": 1,
+                "criterion": "13/10 or 1 3/10."
+            }
+        ],
+        "expected": [
+            true,
+            true,
+            false
+        ],
+        "uncertain": false,
+        "derivation": "Math check: 3 1/4 = 13/4. 13/4 * 2/5 = 26/20 = 13/10. Student check: The student correctly converted the fraction and multiplied them, but failed to simplify. Assessment: crit-frac-1 (B1) awarded independently for 13/4. crit-frac-2 (M1) awarded for valid multiplication. crit-frac-3 (A1) withheld because the prompt explicitly demands the 'simplest form'."
+    }
   ]
 }
