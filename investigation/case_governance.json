@@ -1,0 +1,41 @@
+{
+  "version": "1.0",
+  "provenance": "Offline synthetic benchmark governance documentation. No student identities or private data. Classifications record the provenance of the synthetic reference decisions; none of the cases constitutes an officially verified Pearson marking decision.",
+  "definitions": {
+    "synthetic_unambiguous": "The expected award follows from standard Edexcel 4MA1 marking conventions stated explicitly in the case derivation, with no documented contestable policy assumption. Still synthetic and subject to moderation; not an official verdict.",
+    "synthetic_provisional_rubric": "The expected award depends on a documented synthetic policy assumption (e.g. ISW application, exact-pi acceptance, crossed-out-work credit, implied-method crediting, strict no-working zero, lowest-mark selection, or artificial M2 splitting). Reported separately; must not be presented as verified Pearson outcomes.",
+    "human_review_required": "The case contains gold-null (unresolved) criteria that cannot be adjudicated from the synthetic transcription; requires teacher moderation before any accuracy claim."
+  },
+  "cases": {
+    "algebra-correct": {"classification": "synthetic_unambiguous"},
+    "algebra-partial": {"classification": "synthetic_unambiguous"},
+    "algebra-invalid-method": {"classification": "synthetic_provisional_rubric", "assumption": "Explicitly shown invalid working suppresses the numerically correct answer under this synthetic rubric"},
+    "algebra-alternative": {"classification": "synthetic_unambiguous"},
+    "geometry-area": {"classification": "synthetic_unambiguous"},
+    "geometry-wrong": {"classification": "synthetic_unambiguous"},
+    "trigonometry": {"classification": "synthetic_unambiguous"},
+    "graphs-gradient": {"classification": "synthetic_unambiguous"},
+    "statistics-grouping": {"classification": "synthetic_unambiguous"},
+    "statistics-arithmetic": {"classification": "synthetic_unambiguous"},
+    "rounding": {"classification": "synthetic_unambiguous"},
+    "follow-through": {"classification": "synthetic_unambiguous"},
+    "unreadable-final": {"classification": "human_review_required", "assumption": "Gold-null A1 criterion requires teacher transcription review"},
+    "simultaneous-equations-ecf": {"classification": "synthetic_unambiguous"},
+    "cosine-rule-premature-rounding": {"classification": "synthetic_unambiguous"},
+    "cylinder-volume-exact-form": {"classification": "synthetic_provisional_rubric", "assumption": "Exact pi form accepted unless decimal/sig-fig commanded; not yet confirmed against 4MA1 scheme"},
+    "probability-isw": {"classification": "synthetic_provisional_rubric", "assumption": "ISW applied to post-hoc incorrect simplification pending strict 4MA1 scheme confirmation"},
+    "mean-via-median-method": {"classification": "synthetic_provisional_rubric", "assumption": "Explicitly shown invalid method suppresses numerically correct answer"},
+    "inequalities-conceptual-error": {"classification": "synthetic_unambiguous"},
+    "trigonometry-alternative-method": {"classification": "synthetic_unambiguous"},
+    "quadratics-dependent-method": {"classification": "synthetic_provisional_rubric", "assumption": "Deliberately strict zero for commanded-but-missing working; simulates strict enforcement, not a verified Pearson decision"},
+    "expanding-partial-multi-mark": {"classification": "synthetic_provisional_rubric", "assumption": "M2 block split into two M1 criteria for evaluator schema"},
+    "probability-tree-arithmetic-error": {"classification": "synthetic_unambiguous"},
+    "geometry-area-crossed-out": {"classification": "synthetic_provisional_rubric", "assumption": "Crossed-out work credited because no replacement was given"},
+    "geometry-conflicting-methods": {"classification": "synthetic_provisional_rubric", "assumption": "Lowest-mark rule applied because no answer line exists in the synthetic format"},
+    "percentages-correct-no-working": {"classification": "synthetic_provisional_rubric", "assumption": "Implied method mark credited for bare correct answer without mandated working"},
+    "indices-correct-no-working-demanded": {"classification": "synthetic_provisional_rubric", "assumption": "Strict zero for bare answer on explicitly commanded working question"},
+    "speed-ambiguous-handwriting": {"classification": "human_review_required", "assumption": "Gold-null A1 criterion requires teacher digit review"},
+    "grouped-mean-dependent-steps": {"classification": "synthetic_unambiguous"},
+    "fractions-independent-b-marks": {"classification": "synthetic_unambiguous"}
+  }
+}
