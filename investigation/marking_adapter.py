@@ -42,22 +42,29 @@ Alignment and validation rules (fail-safe, never guessing):
 - Award values are NEVER inferred from reasons, totals or mark codes.
 - Missing awards are NEVER substituted with False. (An explicit model "false"
   award is data; an absent row is an incomplete answer.)
-- Unknown/unreadable decisions: a row may declare "unknown": true. The adapter
-  REQUIRES the response to also carry "uncertain": true in that case and emits
-  {"awarded": False} for that row while recording its ID in the prediction's
-  "declared_unknown" key (ignored by the evaluator, used for reporting).
+- Unknown/unreadable decisions use ONE strict representation: a row declares
+  `"unknown": true` together with the canonical pair `"awarded": false`. Any
+  combination of `unknown: true` with `awarded: true` is a contradiction and
+  converts the response to a failed prediction (`unknown_award_contradiction`);
+  it is never silently converted into a correct or incorrect marking decision
+  in either direction. An unknown row missing the awarded field fails with
+  `missing_award_field` (the flag pair must be explicit). For every accepted
+  unknown row the adapter deterministically emits the award {"awarded": false}
+  and records the criterion ID in the prediction's "declared_unknown" key
+  (ignored by the evaluator, used for reporting).
 
-Known evaluator limitation (approved for documentation in Stage 1 report):
-  accuracy.evaluate expresses uncertainty only at case level. Golden expected
-  awards that are null are simply excluded from the com metrics; there is no
-  per-criterion abstention channel that avoids counting the emitted value.
-  Therefore a model "unknown" row aligned to a GOLD-KNOWN criterion would be
-  counted as a withheld (false) award by the evaluator. The adapter cannot
-  detect this without reading golden labels, which it must never do. Mitigation:
-  "declared_unknown" makes every abstention visible for separate moderation
-  reporting; an evaluation run report must split these cases out explicitly.
-  A model that should have produced the case-level signal without any unknown
-  row still records unnecessary_uncertainty against uncertain-gold cases.
+Effects of unresolved predictions on existing accuracy metrics:
+- Gold-null criteria (expected null, as in unreadable-final and
+  speed-ambiguous-handwriting): the evaluator EXCLUDES them per criterion and
+  whole-case from exact-score agreement, criterion-vector agreement and
+  criterion-count denominators, so the deterministic false emission is
+  metric-neutral there. The case still completes and counts in
+  uncased/uncertainty metrics via its case-level uncertain flag.
+- Gold-scorable criteria: there is no evaluator abstention channel, so the
+  deterministic false emission IS counted as an incorrect_deduction (a
+  withheld award) against that criterion. It is never hidden: declared_unknown
+  makes the abstention visible and such cases must be reported separately in
+  Stage 2B reporting; no accuracy change is made here.
 - Golden labels never enter the adapter: it reads only scheme id/code/weight
   from the case dict. Feeding it cases stripped of "expected"/"uncertain"/
   "derivation" must behave identically (covered by tests).
@@ -84,7 +91,7 @@ EVALUATION_RESPONSE_SCHEMA = {
                 "properties": {
                     "criterion_id": {"type": "string"},
                     "awarded": {"type": "boolean"},
-                    "unknown": {"type": "boolean"},
+                    "unknown": {"type": "boolean"},   # requires awarded:false; contradiction -> failed prediction
                     "code": {"type": "string"},
                     "weight": {"type": "integer"},
                     "reason": {"type": "string"},
@@ -196,6 +203,10 @@ def prediction_from_response(response, case_schemes):
                                       "missing_award_field" if awarded == "missing" else "non_boolean_award")
         if unknown_flag and not uncertain:
             return _failed_prediction(case_id, uncertain, "uncertainty_not_declared")
+        if unknown_flag and awarded:
+            # Abstention contradicts an award assertion. Never silently convert
+            # it into a marking decision for either direction.
+            return _failed_prediction(case_id, uncertain, "unknown_award_contradiction")
         code = row.get("code")
         scheme_code = scheme_by_id[crit_id].get("code")
         if code is not None and (type(code) is not str or code.strip() != scheme_code):
@@ -205,7 +216,7 @@ def prediction_from_response(response, case_schemes):
             scheme_weight = scheme_by_id[crit_id].get("weight")
             if type(weight) is not int or isinstance(weight, bool) or weight != scheme_weight:
                 return _failed_prediction(case_id, uncertain, "weight_mismatch")
-        awards.append({"id": crit_id, "awarded": awarded})
+        awards.append({"id": crit_id, "awarded": False if unknown_flag else awarded})
         if unknown_flag:
             declared_unknown.append(crit_id)
 

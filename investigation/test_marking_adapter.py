@@ -293,6 +293,60 @@ class AdapterUncertaintyBehaviour(unittest.TestCase):
         payload["breakdown"][0]["unknown"] = True  # uncertainty flag NOT set
         to_failed(gold, payload, "uncertainty_not_declared")
 
+    def test_contradictory_unknown_with_awarded_true_is_rejected(self):
+        gold = cases()
+        payload = response_for("algebra-correct", [True, True], uncertain=True)
+        payload["breakdown"][1]["unknown"] = True
+        payload["breakdown"][1]["awarded"] = True   # contradiction: cannot award an unadjudicated mark
+        to_failed(gold, payload, "unknown_award_contradiction")
+
+    def test_contradiction_still_requires_declared_uncertainty_first(self):
+        """Failure-order invariant: the uncertainty gate precedes the
+        contradiction gate, so an undeclared-uncertainty contradiction is
+        reported as missing uncertainty, not as a contract contradiction. """
+        gold = cases()
+        payload = response_for("algebra-correct", [True, True])  # uncertain NOT set
+        payload["breakdown"][1]["unknown"] = True
+        payload["breakdown"][1]["awarded"] = True
+        to_failed(gold, payload, "uncertainty_not_declared")
+
+    def test_unknown_missing_award_field_is_rejected_not_inferred(self):
+        gold = cases()
+        payload = response_for("algebra-correct", [True, True])
+        payload["breakdown"][1]["unknown"] = True
+        del payload["breakdown"][1]["awarded"]       # abstention must be explicit, not inferred
+        pred = to_failed(gold, payload, "missing_award_field")
+        self.assertNotIn("declared_unknown", pred)
+
+    def test_unknown_row_emits_deterministic_false_not_response_value(self):
+        gold = cases()
+        payload = response_for("algebra-correct", [True, True])
+        payload["uncertain"] = True
+        payload["breakdown"][1]["unknown"] = True
+        payload["breakdown"][1]["awarded"] = False
+        preds = adapter.predictions_from_responses([payload], gold)
+        pred = preds[0]
+        self.assertEqual(pred["declared_unknown"], ["crit-alg-c-2"])
+        emitted = next(a for a in pred["awards"] if a["id"] == "crit-alg-c-2")
+        self.assertIs(emitted["awarded"], False)
+
+    def test_documented_metric_effect_of_unknown_on_scorable_gold(self):
+        """Evaluator limitation made explicit and stable: gold-scorable abstention
+        counts as an incorrect_deduction (withheld mark) until Stage 2B metrics."""
+        gold = cases()
+        payload = response_for("speed-ambiguous-handwriting", [True, False], uncertain=True)
+        payload["breakdown"][1]["unknown"] = True
+        preds = adapter.predictions_from_responses([payload], gold)
+        single = [c for c in cases() if c["id"] == "speed-ambiguous-handwriting"]
+        r = evaluate(preds, case_data=single)
+        # gold-null criterion (crit-spd-2): exclusion keeps agreement metrics neutral
+        self.assertEqual((r["completed"], r["failures"]), (1, 0))
+        self.assertEqual(r["scorable_cases"], 0)     # case excluded from exact agreement
+        self.assertEqual(r["criteria"], 1)           # only crit-spd-1 counts
+        self.assertEqual(r["incorrect_deductions"], 0)  # abstention is metric-neutral on gold-null
+        self.assertEqual(r["uncertainty_expected"], 1)
+        self.assertEqual(r["uncertainty_detected"], 1)
+
     def test_uncertainty_signal_without_unknown_rows_is_kept(self):
         gold = cases()
         payload = {"id": "algebra-correct", "uncertain": True, "breakdown": rows("algebra-correct", [True, True])}
