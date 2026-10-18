@@ -40,37 +40,57 @@ def validate_math_source_references(references, c3_documents=None):
 
     Each reference keeps ``document_id / document_role / sha256 / page /
     label`` (and an optional ``excerpt``). When C3 document records are
-    supplied, the digest must match one of them and the page must be
-    inside it. Returns deep copies; the caller's structures are never
-    mutated.
+    supplied, EVERY identity field is cross-checked:
+
+    - the digest must match at least one supplied record;
+    - the ``document_id`` must match a record that shares the digest
+      (a digest alone never binds a document);
+    - if several supplied records share BOTH the digest and the
+      ``document_id``, resolution would be ambiguous and the claim is
+      rejected;
+    - the role and page bound of the bound record must agree.
+
+    Returns deep copies; the caller's structures are never mutated.
     """
     from investigation.math_verification import _validate_source_references
     validated = _validate_source_references(references)
     if len(validated) > MAX_REFERENCES_PER_CLAIM:
         raise ValueError("too many source references for one claim")
-    by_digest = {}
-    if c3_documents is not None:
-        if not isinstance(c3_documents, (list, tuple)):
-            raise ValueError("c3_documents must be a list of C3 records")
-        for document in c3_documents:
-            from investigation.pdf_evidence import validate_document_evidence
-            valid = validate_document_evidence(document)
-            by_digest[valid["sha256"]] = valid
+    if c3_documents is None:
+        return copy.deepcopy(validated)
+    if not isinstance(c3_documents, (list, tuple)):
+        raise ValueError("c3_documents must be a list of C3 records")
+    records = []
+    for document in c3_documents:
+        from investigation.pdf_evidence import validate_document_evidence
+        records.append(validate_document_evidence(document))
     for reference in validated:
-        document = by_digest.get(reference["sha256"])
-        if by_digest and document is None:
+        digest_matches = [record for record in records
+                          if record["sha256"] == reference["sha256"]]
+        if not digest_matches:
             raise ValueError(
                 "a source reference digest does not match any supplied "
                 "C3 document record")
-        if document is not None:
-            if reference["document_role"] != document["document_role"]:
-                raise ValueError(
-                    "a source reference role disagrees with its C3 "
-                    "document record")
-            if reference["page"] > document["page_count"]:
-                raise ValueError(
-                    "a source reference page is outside its C3 document "
-                    "record")
+        bound = [record for record in digest_matches
+                 if record["document_id"] == reference["document_id"]]
+        if not bound:
+            raise ValueError(
+                "a source reference document_id does not match any "
+                "supplied C3 record with the referenced digest")
+        if len(bound) > 1:
+            raise ValueError(
+                "ambiguous C3 binding: multiple supplied records share "
+                "the referenced digest and document_id, so the source "
+                "cannot be resolved unambiguously")
+        record = bound[0]
+        if reference["document_role"] != record["document_role"]:
+            raise ValueError(
+                "a source reference role disagrees with its C3 "
+                "document record")
+        if reference["page"] > record["page_count"]:
+            raise ValueError(
+                "a source reference page is outside its C3 document "
+                "record")
     return copy.deepcopy(validated)
 
 

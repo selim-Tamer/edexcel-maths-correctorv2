@@ -65,7 +65,7 @@ production app.
   result contract (`verified` / `contradicted` / `inconclusive` /
   `unsupported`; no numeric confidence anywhere). Checks cover exact
   arithmetic, algebraic identities (expansion, factorisation, rational
-  equivalence with domain/pole notes), surd equality, bounded
+  equivalence with domain/excluded-value notes), surd equality, bounded
   polynomial equation solving (degree cap 4; quadratic checks cap 2),
   exact substitution, assumption-scoped refinement (`refine`) and
   50-digit numeric comparison ONLY for explicitly approximate claims.
@@ -74,11 +74,34 @@ production app.
   inconclusive. Equivalence is never claimed from numeric sampling,
   and a contradiction never claims any official document is wrong —
   every result carries that scope note.
+
+  Original-domain and solution-set completeness rules (PR #25 review):
+
+  - the parser records the exact zero set of every ORIGINAL denominator
+    (divisions and negative powers) BEFORE any Sympy auto-cancellation,
+    plus a `domain_analysis_complete` flag; radical or over-cap
+    denominators make that flag False instead of guessing poles;
+  - a claimed solution making any original denominator zero is refused
+    (`solution_excluded_by_original_domain`), and substitution onto an
+    undefined point is contradicted, never verified;
+  - wherever the domain analysis is incomplete (radical denominators and
+    similar), identities and equation solution sets stay `inconclusive`,
+    never `verified`;
+  - `verified` equation solution sets require a provably complete
+    solver for the class (degree <= 2). Degree 3-4 claims with exactly
+    confirmed roots stay `inconclusive`, contradictions from exact
+    residuals remain `contradicted`;
+  - identities (infinitely many solutions on the common domain) and
+    no-solution equations are explicitly distinguished in the evidence;
+    a finite claimed set can never complete an infinite solution set.
 - `math_claims.py` integrates with the other stages: claim
   `source_references` keep C3 `document_id`/`role`/`sha256`/`page`
-  verbatim, and can be cross-checked against C3 document records.
-  C2 findings pass through as untouched deep copies. Mathematical
-  correctness and mark eligibility are reported in separate sections.
+  verbatim, and can be cross-checked against C3 document records: the
+  `sha256` must match, the `document_id` must bind a record sharing
+  that digest (a digest alone never binds a document), and duplicate
+  digest+`document_id` bindings are rejected as ambiguous. C2 findings
+  pass through as untouched deep copies. Mathematical correctness and
+  mark eligibility are reported in separate sections.
 - `math_benchmark.py` is a 28-case synthetic benchmark (`MBC-01`..)
   independent of the C2 accuracy/case-governance fixtures: it runs the
   public `verify_claim` path and asserts expected outcomes plus
@@ -100,7 +123,7 @@ Stage C4 corrections for two C3 findings (narrow scope, contracts kept):
 Run their tests with:
 
 ```sh
-python -m unittest investigation.test_safe_math investigation.test_math_verification investigation.test_math_claims investigation.test_math_benchmark investigation.test_math_security -v
+python -m unittest investigation.test_safe_math investigation.test_math_verification investigation.test_math_claims investigation.test_math_benchmark investigation.test_math_security investigation.test_equation_and_domain_integrity -v
 ```
 
 ## Live (not executed for this investigation)

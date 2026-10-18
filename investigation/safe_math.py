@@ -50,6 +50,7 @@ MAX_FLOAT_MAGNITUDE = 1e6
 MAX_EXPONENT_MAGNITUDE = 50
 MAX_EXPANDED_TERMS = 4096
 EXPAND_POWER_BOUND = 20
+MAX_ZERO_DEGREE = 4
 
 DEFAULT_VARIABLES = ("x", "y", "z", "a", "b", "c", "k", "m", "n", "t")
 WHITELISTED_FUNCTIONS = ("sqrt", "abs")
@@ -115,11 +116,48 @@ def _safe_ast_parse(text):
 
 
 class _BoundedParser:
-    """Validated-AST Sympy builder. The input never executes anywhere."""
+    """Validated-AST Sympy builder. The input never executes anywhere.
+
+    While building the expression the parser independently records the
+    ORIGINAL domain exclusions BEFORE Sympy's automatic simplification
+    can erase them: every division (``/``) and every negative power
+    (``**-n``) contributes the exact zero set of its denominator.
+    Later simplification may collapse the resulting symbol, but the
+    recorded excluded values still describe the original expression's
+    undefined points.
+    """
 
     def __init__(self, whitelist):
         self._whitelist = frozenset(whitelist)
         self._depth = 0
+        self.referenced = set()        # variable NAMES seen in the raw input
+        self.excluded = set()          # canonical zero texts of denominators
+        self.domain_complete = True    # False when analysis was not exact
+
+    def _note_denominator_zeros(self, denominator):
+        """Record the zeros of one ORIGINAL denominator subtree.
+
+        Only exact polynomial zeros (in the denominator's own free
+        symbols) are recorded; anything else (radical, multivariate or
+        over-cap denominators) marks the analysis explicitly incomplete
+        instead of being guessed.
+        """
+        if denominator.is_number:
+            return
+        from sympy import Poly, PolynomialError, roots as sympy_roots
+        generators = tuple(sorted(denominator.free_symbols, key=str))
+        if not generators:
+            self.domain_complete = False
+            return
+        try:
+            poly = Poly(denominator, *generators)
+            if poly.total_degree() > MAX_ZERO_DEGREE:
+                self.domain_complete = False
+                return
+            for root in sympy_roots(poly):
+                self.excluded.add(canonical_text(root))
+        except Exception:
+            self.domain_complete = False
 
     def parse(self, text):
         tree = _safe_ast_parse(text)
@@ -169,6 +207,7 @@ class _BoundedParser:
         raise ExpressionRefused(REFUSAL_UNSUPPORTED_SYNTAX)
 
     def _name(self, identifier):
+        self.referenced.add(identifier)
         if identifier not in self._whitelist:
             raise ExpressionRefused(REFUSAL_UNKNOWN_SYMBOL, identifier)
         from sympy import Symbol
@@ -185,9 +224,16 @@ class _BoundedParser:
         if isinstance(node.op, ast.Mult):
             return Mul(left, right)
         if isinstance(node.op, ast.Div):
+            # The ORIGINAL denominator's zeros are excluded values of the
+            # original expression, even if Sympy cancels the fraction later.
+            self._note_denominator_zeros(right)
             return Mul(left, Pow(right, Integer(-1)))
         if isinstance(node.op, ast.Pow):
             _check_power(right)
+            if right.is_number and right < 0:
+                # A negative power is a division by the base: the base's
+                # zeros are excluded from the original domain.
+                self._note_denominator_zeros(left)
             return Pow(left, right)
         raise ExpressionRefused(REFUSAL_UNSUPPORTED_SYNTAX)
 
@@ -271,10 +317,15 @@ def _split_equation(text, allow_equation):
 def parse_bounded_expression(text, variables=None, *, allow_equation=False):
     """Parse one bounded expression, or ``lhs = rhs`` when allowed.
 
-    Returns ``{"schema", "variables", "has_floats", "lhs", "rhs"}`` where
-    ``rhs`` is None unless an equation was requested. Raises
-    :class:`ExpressionRefused` for every refusal; reason codes are explicit
-    and the raw input is never echoed back.
+    Returns ``{"schema", "variables", "has_floats", "excluded_values",
+    "domain_analysis_complete", "lhs", "rhs"}`` where ``rhs`` is None
+    unless an equation was requested. ``excluded_values`` carries the
+    exact zero-sets of every original denominator BEFORE Sympy's
+    automatic simplification; ``domain_analysis_complete`` is False when
+    a denominator's zeros could not be resolved exactly (radical or
+    over-cap denominators), never guessed. Raises
+    :class:`ExpressionRefused` for every refusal; reason codes are
+    explicit and the raw input is never echoed back.
     """
     if not isinstance(text, str):
         raise ExpressionRefused(REFUSAL_NOT_A_STRING)
@@ -293,6 +344,7 @@ def parse_bounded_expression(text, variables=None, *, allow_equation=False):
         if nodes > MAX_EXPR_NODES:
             raise ExpressionRefused(REFUSAL_TOO_COMPLEX)
     parts = []
+    parsers = []
     has_floats = False
     free_symbols = set()
     for part in (left_text, right_text):
@@ -300,6 +352,7 @@ def parse_bounded_expression(text, variables=None, *, allow_equation=False):
             parts.append(None)
             continue
         parser = _BoundedParser(whitelist)
+        parsers.append(parser)
         expression = parser.parse(part)
         free = expression.free_symbols
         free_symbols.update(free)
@@ -307,10 +360,26 @@ def parse_bounded_expression(text, variables=None, *, allow_equation=False):
         if expression.atoms(SympyFloat):
             has_floats = True
         parts.append(expression)
+    referenced_variables = set()
+    excluded_values = set()
+    domain_analysis_complete = True
+    for parser in parsers:
+        referenced_variables.update(parser.referenced)
+        excluded_values.update(parser.excluded)
+        domain_analysis_complete = domain_analysis_complete \
+            and parser.domain_complete
     return {
         "schema": PARSER_SCHEMA,
         "variables": sorted(name.name for name in free_symbols),
         "has_floats": has_floats,
+        # Variable names present in the ORIGINAL text, even when Sympy
+        # cancels them away (x/x -> 1); distinguishes genuinely constant
+        # equations from cancelled-away ones.
+        "referenced_variables": sorted(referenced_variables),
+        # ORIGINAL-domain exclusions (exact zero sets of every original
+        # denominator), recorded before any Sympy auto-cancellation
+        "excluded_values": sorted(excluded_values),
+        "domain_analysis_complete": domain_analysis_complete,
         "lhs": parts[0],
         "rhs": parts[1],
     }
