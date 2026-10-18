@@ -1,0 +1,415 @@
+{
+  "benchmark_version": "c2.1",
+  "engine_compatibility": "phase-c2-scheme-verification",
+  "provenance": "Synthetic verification benchmark authored for engineering tests, NOT official Pearson 4MA1 material. Cases exercise the deterministic structural rules of investigation/verification_engine.py; none of the expected findings constitutes a claim about a real Pearson mark scheme. Deliberately valid schemes and negative controls are included; cases beyond Stage C2 scope expect evidence gaps or human-review findings instead of fabricated verdicts. Algebraic solutions present in claims are never evaluated in this stage.",
+  "cases": [
+    {
+      "id": "correct-complete-scheme",
+      "description": "Negative control: fully valid scheme with dependencies, follow-through and totals that reconcile.",
+      "expected_findings": [],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 3,
+            "source_ref": {"page": 4},
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 1,
+               "note": "Sets out the balancing step."},
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-M1"],
+               "note": "Exact value following a valid method."},
+              {"id": "Q1-A1ft", "code": "A1ft", "weight": 1,
+               "dependencies": ["Q1-M1"], "follow_through": true,
+               "note": "Follow-through from their earlier valid value."}
+            ]
+          },
+          {
+            "id": "Q2",
+            "total": 1,
+            "source_ref": {"page": 5},
+            "criteria": [
+              {"id": "Q2-B1", "code": "B1", "weight": 1}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "stated-total-mismatch",
+      "description": "Question total is explicitly 5 but criterion weights sum to 4.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-TOTAL-MISMATCH", "question_id": "Q3", "criterion_ids": []}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q3",
+            "total": 5,
+            "criteria": [
+              {"id": "Q3-M1", "code": "M1", "weight": 1},
+              {"id": "Q3-A1", "code": "A1", "weight": 1},
+              {"id": "Q3-B1", "code": "B1", "weight": 2}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "dependency-missing-criterion",
+      "description": "A dependency references a criterion id that does not exist anywhere in the document.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DEP-UNDEFINED", "question_id": "Q1", "criterion_ids": ["Q1-A1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 1},
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-M2"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "duplicate-criterion-ids",
+      "description": "Two criteria carry the same id, making per-criterion alignment ambiguous.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DUP-CRITERIA", "question_id": null, "criterion_ids": ["Q1-A1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-A1", "code": "A1", "weight": 1},
+              {"id": "Q1-A1", "code": "A1", "weight": 1}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "duplicate-question-ids",
+      "description": "Two questions share one identifier.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DUP-QUESTIONS", "question_id": "Q7", "criterion_ids": []},
+        {"rule_id": "SCHEME-TOTAL-ABSENT", "question_id": "Q7", "criterion_ids": []}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {"id": "Q7", "criteria": [{"id": "Q7-M1", "code": "M1", "weight": 1}]},
+          {"id": "Q7", "criteria": [{"id": "Q7-B1", "code": "B1", "weight": 1}]}
+        ]
+      }
+    },
+    {
+      "id": "self-dependency",
+      "description": "A criterion declares itself as its own dependency.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DEP-SELF", "question_id": "Q1", "criterion_ids": ["Q1-M1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 1,
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 1,
+               "dependencies": ["Q1-M1"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "dependency-cycle",
+      "description": "Two criteria depend on each other; no qualification order exists.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DEP-CYCLE", "question_id": null,
+         "criterion_ids": ["Q1-A1", "Q1-B1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-B1"]},
+              {"id": "Q1-B1", "code": "B1", "weight": 1,
+               "dependencies": ["Q1-A1"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "unsupported-mark-codes",
+      "description": "Codes outside the supported M/A/B/dM grammar are never assumed valid.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-CODE-UNSUPPORTED", "question_id": "Q1", "criterion_ids": ["Q1-X2"]},
+        {"rule_id": "SCHEME-CODE-UNSUPPORTED", "question_id": "Q1", "criterion_ids": ["Q1-M0"]},
+        {"rule_id": "SCHEME-CODE-UNSUPPORTED", "question_id": "Q1", "criterion_ids": ["Q1-dA1"]},
+        {"rule_id": "SCHEME-CODE-UNSUPPORTED", "question_id": "Q1", "criterion_ids": ["Q1-c3"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 4,
+            "criteria": [
+              {"id": "Q1-X2", "code": "X2", "weight": 1},
+              {"id": "Q1-M0", "code": "M0", "weight": 1},
+              {"id": "Q1-dA1", "code": "dA1", "weight": 1},
+              {"id": "Q1-c3", "code": "m1", "weight": 1}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "nonpositive-weights",
+      "description": "Zero and negative weights are structurally invalid; total reconciliation is skipped, not guessed.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-WEIGHT-NONPOSITIVE", "question_id": "Q1", "criterion_ids": ["Q1-A1"]},
+        {"rule_id": "SCHEME-WEIGHT-NONPOSITIVE", "question_id": "Q1", "criterion_ids": ["Q1-M1"]},
+        {"rule_id": "SCHEME-TOTAL-UNRECONCILABLE", "question_id": "Q1",
+         "criterion_ids": ["Q1-A1", "Q1-M1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 0},
+              {"id": "Q1-A1", "code": "A1", "weight": -1}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "missing-required-fields",
+      "description": "One criterion lacks its code, another lacks its weight.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-FIELD-MISSING", "question_id": "Q1", "criterion_ids": ["Q1-c2"]},
+        {"rule_id": "SCHEME-FIELD-MISSING", "question_id": "Q1", "criterion_ids": ["Q1-c3"]},
+        {"rule_id": "SCHEME-TOTAL-UNRECONCILABLE", "question_id": "Q1",
+         "criterion_ids": ["Q1-c3"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-c1", "code": "M1", "weight": 1},
+              {"id": "Q1-c2", "weight": 1},
+              {"id": "Q1-c3", "code": "A1"}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ambiguous-extraction-record",
+      "description": "Criterion code and weight are genuinely unknown (ambiguous extraction); no total exists. The engine reports gaps, never invents values.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-FIELD-MISSING", "question_id": "Q1", "criterion_ids": ["Q1-c1"]},
+        {"rule_id": "SCHEME-TOTAL-ABSENT", "question_id": "Q1", "criterion_ids": []}
+      ],
+      "unsupported_in_stage": ["mark-code inference", "weight inference", "total inference"],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false,
+                       "extraction_state": "ambiguous"},
+        "questions": [
+          {
+            "id": "Q1",
+            "criteria": [
+              {"id": "Q1-c1", "note": "The scanned fraction could read 1/2 or 1/3.",
+               "source_ref": {"page": 6, "line": null}}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "missing-source-information",
+      "description": "Structurally valid scheme with no provenance: origin cannot be attributed, reported as an evidence gap.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-PROVENANCE-ABSENT", "question_id": null, "criterion_ids": []}
+      ],
+      "unsupported_in_stage": ["document-session matching"],
+      "scheme": {
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 1,
+            "criteria": [{"id": "Q1-B1", "code": "B1", "weight": 1}]
+          }
+        ]
+      }
+    },
+    {
+      "id": "diagram-dependent-question",
+      "description": "Explicitly diagram-dependent question; deterministic verification is out of scope by declaration.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DIAGRAM-REVIEW", "question_id": "Q9", "criterion_ids": ["Q9-B1"]}
+      ],
+      "unsupported_in_stage": ["geometry verification from transcription"],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q9",
+            "total": 1,
+            "diagram_dependent": true,
+            "claimed_solution": null,
+            "criteria": [{"id": "Q9-B1", "code": "B1", "weight": 1,
+                          "note": "Answer depends on the printed figure."}]
+          }
+        ]
+      }
+    },
+    {
+      "id": "official-style-exception-valid",
+      "description": "Negative control: a scheme that documents an official-style convention (implied method without commanded working) stays valid; the scheme must NOT be flagged.",
+      "expected_findings": [],
+      "unsupported_in_stage": ["exam-board policy interpretation"],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false,
+                       "policy_note": "Documented synthetic convention only."},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 1,
+            "criteria": [
+              {"id": "Q1-B1", "code": "B1", "weight": 1,
+               "note": "Correct answer without working earns B1; method is implied and no working is commanded."}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "claimed-solution-unverifiable",
+      "description": "A claimed solution string exists; Stage C2 performs no algebra verification, so the finding is an evidence gap, not a verdict.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-MATH-UNSUPPORTED", "question_id": "Q1",
+         "criterion_ids": ["Q1-A1", "Q1-M1"]}
+      ],
+      "unsupported_in_stage": ["algebraic solution verification", "arithmetic verification"],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "claimed_solution": "3x = 15, so x = 5.",
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 1},
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-M1"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "duplicated-dependency-declaration",
+      "description": "The same dependency is declared twice; contradictory bookkeeping is provable from the declarations themselves.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DEP-DUPLICATED", "question_id": "Q1", "criterion_ids": ["Q1-A1"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 2,
+            "criteria": [
+              {"id": "Q1-M1", "code": "M1", "weight": 1},
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-M1", "Q1-M1"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "contradictory-follow-through",
+      "description": "The code carries the explicit ft suffix while the flag denies follow-through.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-FT-CONTRADICTION", "question_id": "Q1", "criterion_ids": ["Q1-A1ft"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 1,
+            "criteria": [
+              {"id": "Q1-A1ft", "code": "A1ft", "weight": 1,
+               "follow_through": false}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "alternative-groups-valid-and-invalid",
+      "description": "A correct two-member alternative group coexists with an orphan singleton group; only the singleton is a structural flaw.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-ALT-GROUP-INVALID", "question_id": "Q1",
+         "criterion_ids": ["Q1-A3"]}
+      ],
+      "unsupported_in_stage": [],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 3,
+            "criteria": [
+              {"id": "Q1-A1", "code": "A1", "weight": 1,
+               "alternative_group": "METHOD-A"},
+              {"id": "Q1-A2", "code": "A1", "weight": 1,
+               "alternative_group": "METHOD-A"},
+              {"id": "Q1-A3", "code": "A1", "weight": 1,
+               "alternative_group": "ORPHAN-C"}
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
