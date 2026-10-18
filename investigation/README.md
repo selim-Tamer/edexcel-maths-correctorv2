@@ -44,6 +44,65 @@ Run their tests with:
 python -m unittest investigation.test_pdf_evidence investigation.test_pdf_question_map investigation.test_verification_evidence -v
 ```
 
+## Stage C4 mathematical verification modules (offline)
+
+`safe_math.py`, `math_verification.py`, `math_claims.py` and
+`math_benchmark.py` add an offline, deterministic mathematical
+verification engine for the investigation. It is investigation-only:
+the production app never imports it and it imports nothing from the
+production app.
+
+- `safe_math.py` parses untrusted text with a validated-AST whitelist
+  (operators, bounded numbers, whitelisted variables, `sqrt`/`abs` only)
+  and builds Sympy objects node by node. No `eval`/`exec` and no
+  unrestricted Sympy parsing ever touches raw text; refusals are
+  explicit (`unsupported_syntax`, `unknown_symbol`, `expression_too_long`,
+  `expression_too_complex`, `number_too_large`, `exponent_too_large`).
+  Length/node/depth caps, integer and exponent magnitude caps, and a
+  combinatorial expand bound computed without expanding bound all
+  symbolic work.
+- `math_verification.py` verifies caller-supplied claims into a fixed
+  result contract (`verified` / `contradicted` / `inconclusive` /
+  `unsupported`; no numeric confidence anywhere). Checks cover exact
+  arithmetic, algebraic identities (expansion, factorisation, rational
+  equivalence with domain/pole notes), surd equality, bounded
+  polynomial equation solving (degree cap 4; quadratic checks cap 2),
+  exact substitution, assumption-scoped refinement (`refine`) and
+  50-digit numeric comparison ONLY for explicitly approximate claims.
+  A nonzero canonical difference proves a contradiction only for
+  constant/rational/polynomial classes; symbolic surd/abs forms stay
+  inconclusive. Equivalence is never claimed from numeric sampling,
+  and a contradiction never claims any official document is wrong —
+  every result carries that scope note.
+- `math_claims.py` integrates with the other stages: claim
+  `source_references` keep C3 `document_id`/`role`/`sha256`/`page`
+  verbatim, and can be cross-checked against C3 document records.
+  C2 findings pass through as untouched deep copies. Mathematical
+  correctness and mark eligibility are reported in separate sections.
+- `math_benchmark.py` is a 28-case synthetic benchmark (`MBC-01`..)
+  independent of the C2 accuracy/case-governance fixtures: it runs the
+  public `verify_claim` path and asserts expected outcomes plus
+  review-required flags (`python -m investigation.math_benchmark`).
+
+Stage C4 corrections for two C3 findings (narrow scope, contracts kept):
+
+1. `pdf_evidence.py` now reports `partial_extraction` at document level
+   when per-page truncation or aggregate text-budget exhaustion occurs,
+   instead of silently claiming a fully `extracted` document;
+   `test_only_budget_exhaustion_is_reported_incomplete` asserts the
+   strengthened status.
+2. `pdf_question_map.py` never attaches a continuation page that bears
+   ANY question heading (matched or unmatched number): a new question
+   starts there, so heuristic continuation cannot cross an unmatched
+   heading boundary. Regression tests cover both the boundary and the
+   unchanged positive continuation path.
+
+Run their tests with:
+
+```sh
+python -m unittest investigation.test_safe_math investigation.test_math_verification investigation.test_math_claims investigation.test_math_benchmark investigation.test_math_security -v
+```
+
 ## Live (not executed for this investigation)
 
 Requires explicit human authorization, a separate test-only project with **no billing attached**, and rechecking the current Google free-tier pricing/access. A free-eligible model can charge a billed project. The script cannot check billing; do not use it when billing state is uncertain. Do not supply a production key. Do not place a key in a command line, environment variable, output file or chat.

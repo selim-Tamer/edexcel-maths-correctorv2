@@ -751,7 +751,10 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(
             [p["status"] for p in scheme_document["pages"]],
             ["budget_exhausted", "budget_exhausted"])
-        self.assertEqual(scheme_document["extraction_status"], "extracted")
+        # Stage C4 Phase 6 correction: budget exhaustion is NOT a complete
+        # extraction, so the document status must not claim full success.
+        self.assertEqual(scheme_document["extraction_status"],
+                         "partial_extraction")
         findings = check_document_alignment(
             mark_scheme_document=scheme_document, mark_scheme_mapping=None)
         incomplete = [f for f in findings
