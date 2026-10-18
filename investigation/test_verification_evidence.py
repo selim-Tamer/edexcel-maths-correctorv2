@@ -9,10 +9,12 @@ import json
 import unittest
 
 from investigation import pdf_test_fixtures as fixtures
+from investigation import pdf_evidence as evidence_module
 from investigation.pdf_evidence import extract_pdf_evidence
 from investigation.pdf_question_map import map_question_pages
 from investigation.verification_evidence import (
-    ALIGNMENT_RULES, CERTAINTY_AMBIGUOUS, CERTAINTY_EXPLICIT,
+    AGGREGATION_POLICY, ALIGNMENT_RULES, CERTAINTY_AMBIGUOUS,
+    CERTAINTY_EXPLICIT, CERTAINTY_HEURISTIC, CERTAINTY_HINT,
     CERTAINTY_UNAVAILABLE, check_document_alignment,
     link_findings_to_pdf_evidence, validate_c2_finding)
 from investigation.verification_engine import (
@@ -219,6 +221,33 @@ class LinkingTests(unittest.TestCase):
                 mark_scheme_document=scheme_document,
                 mark_scheme_mapping=mapping)
 
+    def test_evidence_reference_identity_is_hash_bound(self):
+        # A reference whose digest/id/role no longer match the document
+        # record it is attached to must be rejected, so links can never
+        # point at a different PDF than the evidence section describes.
+        findings = _findings_with_mismatch()
+        scheme_document = _scheme_document(SCHEME_PAGES)
+        mapping = map_question_pages(scheme_document, ["Q1", "Q2"])
+        for tamper in (
+                {"sha256": "c" * 64},
+                {"document_id": "pdf:otherdocument"},
+                {"document_role": "question_paper"}):
+            for key, value in tamper.items():
+                mapping["matches"][0]["references"][0][key] = value
+            with self.subTest(tamper=sorted(tamper)):
+                with self.assertRaises(ValueError):
+                    link_findings_to_pdf_evidence(
+                        findings, mark_scheme_document=scheme_document,
+                        mark_scheme_mapping=mapping)
+            # restore for the next tamper round
+            reference = mapping["matches"][0]["references"][0]
+            reference.update({
+                key: original for key, original in
+                (("sha256", scheme_document["sha256"]),
+                 ("document_id", scheme_document["document_id"]),
+                 ("document_role", scheme_document["document_role"]))
+                if key in tamper})
+
     def test_output_deterministic_and_json_serializable(self):
         findings = _findings_with_mismatch()
         scheme_document = _scheme_document(SCHEME_PAGES)
@@ -247,6 +276,116 @@ class LinkingTests(unittest.TestCase):
             any("empty page" in warning or "text layer" in warning
                 for warning in warnings),
             warnings)
+
+    def test_explicit_page_match_never_masks_hint_only_source(self):
+        # The paper maps Q1 via an explicit heading while the scheme side
+        # can only offer a validated caller hint: the combined certainty
+        # must degrade to the weakest source, never report "explicit".
+        findings = _findings_with_mismatch()
+        paper_document = _paper_document(
+            [["Question 1 total for this question: 2 marks"]])
+        paper_mapping = map_question_pages(paper_document, ["Q1"])
+        scheme_document = _scheme_document(
+            [["plain scheme row without question headings"]])
+        scheme_mapping = map_question_pages(scheme_document, ["Q1"],
+                                            hints={"Q1": [1]})
+        enriched = link_findings_to_pdf_evidence(
+            findings,
+            question_paper_document=paper_document,
+            question_paper_mapping=paper_mapping,
+            mark_scheme_document=scheme_document,
+            mark_scheme_mapping=scheme_mapping)
+        mismatch = next(f for f in enriched
+                        if f["rule_id"] == "SCHEME-TOTAL-MISMATCH")
+        self.assertEqual(mismatch["pdf_evidence"]["certainty"],
+                         CERTAINTY_HINT)
+        self.assertEqual(mismatch["pdf_evidence"]["source_certainties"],
+                         {"question_paper": CERTAINTY_EXPLICIT,
+                          "mark_scheme": CERTAINTY_HINT})
+        self.assertEqual(
+            mismatch["pdf_evidence"]["question_paper"]["certainty"],
+            CERTAINTY_EXPLICIT)
+        self.assertEqual(
+            mismatch["pdf_evidence"]["mark_scheme"]["certainty"],
+            CERTAINTY_HINT)
+        self.assertIn("weakest",
+                      mismatch["pdf_evidence"]["aggregation_policy"])
+
+    def test_heuristic_source_is_not_masked_by_explicit_other(self):
+        # Fixture note: on the public mapping path, continuation references
+        # are only ever attached to heading matches, so a standalone
+        # heuristic-certain match is not reachable today. The certainty
+        # label of an otherwise valid mapping (accepted unchanged by
+        # validate_question_mapping, which permits "heuristic") is rewritten
+        # here purely to exercise the weakest-source bound.
+        findings = _findings_with_mismatch()
+        scheme_document = _scheme_document(SCHEME_PAGES)
+        scheme_mapping = map_question_pages(scheme_document, ["Q1", "Q2"])
+        for entry in scheme_mapping["matches"]:
+            if entry["question_id"] == "Q1":
+                entry["certainty"] = "heuristic"
+        enriched = link_findings_to_pdf_evidence(
+            findings, mark_scheme_document=scheme_document,
+            mark_scheme_mapping=scheme_mapping)
+        mismatch = next(f for f in enriched
+                        if f["rule_id"] == "SCHEME-TOTAL-MISMATCH")
+        self.assertEqual(mismatch["pdf_evidence"]["certainty"],
+                         CERTAINTY_HEURISTIC)
+        self.assertEqual(
+            mismatch["pdf_evidence"]["source_certainties"]["mark_scheme"],
+            CERTAINTY_HEURISTIC)
+        # heuristic stays labelled as needs-review in the note, never as
+        # independently verified extracted evidence
+        self.assertIn("needs-review", mismatch["pdf_evidence"]["note"])
+
+    def test_ambiguous_source_dominates_and_requires_review(self):
+        findings = _findings_with_mismatch()
+        paper_document = _paper_document(
+            [["Question 1 total for this question: 2 marks"]])
+        paper_mapping = map_question_pages(paper_document, ["Q1"])
+        scheme_document = _scheme_document(
+            [["Q1 (a) M1: rows"], ["filler"], ["Q1 (b) duplicate heading"]])
+        scheme_mapping = map_question_pages(scheme_document, ["Q1"])
+        self.assertEqual(scheme_mapping["matches"][0]["certainty"],
+                         "ambiguous")
+        enriched = link_findings_to_pdf_evidence(
+            findings, question_paper_document=paper_document,
+            question_paper_mapping=paper_mapping,
+            mark_scheme_document=scheme_document,
+            mark_scheme_mapping=scheme_mapping)
+        mismatch = next(f for f in enriched
+                        if f["rule_id"] == "SCHEME-TOTAL-MISMATCH")
+        self.assertEqual(mismatch["pdf_evidence"]["certainty"],
+                         CERTAINTY_AMBIGUOUS)
+        self.assertTrue(mismatch["pdf_evidence"]["review_required"])
+        # the C2 finding itself is untouched: only pdf_evidence changes
+        self.assertEqual(mismatch["state"],
+                         next(f for f in findings
+                              if f["finding_id"] == mismatch["finding_id"])
+                         ["state"])
+        self.assertEqual(mismatch["pdf_evidence"]["source_certainties"],
+                         {"question_paper": CERTAINTY_EXPLICIT,
+                          "mark_scheme": CERTAINTY_AMBIGUOUS})
+
+    def test_aggregation_policy_is_documented_and_deterministic(self):
+        findings = _findings_with_mismatch()
+        scheme_document = _scheme_document(SCHEME_PAGES)
+        scheme_mapping = map_question_pages(scheme_document, ["Q1", "Q2"])
+        args = dict(mark_scheme_document=scheme_document,
+                    mark_scheme_mapping=scheme_mapping)
+        first = link_findings_to_pdf_evidence(findings, **args)
+        second = link_findings_to_pdf_evidence(findings, **args)
+        self.assertEqual(first, second)
+        for enriched in first:
+            evidence = enriched["pdf_evidence"]
+            self.assertEqual(evidence["aggregation_policy"],
+                             AGGREGATION_POLICY)
+            self.assertIn("weakest", evidence["aggregation_policy"])
+            self.assertIn("human review", evidence["aggregation_policy"])
+            self.assertEqual(
+                set(evidence["source_certainties"]),
+                {"question_paper", "mark_scheme"})
+        json.dumps(first)
 
 
 class AlignmentTests(unittest.TestCase):
@@ -442,6 +581,241 @@ class AlignmentTests(unittest.TestCase):
                 check_document_alignment(
                     question_paper_document=document,
                     question_paper_mapping=mapping)
+
+    def test_simultaneous_role_extraction_failures_have_unique_ids(self):
+        # Both documents fail extraction on every page: two logically
+        # distinct EXTRACTION-INCOMPLETE findings (one per document role)
+        # must both exist, with distinct deterministic finding ids.
+        import io
+        import pypdfium2 as pdfium_module
+        from pypdf import PdfReader
+        from unittest import mock
+
+        class FakeTextPage:
+            def count_chars(self):
+                raise RuntimeError("synthetic pdfium failure")
+
+            def get_text_range(self, start, count):
+                raise RuntimeError("synthetic pdfium failure")
+
+            def close(self):
+                pass
+
+        class FakePage:
+            def get_objects(self):
+                return iter(())
+
+            def get_textpage(self):
+                return FakeTextPage()
+
+            def close(self):
+                pass
+
+        class FakeDocument:
+            def __init__(self, data):
+                self.pages = [FakePage(), FakePage()]
+
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                return self.pages[index]
+
+            def close(self):
+                pass
+
+        data = fixtures.build_pdf([["Q1 row"], ["Q2 row"]])
+        self.assertEqual(len(PdfReader(io.BytesIO(data)).pages), 2)
+        with mock.patch.object(pdfium_module, "PdfDocument", FakeDocument):
+            scheme_document = extract_pdf_evidence(data, "mark_scheme")
+            paper_document = extract_pdf_evidence(data, "question_paper")
+        findings = check_document_alignment(
+            question_paper_document=paper_document,
+            question_paper_mapping=None,
+            mark_scheme_document=scheme_document,
+            mark_scheme_mapping=None)
+        incomplete = [f for f in findings
+                      if f["rule_id"] == "PDF-ALIGN-EXTRACTION-INCOMPLETE"]
+        self.assertEqual(len(incomplete), 2)
+        self.assertEqual([f["evidence"]["document_role"] for f in incomplete],
+                         ["mark_scheme", "question_paper"])
+        self.assertTrue(all(f["state"] == INSUFFICIENT for f in incomplete))
+        # identity includes the document role; nothing was lost/overwritten
+        for finding in incomplete:
+            self.assertIn(finding["evidence"]["document_role"],
+                          finding["finding_id"])
+            self.assertEqual(finding["evidence"]["failed_pages"], [1, 2])
+        self.assertEqual(len({f["finding_id"] for f in findings}),
+                         len(findings))
+        # deterministic: same inputs rebuild byte-identical findings
+        again = check_document_alignment(
+            question_paper_document=paper_document,
+            question_paper_mapping=None,
+            mark_scheme_document=scheme_document,
+            mark_scheme_mapping=None)
+        self.assertEqual(findings, again)
+
+    def test_unmatched_headings_in_both_roles_are_distinct(self):
+        # Multiple distinct heading numbers across BOTH document roles:
+        # every (role, heading number) pair is a separate finding with a
+        # unique, deterministic id.
+        paper_pages = [
+            ["Question 7 total for this question: 2 marks"],
+            ["Question 9 total for this question: 1 mark"],
+        ]
+        scheme_pages = [
+            ["Q9 (a) A1: records the answer"],
+            ["filler text"],
+        ]
+        findings, _, _ = self.alignment_case(
+            scheme_pages, paper_pages, scheme_ids=["Q1"], paper_ids=["Q1"])
+        unmatched = [f for f in findings
+                     if f["rule_id"] == "PDF-ALIGN-UNMATCHED-HEADINGS"]
+        self.assertEqual(len(unmatched), 3)
+        observed = sorted((f["evidence"]["document_role"],
+                           f["evidence"]["heading_number"])
+                          for f in unmatched)
+        self.assertEqual(observed,
+                         [("mark_scheme", "9"),
+                          ("question_paper", "7"),
+                          ("question_paper", "9")])
+        for finding in unmatched:
+            number = finding["evidence"]["heading_number"]
+            self.assertIn(f"heading-{number}", finding["finding_id"])
+            self.assertIn(finding["evidence"]["document_role"],
+                          finding["finding_id"])
+        # no findings silently lost or overwritten anywhere in the output
+        self.assertEqual(len({f["finding_id"] for f in findings}),
+                         len(findings))
+        self.assertEqual(len(findings), 3)
+
+    def test_ambiguous_mapping_in_both_documents_unique_ids(self):
+        # The same question has multiple candidate pages in BOTH documents:
+        # two human-review findings (one per role) with distinct ids.
+        paper_pages = [
+            ["Question 1 total for this question: 2 marks",
+             "Question 2 total for this question: 5 marks"],
+            ["Question 2 (b) additional rows"],
+        ]
+        scheme_pages = [
+            ["Q1 (a) M1: forms 2x + 3 = 11", "Q2 (a) B1: subtracts"],
+            ["Q2 (b) A1: completes the answer"],
+        ]
+        findings, _, _ = self.alignment_case(
+            scheme_pages, paper_pages, scheme_ids=["Q1", "Q2"],
+            paper_ids=["Q1", "Q2"])
+        ambiguous = [f for f in findings
+                     if f["rule_id"] == "PDF-ALIGN-AMBIGUOUS-MAPPING"]
+        self.assertEqual(len(ambiguous), 2)
+        self.assertEqual([f["evidence"]["document_role"] for f in ambiguous],
+                         ["mark_scheme", "question_paper"])
+        self.assertEqual({f["state"] for f in ambiguous},
+                         {HUMAN_REVIEW})
+        for finding in ambiguous:
+            self.assertIn(finding["evidence"]["document_role"],
+                          finding["finding_id"])
+        self.assertEqual(len({f["finding_id"] for f in findings}),
+                         len(findings))
+        self.assertEqual(len(findings), 2)
+
+    def test_only_ambiguous_layout_is_reported_incomplete(self):
+        # Truncation at the per-page text cap with NO extraction failure:
+        # incomplete evidence must be reported regardless.
+        from unittest import mock
+        with mock.patch.object(evidence_module, "MAX_PAGE_TEXT_CHARS", 10):
+            scheme_document = _scheme_document(
+                [["Q1 (a) A1: solves 2x + 3 = 11 and shows every step"]])
+        self.assertEqual(scheme_document["pages"][0]["status"],
+                         "ambiguous_layout")
+        findings = check_document_alignment(
+            mark_scheme_document=scheme_document, mark_scheme_mapping=None)
+        incomplete = [f for f in findings
+                      if f["rule_id"] == "PDF-ALIGN-EXTRACTION-INCOMPLETE"]
+        self.assertEqual(len(incomplete), 1)
+        evidence = incomplete[0]["evidence"]
+        self.assertEqual(evidence["ambiguous_layout_pages"], [1])
+        self.assertEqual(evidence["failed_pages"], [])
+        self.assertEqual(evidence["budget_capped_pages"], [])
+        self.assertEqual([f for f in findings
+                          if f["rule_id"] ==
+                          "PDF-ALIGN-TEXT-LAYER-MISSING"], [])
+
+    def test_only_budget_exhaustion_is_reported_incomplete(self):
+        # Aggregate text budget exhausted before ANY text was taken, with
+        # no page failure at all: the document-level status can still say
+        # "extracted", which is exactly why the page-level lists must be
+        # reported honestly.
+        from unittest import mock
+        with mock.patch.object(evidence_module, "MAX_TOTAL_TEXT_CHARS", 0):
+            scheme_document = _scheme_document([["Q1 row"], ["Q2 row"]])
+        self.assertEqual(
+            [p["status"] for p in scheme_document["pages"]],
+            ["budget_exhausted", "budget_exhausted"])
+        self.assertEqual(scheme_document["extraction_status"], "extracted")
+        findings = check_document_alignment(
+            mark_scheme_document=scheme_document, mark_scheme_mapping=None)
+        incomplete = [f for f in findings
+                      if f["rule_id"] == "PDF-ALIGN-EXTRACTION-INCOMPLETE"]
+        self.assertEqual(len(incomplete), 1)
+        evidence = incomplete[0]["evidence"]
+        self.assertEqual(evidence["budget_capped_pages"], [1, 2])
+        self.assertEqual(evidence["failed_pages"], [])
+        self.assertEqual(evidence["ambiguous_layout_pages"], [])
+        self.assertIn("budget", incomplete[0]["explanation"])
+
+    def test_truncation_and_budget_exhaustion_combined_single_finding(self):
+        # Both ambiguous_layout AND budget_exhausted occur: ONE finding per
+        # document role, both page lists populated, nothing duplicated.
+        from unittest import mock
+        with mock.patch.object(evidence_module, "MAX_TOTAL_TEXT_CHARS", 3):
+            scheme_document = _scheme_document(
+                [["Q1 text"], ["Q2 text"], ["Q3 text"]])
+        self.assertEqual(
+            [p["status"] for p in scheme_document["pages"]],
+            ["ambiguous_layout", "budget_exhausted", "budget_exhausted"])
+        findings = check_document_alignment(
+            mark_scheme_document=scheme_document, mark_scheme_mapping=None)
+        incomplete = [f for f in findings
+                      if f["rule_id"] == "PDF-ALIGN-EXTRACTION-INCOMPLETE"]
+        self.assertEqual(len(incomplete), 1)
+        evidence = incomplete[0]["evidence"]
+        self.assertEqual(evidence["ambiguous_layout_pages"], [1])
+        self.assertEqual(evidence["budget_capped_pages"], [2, 3])
+        self.assertEqual(evidence["failed_pages"], [])
+        self.assertNotEqual(incomplete[0]["state"],
+                            "verified_structural_inconsistency")
+
+    def test_document_level_unsupported_content_is_not_fully_verified(self):
+        # A structurally valid record whose every page is fine but whose
+        # document-level status is "unsupported_content" (features this
+        # engine deliberately skips, e.g. embedded actions) must NOT be
+        # presented as complete, fully verified extraction.
+        document = {
+            "schema": evidence_module.DOCUMENT_SCHEMA,
+            "document_id": "pdf:unsupportedtest",
+            "document_role": "mark_scheme",
+            "sha256": "b" * 64,
+            "page_count": 1,
+            "extraction_status": "unsupported_content",
+            "warnings": [],
+            "pages": [{"page": 1, "text": "Q1 content row",
+                       "status": "extracted", "warnings": [],
+                       "objects": None}],
+        }
+        evidence_module.validate_document_evidence(document)
+        findings = check_document_alignment(
+            mark_scheme_document=document, mark_scheme_mapping=None)
+        incomplete = [f for f in findings
+                      if f["rule_id"] == "PDF-ALIGN-EXTRACTION-INCOMPLETE"]
+        self.assertEqual(len(incomplete), 1)
+        self.assertEqual(
+            incomplete[0]["evidence"]["extraction_status"],
+            "unsupported_content")
+        self.assertIn("deliberately does not interpret",
+                      incomplete[0]["explanation"])
+        self.assertNotEqual(incomplete[0]["state"],
+                            "verified_structural_inconsistency")
+        self.assertTrue(incomplete[0]["review_required"])
 
 
 class VocabularyTests(unittest.TestCase):
