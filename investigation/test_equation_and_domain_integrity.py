@@ -3,9 +3,11 @@
 Issue 1: equation solution-set completeness (identities, empty solution
 sets, constant equations, repeated roots, degree-3/4 solver limits,
 rational equations reduced to polynomials).
-Issue 2: original-domain restrictions (denominator zero-sets recorded
-before cancellation, excluded solutions, undefined substitutions,
-incomplete domain analysis stays inconclusive).
+Issue 2 (continued, provenance fix): original-domain restrictions carry
+variable-specific provenance (each original denominator with its own
+variables and zero set); pooled excluded values are never compared
+against unrelated variable assignments; non-resolvable denominators
+(stay) inconclusive.
 Issue 3: C3 source-reference document_id binding and ambiguity rules.
 
 Investigation-only; no network and no student data.
@@ -272,6 +274,142 @@ class DomainRestrictionTests(unittest.TestCase):
         domain_notes = " | ".join(result["domain_notes"])
         self.assertIn("right-hand side", domain_notes)
         self.assertIn("Integer(-2)", domain_notes)
+
+
+class VariableProvenanceTests(unittest.TestCase):
+    """Original denominator restrictions carry variable-specific
+    provenance: an excluded value of x never rejects an assignment to y,
+    restrictions predate cancellation, and non-resolvable denominators
+    stay inconclusive instead of guessing."""
+
+    def _sub(self, expression, assignments, claimed):
+        return verify_claim(_claim("substitution", expression=expression,
+                                   assignments=assignments,
+                                   claimed_value=claimed))
+
+    def test_exclusion_of_one_variable_does_not_reject_another(self):
+        # Reported false rejection: 0 is a pole of x, but y=0 is legal.
+        result = self._sub("1/x + y", {"x": "2", "y": "0"}, "1/2")
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+        self.assertNotIn("undefined_assignments", result["evidence"])
+
+    def test_pole_of_its_own_variable_is_still_refused(self):
+        result = self._sub("1/x + y", {"x": "0", "y": "2"}, "2")
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "x", "value": "Integer(0)"}])
+
+    def test_numerator_zero_on_another_variables_pole_is_valid(self):
+        # x/y at x=0, y=2 is 0 (only y=0 is excluded) and must verify.
+        result = self._sub("x/y", {"x": "0", "y": "2"}, "0")
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+
+    def test_denominator_variable_pole_is_refused(self):
+        result = self._sub("x/y", {"x": "2", "y": "0"}, "0")
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "y", "value": "Integer(0)"}])
+
+    def test_two_cooperating_denominators_valid_assignment(self):
+        result = self._sub("1/x + 1/y", {"x": "2", "y": "3"}, "5/6")
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+
+    def test_two_cooperating_denominators_refunded_pole(self):
+        result = self._sub("1/x + 1/y", {"x": "0", "y": "3"}, "1/3")
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "x", "value": "Integer(0)"}])
+
+    def test_removable_singularity_point_is_undefined(self):
+        # (x^2 - 1)/(x - 1) is never a value at x = 1.
+        result = self._sub("(x**2 - 1)/(x - 1)", {"x": "1"}, "2")
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "x", "value": "Integer(1)"}])
+
+    def test_multivariate_denominator_is_inconclusive_not_verified(self):
+        # x + y: two variables in one denominator cannot be resolved
+        # exactly, so the engine refuses to certify a value there.
+        result = self._sub("1/(x + y)", {"x": "2", "y": "3"}, "1/5")
+        self.assertEqual(result["outcome"], OUTCOME_INCONCLUSIVE)
+        self.assertTrue(result["evidence"]["domain_analysis_incomplete"])
+
+    def test_value_of_one_denominator_does_not_poison_another(self):
+        # x=1 is singular for (x-1) but harmless for 1/x; y=2 is fine
+        # for (y-1); the pair must verify.
+        result = self._sub("1/x + 1/(y - 1)", {"x": "1", "y": "2"}, "2")
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+
+    def test_two_denominators_in_one_variable_both_enforced(self):
+        # x=1 zeroes (x-1) even though x=0 is the zero of the other.
+        result = self._sub("1/x + 1/(x - 1)", {"x": "1"}, "3/2")
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "x", "value": "Integer(1)"}])
+
+    def test_parse_record_carries_variable_specific_provenance(self):
+        from investigation.safe_math import parse_bounded_expression
+        record = parse_bounded_expression("1/x + y")
+        self.assertEqual(len(record["original_denominators"]), 1)
+        entry = record["original_denominators"][0]
+        self.assertEqual(entry["variables"], ["x"])
+        self.assertEqual(entry["zeros"], ["Integer(0)"])
+        self.assertTrue(entry["resolvable"])
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_parse_records_never_pool_across_variables(self):
+        from investigation.safe_math import parse_bounded_expression
+        record = parse_bounded_expression("1/x + 1/y")
+        variables = sorted(tuple(entry["variables"])
+                           for entry in record["original_denominators"])
+        self.assertEqual(variables, [("x",), ("y",)])
+        pooled = {entry["zeros"][0] for entry
+                  in record["original_denominators"]}
+        self.assertEqual(pooled, {"Integer(0)"})
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_over_cap_or_radical_denominator_is_marked_unresolvable(self):
+        from investigation.safe_math import parse_bounded_expression
+        record = parse_bounded_expression("1/sqrt(x)")
+        entry = record["original_denominators"][0]
+        self.assertFalse(entry["resolvable"])
+        self.assertEqual(entry["zeros"], [])
+        self.assertFalse(record["domain_analysis_complete"])
+
+    def test_cancelled_away_denominators_keep_their_restriction(self):
+        # x/y * y/x cancels to 1 in the expression, but the original
+        # denominators stay recorded (single-variable equation check).
+        from investigation.safe_math import parse_bounded_expression
+        record = parse_bounded_expression("x/y * y/x")
+        recorded = sorted(entry["denominator"] for entry
+                          in record["original_denominators"])
+        self.assertEqual(len(recorded), 2)
+        self.assertIn("Symbol('y')", recorded)
+        self.assertIn("Symbol('x')", recorded)
+
+    def test_equation_exclusions_stay_variable_match_after_provenance(self):
+        # Removable-singularity equation set must survive the refactor:
+        # the only on-domain solution of (x^2-4)/(x-2)=0 is -2.
+        result = verify_claim(_claim("equation_solutions",
+                                     equation="(x**2 - 4)/(x - 2) = 0",
+                                     solutions=["-2"]))
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+        excluded = verify_claim(_claim("equation_solutions",
+                                       equation="(x**2 - 4)/(x - 2) = 0",
+                                       solutions=["2"]))
+        self.assertEqual(excluded["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(
+            excluded["evidence"]["rejected_solutions"][0]["status"],
+            "solution_excluded_by_original_domain")
+
+    def test_equation_identity_keeps_excluded_original_domain(self):
+        result = verify_claim(_claim("equation_solutions",
+                                     equation="x/x = 1", solutions=["1"]))
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertIn("infinitely many solutions",
+                      result["evidence"]["completeness"])
+        self.assertIn("Integer(0)",
+                      result["evidence"]["completeness"])
 
 
 class SourceReferenceBindingTests(unittest.TestCase):

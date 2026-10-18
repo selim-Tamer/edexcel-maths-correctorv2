@@ -77,16 +77,24 @@ production app.
 
   Original-domain and solution-set completeness rules (PR #25 review):
 
-  - the parser records the exact zero set of every ORIGINAL denominator
-    (divisions and negative powers) BEFORE any Sympy auto-cancellation,
-    plus a `domain_analysis_complete` flag; radical or over-cap
-    denominators make that flag False instead of guessing poles;
+  - the parser records every ORIGINAL denominator (divisions and
+    negative powers) with variable-specific provenance BEFORE any
+    Sympy auto-cancellation: its own variables, its exact zero set when
+    it is an exactly resolvable univariate denominator, and a
+    `resolvable` flag; radical, multivariate and over-cap denominators
+    are recorded but never guessed (`domain_analysis_complete` False);
+  - exclusion decisions always evaluate the denominator's OWN variable:
+    a zero of `x` never rejects an assignment or solution set for `y`,
+    and restrictions are never pooled across variables;
   - a claimed solution making any original denominator zero is refused
     (`solution_excluded_by_original_domain`), and substitution onto an
     undefined point is contradicted, never verified;
-  - wherever the domain analysis is incomplete (radical denominators and
-    similar), identities and equation solution sets stay `inconclusive`,
-    never `verified`;
+  - wherever the domain analysis is incomplete (radical denominators
+    and similar), identities and equation solution sets stay
+    `inconclusive`, never `verified`;
+  - a denominator using several variables cannot be resolved exactly,
+    so any claim whose value must be certified on its domain is left
+    `inconclusive` rather than guessed;
   - `verified` equation solution sets require a provably complete
     solver for the class (degree <= 2). Degree 3-4 claims with exactly
     confirmed roots stay `inconclusive`, contradictions from exact

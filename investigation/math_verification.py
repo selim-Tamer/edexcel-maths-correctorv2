@@ -176,13 +176,34 @@ def _validate_source_references(references):
     return validated
 
 
-def _domain_notes_for_pair(lhs_record, rhs_record):
-    """Domain compatibility notes from the ORIGINAL parse-level exclusions.
+def _excluded_pairs(record):
+    """Variable-specific exclusion pairs from ORIGINAL-denominator provenance.
 
-    The excluded values are the exact zero sets of every original
-    denominator (recorded by the parser BEFORE any automatic
-    cancellation), so symbolic cancellation can never erase them.
+    Each pair is ``(variable_name, canonical_zero_text)`` and comes only
+    from exactly resolved univariate original denominators. Values are
+    never pooled across variables: a zero of ``x`` never excludes an
+    assignment to ``y``.
     """
+    pairs = set()
+    for item in record["original_denominators"]:
+        if not item["resolvable"]:
+            continue
+        for zero in item["zeros"]:
+            pairs.add((item["variables"][0], zero))
+    return pairs
+
+
+def _domain_notes_for_pair(lhs_record, rhs_record):
+    """Domain compatibility notes from the ORIGINAL parse-level provenance.
+
+    The excluded pairs are variable-specific zero sets of every original
+    denominator (recorded by the parser BEFORE any automatic
+    cancellation), so symbolic cancellation can never erase them, and a
+    zero of one variable is never compared against another variable's
+    assignments.
+    """
+    lhs_pairs = _excluded_pairs(lhs_record)
+    rhs_pairs = _excluded_pairs(rhs_record)
     lhs_excluded = set(lhs_record["excluded_values"])
     rhs_excluded = set(rhs_record["excluded_values"])
     combined_complete = lhs_record["domain_analysis_complete"] \
@@ -191,22 +212,22 @@ def _domain_notes_for_pair(lhs_record, rhs_record):
     if not combined_complete:
         notes.append(
             "the original-domain analysis is incomplete: at least one "
-            "denominator's zero set could not be resolved exactly, so "
+            "denominator's restriction could not be resolved exactly, so "
             "the identity cannot be certified as fully-domain-safe")
-    extra_lhs = sorted(value for value in lhs_excluded
-                       if value not in rhs_excluded)
-    extra_rhs = sorted(value for value in rhs_excluded
-                       if value not in lhs_excluded)
+    extra_lhs = sorted(pair for pair in lhs_pairs if pair not in rhs_pairs)
+    extra_rhs = sorted(pair for pair in rhs_pairs if pair not in lhs_pairs)
     if extra_lhs:
         notes.append(
             "the identity holds on the common domain only: the "
             "left-hand side is undefined at the excluded value(s) "
-            + ", ".join(extra_lhs))
+            + ", ".join(value + " (variable " + variable + ")"
+                        for variable, value in extra_lhs))
     if extra_rhs:
         notes.append(
             "the identity holds on the common domain only: the "
             "right-hand side is undefined at the excluded value(s) "
-            + ", ".join(extra_rhs))
+            + ", ".join(value + " (variable " + variable + ")"
+                        for variable, value in extra_rhs))
     return notes, extra_lhs, extra_rhs, combined_complete
 
 
@@ -515,6 +536,17 @@ def _classify_equation_diff(canonical, variable):
     return poly, "solver_partial"       # degree 3..4: incompleteness risk
 
 
+def zero_of_any_denominator(excluded_pairs, candidate_root):
+    """True when the claimed value zeroes SOME resolvable denominator.
+
+    Used only where the owning variable is structurally ambiguous
+    (cancelled-away multi-variable equations); the single-variable
+    paths match the pair exactly.
+    """
+    text = canonical_text(candidate_root)
+    return any(value == text for _variable, value in excluded_pairs)
+
+
 def _verify_equation_solutions(claim, whitelist, result):
     from sympy import cancel, roots as sympy_roots
     is_quadratic = claim["kind"] == KIND_QUADRATIC
@@ -524,7 +556,8 @@ def _verify_equation_solutions(claim, whitelist, result):
         else "bounded_polynomial_solution_check")
     claimed_list = _parse_claimed_solutions(claim["solutions"], whitelist)
     referenced = set(equation_record["referenced_variables"])
-    excluded = set(equation_record["excluded_values"])
+    excluded_pairs = _excluded_pairs(equation_record)
+    excluded = sorted({zero for _variable, zero in excluded_pairs})
     domain_complete = equation_record["domain_analysis_complete"]
     if len(variable_and_others) != 1:
         if variable_and_others:
@@ -547,8 +580,9 @@ def _verify_equation_solutions(claim, whitelist, result):
                     "claimed solutions must be exact; approximate "
                     "floats are not accepted as solutions in this "
                     "stage")
-            if canonical_text(candidate_root) in excluded:
-                # The original equation is undefined at this value.
+            if zero_of_any_denominator(excluded_pairs, candidate_root):
+                # The original equation is undefined at this value: the
+                # claimed solution zeroes some original denominator.
                 checked.append({
                     "solution": canonical_text(candidate_root),
                     "status": "solution_excluded_by_original_domain",
@@ -565,7 +599,7 @@ def _verify_equation_solutions(claim, whitelist, result):
                     "status": "root_rejected",
                     "residual": str(value)})
         evidence = {"claimed_solutions_checked": checked,
-                    "original_domain_excluded_values": sorted(excluded)}
+                    "original_domain_excluded_values": excluded}
         if not domain_complete:
             evidence["domain_analysis_incomplete"] = True
         evidence["rejected_solutions"] = [
@@ -599,10 +633,10 @@ def _verify_equation_solutions(claim, whitelist, result):
             raise _EngineUnsupported(
                 "claimed solutions must be exact; approximate floats are "
                 "not accepted as solutions in this stage")
-        if canonical_text(candidate_root) in excluded:
-            # The ORIGINAL equation is undefined where any original
-            # denominator is zero; such solutions are refused even if
-            # cancellation made the difference look root-like there.
+        if (variable.name, canonical_text(candidate_root)) in excluded_pairs:
+            # The ORIGINAL equation is undefined where an original
+            # denominator in this variable is zero; such solutions are
+            # refused even if cancellation erased the denominator.
             all_claimed_roots_valid = False
             root_reports.append({
                 "solution": canonical_text(candidate_root),
@@ -626,7 +660,7 @@ def _verify_equation_solutions(claim, whitelist, result):
                                  "residual": canonical_text(value)})
     evidence = {
         "claimed_solutions_checked": root_reports,
-        "original_domain_excluded_values": sorted(excluded),
+        "original_domain_excluded_values": excluded,
     }
     if not domain_complete:
         evidence["domain_analysis_incomplete"] = True
@@ -642,7 +676,7 @@ def _verify_equation_solutions(claim, whitelist, result):
             entry for entry in root_reports
             if entry["status"] != "root_confirmed"]
         if status == "trusted" and domain_complete:
-            _attach_computed_set(poly, evidence, excluded)
+            _attach_computed_set(poly, evidence, excluded_pairs, variable)
             if evidence.get("solution_set_on_common_domain") == []:
                 evidence["completeness"] = (
                     "the equation has NO solutions in the supported "
@@ -694,8 +728,10 @@ def _verify_equation_solutions(claim, whitelist, result):
         return OUTCOME_CONTRADICTED, evidence
     computed = sorted({canonical_text(root) for root, multiplicity
                        in sympy_roots(poly).items()})
-    excluded_computed = [text for text in computed if text in excluded]
-    effective = [text for text in computed if text not in excluded]
+    excluded_computed = [text for text in computed
+                         if (variable.name, text) in excluded_pairs]
+    effective = [text for text in computed
+                 if (variable.name, text) not in excluded_pairs]
     evidence["computed_solution_set"] = computed
     evidence["solution_set_on_common_domain"] = effective
     evidence["excluded_computed_roots"] = excluded_computed
@@ -728,8 +764,13 @@ def _verify_equation_solutions(claim, whitelist, result):
     return OUTCOME_INCONCLUSIVE, evidence
 
 
-def _attach_computed_set(poly, evidence, excluded):
-    """Best-effort diagnostic solution set for contradicted claims."""
+def _attach_computed_set(poly, evidence, excluded_pairs, variable):
+    """Best-effort diagnostic solution set for contradicted claims.
+
+    ``variable`` is the solving symbol; computed roots are filtered
+    through the variable-specific original denominators (provenance
+    pairs keyed by symbol NAME), never through a pooled set.
+    """
     from sympy import roots as sympy_roots
     try:
         computed = sorted({canonical_text(root) for root, _multiplicity
@@ -737,8 +778,11 @@ def _attach_computed_set(poly, evidence, excluded):
     except Exception:
         return
     evidence["computed_solution_set"] = computed
+    evidence["excluded_computed_roots"] = [
+        text for text in computed if (variable.name, text) in excluded_pairs]
     evidence["solution_set_on_common_domain"] = [
-        text for text in computed if text not in excluded]
+        text for text in computed
+        if (variable.name, text) not in excluded_pairs]
 
 
 def _verify_substitution(claim, whitelist, result):
@@ -752,7 +796,7 @@ def _verify_substitution(claim, whitelist, result):
             "substitution verification requires exact claimed values")
     expression = expression_record["lhs"]
     claimed_value = claimed_record["lhs"]
-    excluded = set(expression_record["excluded_values"])
+    excluded_pairs = _excluded_pairs(expression_record)
     result["verification_kind"] = EXACT_KIND
     result["method_description"] = "exact_substitution_evaluation"
     assignments = claim["assignments"]
@@ -775,9 +819,11 @@ def _verify_substitution(claim, whitelist, result):
         if value.free_symbols:
             raise _EngineUnsupported(
                 "assignment values must be constants in this stage")
-        if canonical_text(value) in excluded:
-            # The ORIGINAL expression is undefined at this assignment;
-            # any claimed value there is a contradiction, never a match.
+        if (variable_name, canonical_text(value)) in excluded_pairs:
+            # The ORIGINAL expression is undefined at this assignment:
+            # a resolvable original denominator in this very variable
+            # evaluates to zero there. Values are never pooled across
+            # variables; an excluded value of x never rejects y.
             excluded_assignments.append(
                 {"variable": variable_name,
                  "value": canonical_text(value)})
