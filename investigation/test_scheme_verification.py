@@ -119,6 +119,40 @@ class ModelContractTests(unittest.TestCase):
             scheme_model.parse_scheme(_scheme([
                 {"id": "Q1", "criteria": [{"id": "Q1-root", "dependencies": too_many_deps}]}]))
 
+    def test_optional_fields_cannot_cause_unbounded_processing(self):
+        huge_extra = "y" * (scheme_model.MAX_EXTRAS_SERIALIZED_CHARS + 1)
+        with self.assertRaises(scheme_model.SchemeModelError):
+            scheme_model.parse_scheme(_scheme([
+                {"id": "Q1", "criteria": [{"id": "Q1-c1", "blob": huge_extra}]}]))
+        with self.assertRaises(scheme_model.SchemeModelError):
+            scheme_model.parse_scheme(
+                _scheme([{"id": "Q1", "criteria": [
+                    {"id": "Q1-c1", "code": "M1", "weight": 1}]}],
+                    provenance=None) | {"blob": huge_extra})
+        # deep nested extras are rejected rather than recursed into
+        root = {}
+        cursor = root
+        for _ in range(3000):
+            cursor["link"] = {}
+            cursor = cursor["link"]
+        with self.assertRaises(scheme_model.SchemeModelError):
+            scheme_model.parse_scheme(
+                _scheme([{"id": "Q1", "criteria": []}]) | {"nested": root})
+        # source_ref values must be scalar and bounded
+        with self.assertRaises(scheme_model.SchemeModelError):
+            scheme_model.parse_scheme(_scheme([
+                {"id": "Q1", "criteria": [
+                    {"id": "Q1-c1", "source_ref": {"page": {"deep": 1}}}]}]))
+        with self.assertRaises(scheme_model.SchemeModelError):
+            long_value = "v" * (scheme_model.MAX_SOURCE_REF_STRING_CHARS + 1)
+            scheme_model.parse_scheme(_scheme([
+                {"id": "Q1", "criteria": [
+                    {"id": "Q1-c1", "source_ref": {"page": long_value}}]}]))
+        long_provenance = {"note": "w" * (scheme_model.MAX_EXTRAS_SERIALIZED_CHARS + 1)}
+        with self.assertRaises(scheme_model.SchemeModelError):
+            scheme_model.parse_scheme(_scheme(
+                [{"id": "Q1", "criteria": []}], provenance=long_provenance))
+
     def test_mark_code_grammar(self):
         supported = ["M1", "A1", "B2", "dM1", "A1ft", "M2ft", "B1ft", "dM2"]
         unsupported = ["X1", "m1", "M0", "dA1", "C1", 10, None, "A1 FT", "", "-", "dM"]
@@ -407,9 +441,198 @@ class DuplicateQuestionIdTests(unittest.TestCase):
         absent = _one(payload, "SCHEME-TOTAL-ABSENT")
         self.assertEqual(absent["evidence"]["colliding_occurrences"], 2)
 
+    def test_same_identity_with_distinct_evidence_keeps_both(self):
+        # Two questions share the id "Q7" and have different criteria counts;
+        # their TOTAL-ABSENT findings must coexist with complete evidence.
+        payload = _scheme([
+            {"id": "Q7", "criteria": [{"id": "Q7-A", "code": "M1", "weight": 1}]},
+            {"id": "Q7", "criteria": [
+                {"id": "Q7-B", "code": "M1", "weight": 1},
+                {"id": "Q7-C", "code": "M1", "weight": 1},
+                {"id": "Q7-D", "code": "M1", "weight": 1}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-TOTAL-ABSENT"]
+        self.assertEqual(len(findings), 2)
+        counts = sorted(f["evidence"]["criteria_count"]
+                        for f in findings)
+        self.assertEqual(counts, [1, 3])
+        ids = sorted(f["finding_id"] for f in findings)
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertTrue(all(f["evidence"].get("colliding_occurrences") is None
+                            for f in findings))
+        # all findings of the run still have unique identities
+        all_ids = [f["finding_id"] for f in engine.verify_scheme(payload)]
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+
+
+class IdentityAndAmbiguityTests(unittest.TestCase):
+    """PR #23 review correction 1: every logically distinct issue keeps its
+    complete evidence; correction 2: ambiguous duplicate identifiers are
+    never treated as verified dependency relationships."""
+
+    def test_multiple_invalid_dependencies_on_one_criterion_keep_evidence(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-c3", "code": "A1", "weight": 1,
+                 "dependencies": ["missing-M1", "missing-M2"]}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-DEP-UNDEFINED"]
+        self.assertEqual(len(findings), 2)
+        by_dep = {f["evidence"]["dependency_id"]: f for f in findings}
+        self.assertEqual(sorted(by_dep), ["missing-M1", "missing-M2"])
+        self.assertEqual(by_dep["missing-M1"]["finding_id"],
+                         "SCHEME-DEP-UNDEFINED::Q1::Q1-c3::missing-M1")
+        self.assertEqual(by_dep["missing-M2"]["finding_id"],
+                         "SCHEME-DEP-UNDEFINED::Q1::Q1-c3::missing-M2")
+        self.assertEqual(len({f["finding_id"] for f in findings}), 2)
+
+    def test_multiple_independent_errors_sharing_question_and_criterion(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-c3", "code": "X1", "weight": 1,
+                 "dependencies": ["missing-M1", "missing-M2"]}]}])
+        findings = engine.verify_scheme(payload)
+        ids = [f["finding_id"] for f in findings]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(findings), 3)   # 2 x UNDEFINED + UNSUPPORTED-CODE
+        self.assertEqual(
+            len({f["rule_id"] for f in findings}), 2)
+        # all three share question and criterion identity, all evidence intact
+        for finding in findings:
+            self.assertEqual(finding["question_id"], "Q1")
+            self.assertEqual(finding["criterion_ids"], ["Q1-c3"])
+            self.assertTrue(finding["evidence"])
+
+    def test_multiple_duplicated_dependency_declarations_distinguished(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-M1", "code": "M1", "weight": 1},
+                {"id": "Q1-A1", "code": "A1", "weight": 1,
+                 "dependencies": ["Q1-M1", "Q1-M1", "Q1-Z0", "Q1-Z0"]}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-DEP-DUPLICATED"]
+        self.assertEqual(sorted(f["evidence"]["dependency_id"]
+                                for f in findings),
+                         ["Q1-M1", "Q1-Z0"])
+        self.assertNotEqual(findings[0]["finding_id"], findings[1]["finding_id"])
+
+    def test_distinct_alternative_groups_produce_distinct_findings(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 2, "criteria": [
+                {"id": "Q1-A1", "code": "A1", "weight": 1,
+                 "alternative_group": "ALPHA"},
+                {"id": "Q1-A2", "code": "A1", "weight": 1,
+                 "alternative_group": "BETA"}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-ALT-GROUP-INVALID"]
+        self.assertEqual(sorted(f["evidence"]["alternative_group"]
+                                for f in findings), ["ALPHA", "BETA"])
+        self.assertNotEqual(findings[0]["finding_id"], findings[1]["finding_id"])
+
+    def test_distinct_invalid_weights_on_duplicates_of_one_id_are_kept(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 0, "criteria": [
+                {"id": "Q1-D", "code": "M1", "weight": 0},
+                {"id": "Q1-D", "code": "M1", "weight": -1}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-WEIGHT-NONPOSITIVE"]
+        self.assertEqual(sorted(f["evidence"]["weight"] for f in findings),
+                         [-1, 0])
+        self.assertNotEqual(findings[0]["finding_id"], findings[1]["finding_id"])
+
+    def test_missing_fields_on_duplicated_criterion_consolidate_identically(self):
+        # Two occurrences of one id, each missing the same fields: the issues
+        # are identical and consolidate with the occurrence count recorded.
+        payload = _scheme([
+            {"id": "Q1", "total": 0, "criteria": [
+                {"id": "Q1-D", "code": "B1"},
+                {"id": "Q1-D", "code": "B1"}]}])
+        findings = [f for f in engine.verify_scheme(payload)
+                    if f["rule_id"] == "SCHEME-FIELD-MISSING"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["evidence"]["colliding_occurrences"], 2)
+        self.assertEqual(findings[0]["evidence"]["missing_fields"], ["weight"])
+
+    def test_same_criterion_with_different_missing_field_sets_distinct(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 0, "criteria": [
+                {"id": "Q1-E1"}, {"id": "Q1-E2", "weight": 0}]}])
+        field_findings = [f for f in engine.verify_scheme(payload)
+                          if f["rule_id"] == "SCHEME-FIELD-MISSING"]
+        self.assertEqual(len(field_findings), 2)
+        self.assertNotEqual(field_findings[0]["finding_id"],
+                            field_findings[1]["finding_id"])
+
+    def test_ambiguous_reference_is_not_undefined_and_no_cycle_is_concluded(self):
+        # Q1-U (unique) depends on the duplicated Q2-A1; both Q2-A1
+        # occurrences depend back on Q1-U. Raw edges would suggest a cycle,
+        # but no cycle may be concluded over ambiguous identifiers.
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-U", "code": "M1", "weight": 1,
+                 "dependencies": ["Q2-A1"]}]},
+            {"id": "Q2", "total": 2, "criteria": [
+                {"id": "Q2-A1", "code": "A1", "weight": 1,
+                 "dependencies": ["Q1-U"]},
+                {"id": "Q2-A1", "code": "A1", "weight": 1,
+                 "dependencies": ["Q1-U"]}]}])
+        findings = engine.verify_scheme(payload)
+        rules = sorted(f["rule_id"] for f in findings)
+        self.assertEqual(rules, ["SCHEME-DUP-CRITERIA", "SCHEME-REF-AMBIGUOUS"])
+        ambiguous = [f for f in findings
+                     if f["rule_id"] == "SCHEME-REF-AMBIGUOUS"][0]
+        self.assertEqual(ambiguous["state"], engine.INSUFFICIENT)
+        self.assertEqual(ambiguous["evidence"]["referenced_occurrences"], 2)
+        self.assertTrue(ambiguous["review_required"])
+
+    def test_undefined_still_reported_when_not_duplicated(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-U", "code": "M1", "weight": 1,
+                 "dependencies": ["QX-404"]}]}])
+        finding = _one(payload, "SCHEME-DEP-UNDEFINED")
+        self.assertEqual(finding["evidence"]["dependency_id"], "QX-404")
+
+    def test_self_dependency_with_duplicated_own_id_is_ambiguous(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 2, "criteria": [
+                {"id": "Q1-S", "code": "M1", "weight": 1,
+                 "dependencies": ["Q1-S"]},
+                {"id": "Q1-S", "code": "M1", "weight": 1}]}])
+        rules = sorted(f["rule_id"] for f in engine.verify_scheme(payload))
+        self.assertEqual(rules,
+                         ["SCHEME-DUP-CRITERIA", "SCHEME-REF-AMBIGUOUS"])
+        ambiguous = [f for f in engine.verify_scheme(payload)
+                     if f["rule_id"] == "SCHEME-REF-AMBIGUOUS"][0]
+        self.assertIn("self-reference", ambiguous["evidence"]["cause"])
+
+    def test_self_dependency_with_unique_id_remains_verified(self):
+        payload = _scheme([
+            {"id": "Q1", "total": 1, "criteria": [
+                {"id": "Q1-S", "code": "M1", "weight": 1,
+                 "dependencies": ["Q1-S"]}]}])
+        finding = _one(payload, "SCHEME-DEP-SELF")
+        self.assertEqual(finding["state"], engine.VERIFIED)
+        self.assertEqual(
+            finding["finding_id"], "SCHEME-DEP-SELF::Q1::Q1-S::Q1-S")
+
+    def test_unique_id_dependency_graph_unchanged_negative_control(self):
+        # deliberately valid graph around duplicate identifiers elsewhere:
+        # unique ids elsewhere in the document are NOT affected
+        payload = _scheme([
+            {"id": "Q1", "total": 3, "criteria": [
+                {"id": "Q1-M1", "code": "M1", "weight": 1},
+                {"id": "Q1-A1", "code": "A1", "weight": 1,
+                 "dependencies": ["Q1-M1"]},
+                {"id": "Q1-B1", "code": "B1", "weight": 1}]},
+            {"id": "Q2", "total": 2, "criteria": [
+                {"id": "Q2-X", "code": "M1", "weight": 1},
+                {"id": "Q2-Y", "code": "A1", "weight": 1,
+                 "dependencies": ["Q2-X"]}]}])
+        self.assertEqual(_keys(payload), [])
+
 
 class DiagramDependenceTests(unittest.TestCase):
-
     def test_explicit_diagram_dependence_requires_human_review(self):
         payload = _scheme([
             {"id": "Q9", "total": 1, "diagram_dependent": True, "criteria": [
@@ -494,7 +717,7 @@ class ModuleHygieneTests(unittest.TestCase):
                                  f"{module.__name__} contains {pattern!r}")
 
     def test_rules_documented_constant_matches_engine_checks(self):
-        self.assertEqual(len(engine.SUPPORTED_RULES), 18)
+        self.assertEqual(len(engine.SUPPORTED_RULES), 19)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -520,7 +743,8 @@ class BenchmarkTests(unittest.TestCase):
             "missing-source-information", "diagram-dependent-question",
             "official-style-exception-valid", "claimed-solution-unverifiable",
             "duplicated-dependency-declaration", "contradictory-follow-through",
-            "alternative-groups-valid-and-invalid"}
+            "alternative-groups-valid-and-invalid",
+            "ambiguous-dependency-reference"}
         ids = {case["id"] for case in self.data["cases"]}
         self.assertEqual(expected_cases - ids, set())
 

@@ -34,7 +34,12 @@ invalid and reported as a finding rather than silently accepted.
 Malformed input (wrong types, wrong containers, empty identifiers, or
 oversized documents) raises :class:`SchemeModelError`, a ValueError subclass,
 with a message that names the offending document position but never echoes
-scheme prose, so errors can be logged safely.
+scheme prose, so errors can be logged safely. Optional prose and extra
+fields are BOUNDED so no document content can drive unbounded processing:
+``note``/``claimed_solution`` are character-limited, ``source_ref`` strings
+and dicts are length/key/value-scalar limited, and every extra field must be
+JSON-serializable data within a total serialized-size cap (deep nesting is
+rejected rather than recursed).
 
 Supported input contract (all keys absent/unavailable unless stated):
 
@@ -73,12 +78,17 @@ Constraints enforced here (malformed -> SchemeModelError):
 - every *extra* key is retained verbatim in ``extras`` and otherwise ignored
 - size caps: MAX_QUESTIONS/CRITERIA/DEPENDENCIES/NOTE_CHAR_LIMIT
 """
+import json
 import re
 
 MAX_QUESTIONS = 100
 MAX_CRITERIA_PER_QUESTION = 50
 MAX_DEPENDENCIES_PER_CRITERION = 20
 MAX_NOTE_CHAR_LIMIT = 4000
+MAX_SOURCE_REF_STRING_CHARS = 1000
+MAX_SOURCE_REF_KEYS = 20
+MAX_EXTRAS_SERIALIZED_CHARS = 50_000
+MAX_EXTRA_DEPTH = 32
 
 _MARK_CODE_PATTERN = re.compile(r"^(?:(?:dM|M|A|B)[1-9][0-9]*)(?:ft)?$")
 _SUPPORTED_BASES = ("M", "A", "B", "dM")
@@ -136,7 +146,9 @@ def _source_ref(value, position):
     """Verbatim source reference; dict (e.g. pdf page) or short string or null.
 
     Kept exactly as supplied: the engine never parses pages or sessions from
-    it in Stage C2.
+    it in Stage C2. Bounds: strings <= MAX_SOURCE_REF_STRING_CHARS, dicts
+    <= MAX_SOURCE_REF_KEYS with scalar values only, so no source-reference
+    payload can drive unbounded processing.
     """
     if value is None:
         return None
@@ -145,11 +157,60 @@ def _source_ref(value, position):
             raise SchemeModelError(f"{position}: source_ref is empty or too long")
         return value
     if isinstance(value, dict):
-        if len(value) > 20:
-            raise SchemeModelError(f"{position}: source_ref dict is too large")
+        if len(value) > MAX_SOURCE_REF_KEYS:
+            raise SchemeModelError(
+                f"{position}: source_ref dict has more than "
+                f"{MAX_SOURCE_REF_KEYS} keys")
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise SchemeModelError(
+                    f"{position}: source_ref keys must be strings")
+            if isinstance(item, (dict, list)):
+                raise SchemeModelError(
+                    f"{position}: source_ref values must be scalars")
+            if isinstance(item, str) and len(item) > MAX_SOURCE_REF_STRING_CHARS:
+                raise SchemeModelError(
+                    f"{position}: source_ref string values exceed "
+                    f"{MAX_SOURCE_REF_STRING_CHARS} characters")
         return dict(value)
     raise SchemeModelError(
         f"{position}: source_ref must be a string, a dict or omitted")
+
+
+def _bounded_payload(value, position, what):
+    """Bound any verbatim-retained payload (extras and similar).
+
+    The payload must be JSON data (it is never code) and fit within
+    MAX_EXTRAS_SERIALIZED_CHARS when serialized; container nesting deeper
+    than MAX_EXTRA_DEPTH is rejected by an EXPLICIT STACK WALK (never
+    recursive), so no document content can drive unbounded or deep
+    processing. Nothing else is enforced: unknown fields remain unknown and
+    are never interpreted.
+    """
+    if not value:
+        return
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_EXTRA_DEPTH:
+            raise SchemeModelError(
+                f"{position}: {what} are nested deeper than "
+                f"{MAX_EXTRA_DEPTH} levels")
+        if isinstance(node, dict):
+            for nested in node.values():
+                stack.append((nested, depth + 1))
+        elif isinstance(node, list):
+            for nested in node:
+                stack.append((nested, depth + 1))
+    try:
+        serialized = json.dumps(value, sort_keys=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise SchemeModelError(
+            f"{position}: {what} must be JSON-serializable data") from exc
+    if len(serialized) > MAX_EXTRAS_SERIALIZED_CHARS:
+        raise SchemeModelError(
+            f"{position}: {what} exceed the {MAX_EXTRAS_SERIALIZED_CHARS}-"
+            "character serialized limit")
 
 
 def _require_nonempty_id(value, position, field):
@@ -308,6 +369,7 @@ def _parse_criterion(raw, index, question_id):
     known = {"id", "code", "weight", "dependencies", "follow_through",
              "alternative_group", "note", "source_ref"}
     extras = {key: value for key, value in raw.items() if key not in known}
+    _bounded_payload(extras, position, "extra criterion fields")
 
     return Criterion(
         document_index=index,
@@ -347,6 +409,7 @@ def _parse_question(raw, index):
     known = {"id", "total", "diagram_dependent", "claimed_solution",
              "source_ref", "criteria"}
     extras = {key: value for key, value in raw.items() if key not in known}
+    _bounded_payload(extras, position, "extra question fields")
 
     return Question(
         document_index=index,
@@ -372,6 +435,8 @@ def parse_scheme(payload):
     provenance = payload.get("provenance")
     if provenance is not None and not isinstance(provenance, dict):
         raise SchemeModelError("Field 'provenance' must be an object or omitted")
+    if isinstance(provenance, dict):
+        _bounded_payload(provenance, "document provenance", "provenance fields")
     questions_raw = payload.get("questions")
     if not isinstance(questions_raw, list):
         raise SchemeModelError("A 'questions' list is required")
@@ -381,6 +446,7 @@ def parse_scheme(payload):
 
     known = {"provenance", "questions"}
     extras = {key: value for key, value in payload.items() if key not in known}
+    _bounded_payload(extras, "document", "extra document fields")
 
     questions = [_parse_question(entry, index)
                  for index, entry in enumerate(questions_raw)]

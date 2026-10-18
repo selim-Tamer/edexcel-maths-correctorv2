@@ -61,8 +61,9 @@
     },
     {
       "id": "dependency-missing-criterion",
-      "description": "A dependency references a criterion id that does not exist anywhere in the document.",
+      "description": "Two dependencies of one criterion reference criterion ids that do not exist anywhere; both findings keep their own evidence.",
       "expected_findings": [
+        {"rule_id": "SCHEME-DEP-UNDEFINED", "question_id": "Q1", "criterion_ids": ["Q1-A1"]},
         {"rule_id": "SCHEME-DEP-UNDEFINED", "question_id": "Q1", "criterion_ids": ["Q1-A1"]}
       ],
       "unsupported_in_stage": [],
@@ -75,7 +76,39 @@
             "criteria": [
               {"id": "Q1-M1", "code": "M1", "weight": 1},
               {"id": "Q1-A1", "code": "A1", "weight": 1,
-               "dependencies": ["Q1-M2"]}
+               "dependencies": ["Q1-M2", "Q1-M3"]}
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ambiguous-dependency-reference",
+      "description": "A dependency references a duplicated criterion id. The reference is neither valid nor undefined; it is evidence-insufficient. Dependence of the duplicated occurrences back on the unique criterion would superficially form a cycle, but no cycle conclusion may be drawn from ambiguous edges.",
+      "expected_findings": [
+        {"rule_id": "SCHEME-DUP-CRITERIA", "question_id": null, "criterion_ids": ["Q2-A1"]},
+        {"rule_id": "SCHEME-REF-AMBIGUOUS", "question_id": "Q1", "criterion_ids": ["Q1-U"]}
+      ],
+      "unsupported_in_stage": ["resolving which duplicated occurrence is the dependency target"],
+      "scheme": {
+        "provenance": {"author": "synthetic benchmark", "verified": false},
+        "questions": [
+          {
+            "id": "Q1",
+            "total": 1,
+            "criteria": [
+              {"id": "Q1-U", "code": "M1", "weight": 1,
+               "dependencies": ["Q2-A1"]}
+            ]
+          },
+          {
+            "id": "Q2",
+            "total": 2,
+            "criteria": [
+              {"id": "Q2-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-U"]},
+              {"id": "Q2-A1", "code": "A1", "weight": 1,
+               "dependencies": ["Q1-U"]}
             ]
           }
         ]

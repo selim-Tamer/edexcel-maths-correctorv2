@@ -30,11 +30,16 @@ Deterministic checks (rule ids are stable identifiers used by tests):
 - SCHEME-TOTAL-UNRECONCILABLE total present but some weight missing/invalid
   (evidence_insufficient)
 - SCHEME-DEP-UNDEFINED   dependency references a nonexistent criterion id
-- SCHEME-DEP-SELF        criterion depends on itself
+- SCHEME-DEP-SELF        criterion depends on itself (unique ids only)
+- SCHEME-REF-AMBIGUOUS   the referenced identifier is duplicated in the
+  document, so the target occurrence cannot be identified; the reference is
+  never treated as a verified-valid dependency
 - SCHEME-DEP-DUPLICATED  the same dependency declared twice (contradictory
   explicit declarations)
-- SCHEME-DEP-CYCLE       dependency cycle (iterative Tarjan SCC, bounded by
-  the documented size caps; unbounded traversal is impossible)
+- SCHEME-DEP-CYCLE       dependency cycle over UNAMBIGUOUS relationships only
+  (iterative Tarjan SCC, bounded by the documented size caps; unbounded
+  traversal is impossible; edges touching duplicated identifiers are
+  excluded from cycle conclusions)
 - SCHEME-FT-CONTRADICTION follow-through flag contradicts an explicit "ft"
   code suffix (e.g. code "A1ft" with follow_through false)
 - SCHEME-FT-MISMATCH     follow-through flag true but code lacks the "ft"
@@ -53,6 +58,7 @@ Arithmetic is deliberately not evaluated here even though production uses a
 small safe evaluator, because re-implementing ad-hoc verification invites
 false positives; SymPy integration is a later stage needing approval.
 """
+import json
 from collections import Counter
 
 from investigation.scheme_model import (
@@ -71,10 +77,20 @@ REVIEW_STATES = (VERIFIED, SUSPECTED, INSUFFICIENT, HUMAN_REVIEW)
 
 
 def _finding(rule_id, category, state, severity, question_id, criterion_ids,
-             evidence, explanation):
-    """Build one finding dict with a deterministic, collision-checked id."""
+             evidence, explanation, discriminator=None):
+    """Build one finding dict with a deterministic, collision-checked id.
+
+    ``discriminator`` (when the rule has an intrinsic per-occurrence
+    attribute, such as the missing dependency id or the alternative-group
+    name) becomes part of the identity, so logically distinct issues never
+    share an id. Residual same-identity collisions (possible only under
+    duplicated question identifiers) are handled deterministically in
+    ``verify_scheme_document`` without discarding any evidence.
+    """
     ordered_criteria = sorted(criterion_ids)
     parts = [rule_id, question_id or "-", ",".join(ordered_criteria)]
+    if discriminator is not None:
+        parts.append(str(discriminator))
     finding_id = "::".join(parts)
     return {
         "finding_id": finding_id,
@@ -143,7 +159,10 @@ def check_mark_codes(document):
                  "grammar": "^(dM|M|A|B)[1-9][0-9]*ft?$"},
                 f"Mark code '{criterion.code}' is outside the supported "
                 "M/A/B/dM notation, so its meaning cannot be reconciled; "
-                "unknown codes are never assumed valid."))
+                "unknown codes are never assumed valid. A notation mismatch "
+                "is a property of this record; this rule never asserts that "
+                "an official Pearson mark scheme is wrong.",
+                discriminator=criterion.code))
     return findings
 
 
@@ -158,7 +177,8 @@ def check_weights(document):
                 VERIFIED, "medium", question.id, [criterion.id],
                 {"weight": criterion.weight},
                 f"Criterion '{criterion.id}' declares weight "
-                f"{criterion.weight}; weights must be positive integers."))
+                f"{criterion.weight}; weights must be positive integers.",
+                discriminator=str(criterion.weight)))
     return findings
 
 
@@ -179,7 +199,8 @@ def check_required_fields(document):
             {"missing_fields": missing, "evidence": _criterion_evidence(criterion)},
             f"Criterion '{criterion.id}' is missing required structural "
             f"field(s): {', '.join(missing)}. The record cannot be scored or "
-            "reconciled; absence is reported, never filled by inference."))
+            "reconciled; absence is reported, never filled by inference.",
+            discriminator=",".join(missing)))
     return findings
 
 
@@ -230,24 +251,43 @@ def check_question_totals(document):
 
 
 def check_dependencies(document):
-    id_set = set()
-    for _, criterion in document.criteria():
-        id_set.add(criterion.id)
+    """Dependency rules with duplicate-aware resolution.
+
+    A dependency id is resolved ONLY against unique criterion identifiers
+    (ids that appear exactly once). When the referenced id is itself
+    duplicated anywhere in the document, the relationship cannot be resolved
+    to a unique target, so it is reported as an ambiguous reference
+    (evidence_insufficient) instead of either an undefined reference or a
+    verified-valid relationship. The same applies to a self-reference whose
+    own id is duplicated: "depends on itself" cannot be distinguished from
+    "depends on the other occurrence". Dependency-cycle conclusions are
+    therefore never drawn from ambiguous edges (see ``_dependents``).
+    """
+    id_counts = Counter(criterion.id for _, criterion in document.criteria())
 
     undefined = []
     self_dependent = []
     duplicated = []
+    ambiguous = []
     for question, criterion in document.criteria():
         seen = set()
         for dependency in criterion.dependencies:
-            if dependency == criterion.id:
-                self_dependent.append((question.id, criterion.id))
-                continue    # self-reference is undefined-reference noise, too
-            if dependency not in id_set and dependency not in seen:
-                undefined.append((question.id, criterion.id, dependency))
             if dependency in seen:
                 duplicated.append((question.id, criterion.id, dependency))
+                continue
             seen.add(dependency)
+            if dependency == criterion.id:
+                if id_counts[dependency] > 1:
+                    ambiguous.append((question.id, criterion.id, dependency,
+                                      "self-reference with a duplicated id"))
+                else:
+                    self_dependent.append((question.id, criterion.id))
+                continue
+            if id_counts.get(dependency, 0) > 1:
+                ambiguous.append((question.id, criterion.id, dependency,
+                                  "referenced id is duplicated"))
+            elif dependency not in id_counts:
+                undefined.append((question.id, criterion.id, dependency))
 
     findings = []
     for question_id, criterion_id, dependency in undefined:
@@ -256,30 +296,57 @@ def check_dependencies(document):
             "high", question_id, [criterion_id],
             {"dependency_id": dependency},
             f"Criterion '{criterion_id}' depends on '{dependency}', which is "
-            "not an identifier of any criterion in the document."))
+            "not an identifier of any criterion in the document.",
+            discriminator=dependency))
     for question_id, criterion_id in self_dependent:
         findings.append(_finding(
             "SCHEME-DEP-SELF", "self_dependency", VERIFIED,
             "high", question_id, [criterion_id],
             {"dependency_id": criterion_id},
             f"Criterion '{criterion_id}' declares itself as a dependency; "
-            "qualifications cannot resolve."))
+            "qualifications cannot resolve.",
+            discriminator=criterion_id))
     for question_id, criterion_id, dependency in duplicated:
         findings.append(_finding(
             "SCHEME-DEP-DUPLICATED", "contradictory_dependency_declaration",
             VERIFIED, "medium", question_id, [criterion_id],
             {"dependency_id": dependency},
             f"Criterion '{criterion_id}' declares dependency '{dependency}' "
-            "twice; duplicate declarations are contradictory bookkeeping."))
+            "twice; duplicate declarations are contradictory bookkeeping.",
+            discriminator=dependency))
+    for question_id, criterion_id, dependency, cause in ambiguous:
+        findings.append(_finding(
+            "SCHEME-REF-AMBIGUOUS", "ambiguous_dependency_reference",
+            INSUFFICIENT, "high", question_id, [criterion_id],
+            {"dependency_id": dependency, "cause": cause,
+             "referenced_occurrences": id_counts.get(dependency, 0)},
+            f"Criterion '{criterion_id}' depends on '{dependency}', whose "
+            f"identifier appears {id_counts.get(dependency, 0)} times in the "
+            "document; the target occurrence cannot be identified, so no "
+            "valid or invalid dependency conclusion is drawn for this "
+            "reference and it requires human disambiguation.",
+            discriminator=dependency))
     return findings
 
 
-def _dependents(document, defined_ids):
+def _dependents(document):
+    """Adjacency for cycle detection, using ONLY unambiguous relationships.
+
+    Both endpoints of every retained edge are criterion ids that appear
+    exactly once in the document, so a cycle conclusion can never depend on
+    an ambiguous duplicate identifier (which would risk tying two distinct
+    criteria together). Edges from or to duplicated ids - and self-references
+    with duplicated own ids - are excluded here and reported separately as
+    SCHEME-REF-AMBIGUOUS / SCHEME-DUP-CRITERIA findings.
+    """
+    id_counts = Counter(criterion.id for _, criterion in document.criteria())
     adjacency = {}
     for _, criterion in document.criteria():
+        if id_counts[criterion.id] > 1:
+            continue          # an ambiguous source node cannot anchor a cycle
         adjacency[criterion.id] = sorted(
             dependency for dependency in criterion.dependencies
-            if dependency in defined_ids and dependency != criterion.id)
+            if dependency != criterion.id and id_counts.get(dependency, 0) == 1)
     return adjacency
 
 
@@ -333,8 +400,7 @@ def _strongly_connected(adjacency, nodes):
 
 
 def check_dependency_cycles(document):
-    defined_ids = {criterion.id for _, criterion in document.criteria()}
-    adjacency = _dependents(document, defined_ids)
+    adjacency = _dependents(document)
     components = _strongly_connected(adjacency, sorted(adjacency))
     findings = []
     for component in components:
@@ -363,7 +429,10 @@ def check_follow_through(document):
                 f"Criterion '{criterion.id}' uses follow-through code suffix "
                 f"'ft' ({criterion.code}) but explicitly sets "
                 "follow_through=false; the two explicit declarations "
-                "contradict each other."))
+                "contradict each other. The evidence linking this finding to "
+                "its declarations is the code suffix and the flag value "
+                "recorded above.",
+                discriminator=f"{criterion.code}|flag:false"))
         elif flag is True and not code_ft:
             findings.append(_finding(
                 "SCHEME-FT-MISMATCH", "follow_through_code_mismatch",
@@ -371,7 +440,8 @@ def check_follow_through(document):
                 {"code": criterion.code, "follow_through": flag},
                 f"Criterion '{criterion.id}' is flagged follow-through but "
                 f"code {criterion.code} lacks the 'ft' suffix; this is a "
-                "plausible incongruity requiring interpretation."))
+                "plausible incongruity requiring interpretation.",
+                discriminator=f"{criterion.code}|flag:true"))
     return findings
 
 
@@ -390,7 +460,8 @@ def check_alternative_groups(document):
                     {"alternative_group": group_name, "members": members},
                     f"Alternative group '{group_name}' in question "
                     f"'{question.id}' has {len(members)} member(s); an "
-                    "alternatives declaration requires at least two."))
+                    "alternatives declaration requires at least two.",
+                    discriminator=group_name))
     return findings
 
 
@@ -459,8 +530,9 @@ SUPPORTED_RULES = (
     "SCHEME-WEIGHT-NONPOSITIVE", "SCHEME-FIELD-MISSING",
     "SCHEME-TOTAL-MISMATCH", "SCHEME-TOTAL-ABSENT",
     "SCHEME-TOTAL-UNRECONCILABLE", "SCHEME-DEP-UNDEFINED", "SCHEME-DEP-SELF",
-    "SCHEME-DEP-DUPLICATED", "SCHEME-DEP-CYCLE", "SCHEME-FT-CONTRADICTION",
-    "SCHEME-FT-MISMATCH", "SCHEME-ALT-GROUP-INVALID", "SCHEME-DIAGRAM-REVIEW",
+    "SCHEME-DEP-DUPLICATED", "SCHEME-REF-AMBIGUOUS", "SCHEME-DEP-CYCLE",
+    "SCHEME-FT-CONTRADICTION", "SCHEME-FT-MISMATCH",
+    "SCHEME-ALT-GROUP-INVALID", "SCHEME-DIAGRAM-REVIEW",
     "SCHEME-MATH-UNSUPPORTED", "SCHEME-PROVENANCE-ABSENT",
 )
 
@@ -469,23 +541,51 @@ def verify_scheme_document(document):
     """Run all deterministic checks over a parsed SchemeDocument.
 
     Returns findings sorted by finding_id (deterministic, exactly assertable).
-    Findings with identical ids (possible when question identifiers themselves
-    duplicate) are merged: the first occurrence is kept and its evidence
-    records ``colliding_occurrences``, so no report is duplicated or lost.
+
+    Consolidation policy - no evidence is ever silently discarded:
+    - Findings whose COMPLETE content is identical (possible under duplicated
+      question identifiers) are consolidated into one finding whose evidence
+      records ``colliding_occurrences``; the evidence itself stays available.
+    - Findings are distinguished intrinsically where the rule has an
+      attribute (missing dependency id, alternative group name, mark code,
+      weight value, missing-field set, code|flag pair), so logically distinct
+      issues never share an identity.
+    - Any residual same-finding_id collision (different content) keeps EVERY
+      occurrence: identity is extended with an order index over the canonical
+      content, which is stable for deterministic inputs.
     """
     findings = []
     for check in _CHECKS:
         findings.extend(check(document))
-    merged = {}
+
+    canonical_of = lambda finding: json.dumps(
+        finding, sort_keys=True, separators=(",", ":"))
+    counts = Counter(canonical_of(finding) for finding in findings)
+
+    consolidated = []
+    consumed = set()
     for finding in findings:
-        key = finding["finding_id"]
-        if key in merged:
-            evidence = merged[key]["evidence"]
-            evidence["colliding_occurrences"] = \
-                evidence.get("colliding_occurrences", 1) + 1
-        else:
-            merged[key] = finding
-    return sorted(merged.values(), key=lambda finding: finding["finding_id"])
+        canonical = canonical_of(finding)
+        if canonical in consumed:
+            continue
+        consumed.add(canonical)
+        if counts[canonical] > 1:
+            finding["evidence"]["colliding_occurrences"] = counts[canonical]
+        consolidated.append(finding)
+
+    by_id = {}
+    for finding in consolidated:
+        by_id.setdefault(finding["finding_id"], []).append(finding)
+    final = []
+    for finding_id, group in by_id.items():
+        ordered = sorted(group, key=canonical_of)
+        if len(ordered) == 1:
+            final.append(ordered[0])
+            continue
+        for index, finding in enumerate(ordered):
+            finding["finding_id"] = f"{finding_id}#{index}"
+            final.append(finding)
+    return sorted(final, key=lambda finding: finding["finding_id"])
 
 
 def verify_scheme(payload):
@@ -519,7 +619,6 @@ def load_benchmark(path=None):
     Raises ValueError (content-free, position-only messages) on structural
     malformation of the benchmark itself.
     """
-    import json
     from pathlib import Path
 
     if path is None:
