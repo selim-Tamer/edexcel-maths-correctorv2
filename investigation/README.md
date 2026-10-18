@@ -16,6 +16,34 @@ python -m unittest discover -s tests/ui -p 'test_*.py'
 
 PDF generation writes three deterministic synthetic files to `output/pdf/`. The stroke example is hand-drawn vector glyphs, not real handwriting. The source fixture generator is versioned; generated outputs need not be committed.
 
+## Stage C3 verification modules (offline)
+
+`investigation.pdf_evidence`, `investigation.pdf_question_map` and
+`investigation.verification_evidence` extract digital text from teacher-supplied
+PDFs offline, map question headings conservatively, and link Stage C2 findings
+to page evidence. They are not imported by the production app.
+
+Extraction mirrors the production bounds in `local_pdf.py` (50 MB document cap,
+2000-page cap, 20k chars/page, 2 MB aggregate text budget; 8-bit raw streams)
+and never repairs extracted text: page output states are only `extracted`,
+`empty_text_layer`, `extraction_failed`, `ambiguous_layout`,
+`unsupported_content` or `budget_exhausted`. Question mapping requires a
+caller-supplied question id list and only accepts anchored prefix headings
+(`Question N` / `Q N`); bare numbers are opt-in. Cross-page duplicate headings
+are reported as ambiguous; spanning-page inference is opt-in and labelled
+`heuristic_inference`. Excerpts in an evidence reference must be verbatim
+substrings of the page text with a span that bounds them, so fabricated spans
+are structurally impossible. Alignment findings reuse the Stage C2 state
+vocabulary and can only report suspected issues or evidence gaps — never a
+`verified_structural_inconsistency`, because extraction limitations can always
+hide real content.
+
+Run their tests with:
+
+```sh
+python -m unittest investigation.test_pdf_evidence investigation.test_pdf_question_map investigation.test_verification_evidence -v
+```
+
 ## Live (not executed for this investigation)
 
 Requires explicit human authorization, a separate test-only project with **no billing attached**, and rechecking the current Google free-tier pricing/access. A free-eligible model can charge a billed project. The script cannot check billing; do not use it when billing state is uncertain. Do not supply a production key. Do not place a key in a command line, environment variable, output file or chat.
