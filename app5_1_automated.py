@@ -1815,7 +1815,7 @@ def test_api_key(api_key: str):
             return True, "API key accepted, but no models were returned."
         return True, "API key accepted by Gemini."
     except Exception as exc:
-        message = str(exc)
+        message = redact_secret_values(str(exc), api_key)
 
         if "reported as leaked" in message.lower():
             return False, (
@@ -1937,6 +1937,75 @@ def google_logged_in() -> bool:
         return bool(st.user.is_logged_in)
     except Exception:
         return False
+
+
+AUTH_REQUIRED_MARKING = (
+    "Marking cannot start: sign in with Google first. Every marking run needs an "
+    "authenticated Google session; sign-in is not teacher verification. "
+    "Nothing was uploaded or sent to a provider."
+)
+
+
+def redact_secret_values(message: str, *secrets: str) -> str:
+    """Strip configured secret values from provider messages before display.
+
+    Provider exceptions may echo request details; this keeps the teacher
+    debugging text without leaking configured credentials to the browser.
+    """
+    redacted = str(message)
+    for secret in secrets:
+        value = str(secret or "").strip()
+        if value:
+            redacted = redacted.replace(value, "redacted")
+    return redacted
+
+
+def authenticated_google_identity():
+    """Server-side guard for every path that can consume operator Gemini quota.
+
+    Returns the stable OIDC subject (`st.user.sub`) of a signed-in Google
+    session, or None when the session is anonymous, expired or unidentified.
+    Authentication is unusable in Streamlit (no [auth] section configured) is
+    treated the same way as anonymous access: fail closed.
+
+    Signing in proves an *authenticated Google account only*. It does not
+    verify that the account is a teacher, and no teaching-status or roster
+    verification exists in this application. Callers must fail closed when
+    this returns None, before creating a Gemini client or transferring,
+    generating, auditing or retrying anything.
+    """
+    if not google_logged_in():
+        return None
+    subject = getattr(st.user, "sub", "")
+    if not isinstance(subject, str) or not subject.strip():
+        return None
+    return subject.strip()
+
+
+def render_manual_sign_in_requirement():
+    """Fail-closed sign-in UI for the manual marking page.
+
+    Display is a convenience only; the execution-boundary guard
+    (authenticated_google_identity) remains the authorization check.
+    """
+    st.info(
+        "Automatic marking is disabled until you sign in with Google. "
+        "Sign-in proves an authenticated Google account; it is not teacher "
+        "verification."
+    )
+    try:
+        configured = classroom_auth_configured()
+    except Exception:
+        configured = False
+    if configured:
+        if st.button("🔑 Sign in with Google", key="manual_google_sign_in"):
+            st.login("google")
+    else:
+        st.caption(
+            "Google sign-in is not configured on this deployment, so marking "
+            "stays unavailable. An operator must add the [auth] settings to "
+            "Streamlit Secrets. No secret values are stored or displayed here."
+        )
 
 
 def get_google_access_token() -> str:
@@ -3203,12 +3272,20 @@ with st.sidebar:
         st.warning("Some Gemini files could not be deleted. They remain subject to Gemini's automatic expiry.")
 
     if st.button("🔑 Test API key", use_container_width=True):
-        ok, message = test_api_key(api_key)
-        if ok:
-            st.success(message)
+        # Server-side boundary: even this lightweight check consumes requests on
+        # the configured key, so an anonymous session must not trigger it.
+        if authenticated_google_identity() is None:
+            st.error(
+                "Sign in with Google before testing API access. "
+                "Nothing was sent to a provider."
+            )
         else:
-            # Provider errors may echo request credentials; keep them server-side.
-            st.error("API key test failed. Check the key, model access and quota.")
+            ok, message = test_api_key(api_key)
+            if ok:
+                st.success(message)
+            else:
+                # Provider errors may echo request credentials; keep them server-side.
+                st.error("API key test failed. Check the key, model access and quota.")
 
     if not api_key:
         st.caption("No API key loaded.")
@@ -3427,7 +3504,17 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                             processed_ids = job_state["processed"]
 
                             if job_request:
-                                if not api_key:
+                                # Server-side re-check before every batch: an
+                                # anonymous, expired or unidentified session must
+                                # not reach a client, upload or generation call.
+                                if authenticated_google_identity() is None:
+                                    st.error(
+                                        "Classroom marking cannot start: your Google "
+                                        "session is missing, expired or unidentified. "
+                                        "Log out, reconnect and try again. Nothing was "
+                                        "uploaded or marked."
+                                    )
+                                elif not api_key:
                                     st.error(
                                         "GEMINI_API_KEY is not configured. Add it to "
                                         "Streamlit Secrets before running Classroom marking."
@@ -3469,7 +3556,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                             selected_course_id + " / " + str(selected_assignment.get("title", selected_assignment["id"])))
 
                                     except Exception as classroom_error:
-                                        message = str(classroom_error)
+                                        message = redact_secret_values(str(classroom_error), api_key)
                                         if "401" in message:
                                             st.error(
                                                 "Google authorization expired or was revoked. "
@@ -3630,7 +3717,12 @@ with col4:
 
 render_local_pdf_inspector(list(student_pdfs or []) + ([mark_scheme_pdf] if mark_scheme_pdf else []) + ([question_pdf] if question_pdf else []))
 
-ready = bool(student_pdfs and mark_scheme_pdf and api_key)
+# Manual marking executes OAuth-authenticated only. `ready` controls widget
+# availability only; the server-side execution boundary below re-checks the
+# identity before any Gemini client, upload, generation or audit runs.
+marking_identity = authenticated_google_identity()
+
+ready = bool(student_pdfs and mark_scheme_pdf and api_key and marking_identity)
 
 if not ready:
     st.warning(
@@ -3638,12 +3730,27 @@ if not ready:
         "a Gemini API key to start."
     )
 
-if st.button(
+if not marking_identity:
+    render_manual_sign_in_requirement()
+
+manual_run_requested = st.button(
     "🚀 Mark Homework Automatically",
     type="primary",
     use_container_width=True,
     disabled=not ready,
-):
+)
+
+# Authorization is decided here, server-side, from the authenticated OIDC
+# session — never from widget values, UI state or file contents. UI changes
+# cannot flip this; a forged widget value still fails the identity check.
+manual_run_authorized = (
+    manual_run_requested and authenticated_google_identity() is not None
+)
+
+if manual_run_requested and not manual_run_authorized:
+    st.error(AUTH_REQUIRED_MARKING)
+
+if manual_run_authorized:
     client = None
     document_run = None
     batch_results = []
@@ -3769,7 +3876,7 @@ if st.button(
             )
 
     except Exception as exc:
-        message = str(exc)
+        message = redact_secret_values(str(exc), api_key)
 
         if "reported as leaked" in message.lower():
             st.error(

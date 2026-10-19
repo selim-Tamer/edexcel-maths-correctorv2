@@ -118,6 +118,9 @@ class CredentialTests(unittest.TestCase):
         f.update(st=ui, __file__=str(SOURCE))
         if test_result is not None:
             ui.button = lambda *args, **kwargs: True
+            # A legitimate mocked authenticated session; the key-test path is
+            # blocked for anonymous sessions by the new server-side guard.
+            f["authenticated_google_identity"] = lambda: "synthetic-teacher-sub"
             f["test_api_key"] = Mock(return_value=test_result)
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         sidebar = next(n for n in tree.body if isinstance(n, ast.With)
