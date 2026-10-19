@@ -575,10 +575,10 @@ def build_csv_rows(student_name: str, result: dict) -> list:
 
 def result_owner():
     """Bind reports to an authenticated subject, or this anonymous manual session."""
+    owner = sensitive_state_owner()
+    if owner is not None:
+        return owner
     if google_logged_in():
-        subject = getattr(st.user, "sub", "")
-        if isinstance(subject, str) and subject:
-            return "google:" + subject
         return None  # authenticated but unidentified: do not expose history
     return "session:" + st.session_state.setdefault("manual_report_owner", uuid.uuid4().hex)
 
@@ -630,8 +630,8 @@ def render_result_snapshots():
             st.caption("These are historical results, not current grade suggestions. "
                        "Final marks include teacher overrides. Download to retain them beyond this session. "
                        "Up to 200 reports are retained per path; older reports may be removed.")
-            if namespace == "manual" and owner.startswith("session:"):
-                st.caption("Manual reports belong to this browser session; Google authentication is not required for manual marking.")
+            st.caption("Marking requires Google sign-in. These reports belong to the Google account "
+                       "that marked them; signing out removes access to session-owned marking data.")
             contexts = list(dict.fromkeys(row.get("snapshot_label", namespace) for row in rows))
             st.caption("Saved contexts: " + "; ".join(contexts))
             # Ownership is enforced server-side; do not export the OIDC subject.
@@ -643,12 +643,17 @@ def render_result_snapshots():
         st.caption("Older historical reports were removed because the session history limit was reached.")
 
 
-def new_review_row(row, namespace):
-    """Keep cached AI output separate from this run's teacher review."""
+def new_review_row(row, namespace, owner=None):
+    """Keep cached AI output separate from this run's teacher review.
+
+    `owner` pins the row to the authenticated subject captured when the
+    marking run started, so a result can never be attached to a different
+    account if the identity changes while a long job is in flight.
+    """
     reviewed = copy.deepcopy(row)
     if reviewed.get("status") == "Marked":
         reviewed["review_key"] = namespace + "_" + uuid.uuid4().hex
-        reviewed["report_owner"] = result_owner()
+        reviewed["report_owner"] = result_owner() if owner is None else owner
         reviewed["ai_result"] = copy.deepcopy(row.get("ai_result", row["result"]))
     return reviewed
 
@@ -750,10 +755,24 @@ def invalidate_classroom_approval(student_key):
 
 def save_teacher_override(student_key, selected, new_mark, reason):
     """Streamlit callbacks run before rendering, so approval widgets can reset safely."""
+    if not owned_review_key(student_key):
+        # Fail closed: never write an override against another teacher's
+        # result, a stale review key, or an unauthenticated session.
+        return
     st.session_state.setdefault("teacher_overrides", {}).setdefault(student_key, {})[selected] = int(new_mark)
     st.session_state.setdefault("teacher_override_reasons", {}).setdefault(student_key, {})[selected] = reason
     if student_key.startswith("classroom_"):
         invalidate_classroom_approval(student_key)
+
+
+def save_classroom_approval(student_key):
+    """Record an approval only for a result the authenticated teacher owns."""
+    if not owned_review_key(student_key):
+        st.session_state[f"classroom_approval_checkbox_{student_key}"] = False
+        return
+    st.session_state.setdefault("classroom_grade_approvals", {})[student_key] = bool(
+        st.session_state.get(f"classroom_approval_checkbox_{student_key}", False)
+    )
 
 
 def classroom_grade_details(row, rounding_places=2):
@@ -1841,7 +1860,10 @@ def test_api_key(api_key: str):
                 "rate or usage limit."
             )
 
-        return False, f"Gemini returned an authentication/setup error: {message}"
+        return False, (
+            "Gemini returned an authentication/setup error "
+            f"({safe_error_detail(exc)})."
+        )
 
 
 
@@ -1960,6 +1982,87 @@ def redact_secret_values(message: str, *secrets: str) -> str:
     return redacted
 
 
+PROVIDER_ERROR_CODES = (
+    "LEAKED_KEY",
+    "AUTH_REJECTED",
+    "PERMISSION_DENIED",
+    "QUOTA_LIMIT",
+    "SERVICE_UNAVAILABLE",
+    "REQUEST_INVALID",
+    "RESPONSE_INVALID",
+    "UNKNOWN",
+)
+
+
+def provider_error_code(exc: BaseException) -> str:
+    """Allowlisted failure code derived from a provider exception.
+
+    The exception body is read only to classify the failure; no part of it is
+    ever returned, so unknown credentials, OAuth headers, request payloads or
+    student content inside a provider message cannot reach the UI.
+    """
+    body = str(exc).lower()
+    if "reported as leaked" in body:
+        return "LEAKED_KEY"
+    if ("401" in body or "unauthenticated" in body or "invalid api key" in body
+            or "api key not valid" in body):
+        return "AUTH_REJECTED"
+    if ("429" in body or "quota" in body or "resource_exhausted" in body
+            or "rate limit" in body):
+        return "QUOTA_LIMIT"
+    if "403" in body or "permission" in body or "forbidden" in body:
+        return "PERMISSION_DENIED"
+    if any(marker in body for marker in (
+            "500", "503", "unavailable", "overloaded", "high demand",
+            "temporarily", "deadline exceeded", "timed out", "timeout")):
+        return "SERVICE_UNAVAILABLE"
+    if any(marker in body for marker in (
+            "400", "404", "invalid_argument", "invalid argument", "bad request",
+            "failed_precondition", "not found", "malformed")):
+        return "REQUEST_INVALID"
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "RESPONSE_INVALID"
+    return "UNKNOWN"
+
+
+def safe_error_detail(exc: BaseException, *secrets: str, limit: int = 600) -> str:
+    """Safe, allowlisted technical detail for user-visible diagnostics.
+
+    Only the exception class name and a stable allowlisted failure code are
+    emitted. Provider exception bodies — which can echo request credentials,
+    OAuth headers or uploaded student content — are never included, so no
+    redaction or truncation of raw text is required. `secrets` and `limit`
+    are accepted for call-site compatibility and are unused.
+    """
+    return f"{type(exc).__name__} [{provider_error_code(exc)}]"
+
+
+def marking_failure_reason(exc: BaseException) -> str:
+    """Content-free failure category for one student's marking error.
+
+    Raw provider text can echo student submissions or credentials, so only a
+    stable category is stored in results or displayed. The underlying
+    exception class is kept for troubleshooting without any message content.
+    """
+    text = str(exc)
+    lowered = text.lower()
+    if "429" in text or "quota" in lowered or "rate limit" in lowered:
+        category = "the AI provider rate or usage limit was reached"
+    elif "401" in text or "unauthenticated" in lowered or "invalid api key" in lowered:
+        category = "the AI provider rejected the credentials"
+    elif "403" in text or "permission" in lowered or "forbidden" in lowered:
+        category = "the AI provider refused access for this key or project"
+    elif "leaked" in lowered:
+        category = "the AI provider blocked the configured key"
+    elif "503" in text or "overloaded" in lowered or "unavailable" in lowered:
+        category = "the AI provider is temporarily unavailable"
+    elif isinstance(exc, (ValueError, KeyError, TypeError)):
+        category = "the provider response could not be parsed into a marking result"
+    else:
+        category = "an unrecognized marking error occurred"
+    return f"{type(exc).__name__}: {category} (no details are shown to protect student data)"
+
+
 def authenticated_google_identity():
     """Server-side guard for every path that can consume operator Gemini quota.
 
@@ -1980,6 +2083,127 @@ def authenticated_google_identity():
     if not isinstance(subject, str) or not subject.strip():
         return None
     return subject.strip()
+
+
+SENSITIVE_STATE_KEYS = (
+    "last_batch_results",
+    "last_manual_context",
+    "last_mark_scheme_name",
+    "previous_result_snapshots",
+    "teacher_overrides",
+    "teacher_override_reasons",
+    "classroom_grade_approvals",
+    "classroom_jobs",
+)
+SENSITIVE_WIDGET_PREFIXES = (
+    "override_q_",
+    "override_mark_",
+    "override_reason_",
+    "apply_override_",
+    "classroom_approval_checkbox_",
+    "classroom_remark_",
+)
+
+
+def sensitive_state_owner():
+    """Stable owner token for sensitive session state.
+
+    Derived only from the server-side authenticated Google subject; browser-
+    supplied identifiers are never trusted. None means there is no trusted
+    identity: an anonymous, expired or unidentified session owns nothing
+    sensitive and every sensitive read must fail closed.
+    """
+    subject = authenticated_google_identity()
+    return None if subject is None else "google:" + subject
+
+
+def sensitive_widget_keys():
+    """Session keys of per-result override and approval widgets."""
+    return [
+        key for key in st.session_state.keys()
+        if isinstance(key, str) and key.startswith(SENSITIVE_WIDGET_PREFIXES)
+    ]
+
+
+def bind_sensitive_state(owner):
+    """Record the owner binding for the sensitive stores about to be written."""
+    if owner is None:
+        raise RuntimeError("Sensitive marking state requires an authenticated owner.")
+    st.session_state["sensitive_state_owner"] = owner
+
+
+def invalidate_sensitive_state():
+    """Drop every owner-bound result, override, approval and job record.
+
+    Used on explicit logout, authentication expiry and account switching.
+    Safe shared configuration (API-key presence, marking mode, UI
+    preferences) is preserved; only records tied to one teacher's marking
+    results are removed.
+    """
+    for key in SENSITIVE_STATE_KEYS:
+        st.session_state.pop(key, None)
+    for key in sensitive_widget_keys():
+        st.session_state.pop(key, None)
+    st.session_state.pop("manual_report_owner", None)
+    st.session_state.pop("snapshot_history_trimmed", None)
+    st.session_state.pop("sensitive_state_owner", None)
+
+
+def reconcile_sensitive_state():
+    """Fail closed whenever sensitive state is not bound to the current owner.
+
+    Runs on every rerun before any sensitive value is read. A record created
+    under one authenticated subject can never become readable under another
+    subject, after logout, or in an anonymous session: any binding mismatch
+    (or a missing binding left by an older version) destroys the records
+    instead of reassigning them. Ordinary reruns with the same signed-in
+    teacher keep their authorized state.
+    """
+    stored = st.session_state.get("sensitive_state_owner")
+    current = sensitive_state_owner()
+    if stored == current and current is not None:
+        return
+    has_sensitive = any(key in st.session_state for key in SENSITIVE_STATE_KEYS)
+    if has_sensitive or sensitive_widget_keys():
+        invalidate_sensitive_state()
+    elif stored is not None:
+        st.session_state.pop("sensitive_state_owner", None)
+
+
+def row_owner_allowed(row):
+    """Fail-closed ownership check for one stored result row.
+
+    Unknown, missing or mismatched owners never match, so rows written by a
+    different account (or by an unbound older version) are never rendered,
+    exported or edited.
+    """
+    owner = result_owner()
+    if owner is None:
+        return False
+    return isinstance(row, dict) and row.get("report_owner") == owner
+
+
+def owned_review_key(student_key):
+    """True only when student_key belongs to a result the current owner can see.
+
+    Searches the owner-verified stores for the review key and requires the
+    row's recorded owner to match the authenticated subject. Anything not
+    found, or bound to another owner, fails closed.
+    """
+    owner = result_owner()
+    if owner is None or not isinstance(student_key, str) or not student_key:
+        return False
+    candidates = list(st.session_state.get("last_batch_results", []) or [])
+    for job in (st.session_state.get("classroom_jobs", {}) or {}).values():
+        result = (job or {}).get("last_result") or {}
+        candidates.extend(result.get("processed", []) or [])
+    for history in (st.session_state.get("previous_result_snapshots", {}) or {}).values():
+        candidates.extend(history or [])
+    return any(
+        isinstance(row, dict) and row.get("review_key") == student_key
+        and row.get("report_owner") == owner
+        for row in candidates
+    )
 
 
 def render_manual_sign_in_requirement():
@@ -2469,6 +2693,7 @@ def run_classroom_marking_job(
     document_state=None,
     retain_references=False,
     document_context="",
+    report_owner=None,
 ):
     """
     Find TURNED_IN submissions not yet processed this session and mark their
@@ -2483,6 +2708,10 @@ def run_classroom_marking_job(
 
     `already_processed_ids` stores revision fingerprints within this assignment,
     scheme and configuration. The caller persists them; force_remark bypasses them.
+
+    `report_owner` is the authenticated owner captured before the job started;
+    every result row is pinned to it so an identity change mid-job can never
+    attach results to a different account.
     """
     submissions = list_turned_in_submissions(
         token,
@@ -2670,7 +2899,7 @@ def run_classroom_marking_job(
                             f"**{row['student']}** — {row['reason']}"
                         )
     
-                    reviewed = new_review_row(row, "classroom")
+                    reviewed = new_review_row(row, "classroom", owner=report_owner)
                     reviewed["revision"] = revisions[row["submission_id"]]
                     reviewed["is_current"] = True
                     processed.append(reviewed)
@@ -3228,6 +3457,12 @@ def validate_audit_proposal(proposal, maximum):
 # UI
 # ============================================================
 
+# Account-switch safety net: runs before any sensitive state is read. An
+# explicit logout clears state in the button handler; this catches expired
+# sessions, anonymous replacements and a different Google subject signing in
+# on the same browser session.
+reconcile_sensitive_state()
+
 st.title("📐 Pearson Edexcel IGCSE Maths Auto-Marker")
 st.caption(
     "Upload the student's work and official mark scheme. The app marks question-by-question, "
@@ -3323,8 +3558,9 @@ with st.sidebar:
                 st.rerun()
             else:
                 st.info("No locally saved API key was found.")
-        except OSError as exc:
-            st.error(f"Could not remove the saved key: {exc}")
+        except OSError:
+            # OSError text can include local account paths; keep it generic.
+            st.error("Could not remove the saved key file. Check file permissions and try again.")
 
     st.divider()
     st.subheader("Grade handling")
@@ -3384,6 +3620,10 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
         with auth_col2:
             if google_logged_in():
                 if st.button("Log out", use_container_width=True, key="classroom_logout"):
+                    # Invalidate every owner-bound record before the identity
+                    # ends, so nothing survives for the next sign-in on this
+                    # browser session.
+                    invalidate_sensitive_state()
                     document_state["files"].clear()
                     st.session_state.pop("document_session", None)
                     st.logout()
@@ -3520,6 +3760,10 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                         "Streamlit Secrets before running Classroom marking."
                                     )
                                 else:
+                                    # Pin this job to the authenticated owner
+                                    # captured now; results returned after an
+                                    # identity transition are discarded.
+                                    job_owner = sensitive_state_owner()
                                     try:
                                         classroom_client = genai.Client(
             api_key=api_key,
@@ -3543,6 +3787,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 document_state=document_state,
                                                 retain_references=retain_references,
                                                 document_context=context_key,
+                                                report_owner=job_owner,
                                             )
 
                                             classroom_status.update(
@@ -3551,18 +3796,29 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 expanded=False,
                                             )
 
-                                        job_state["last_result"] = merge_classroom_results(
-                                            job_state["last_result"], result, processed_ids, context_key,
-                                            selected_course_id + " / " + str(selected_assignment.get("title", selected_assignment["id"])))
+                                        if job_owner is None or sensitive_state_owner() != job_owner:
+                                            st.error(
+                                                "Classroom marking finished, but the signed-in "
+                                                "account changed during the run. The results "
+                                                "were discarded to protect student data."
+                                            )
+                                        else:
+                                            job_state["last_result"] = merge_classroom_results(
+                                                job_state["last_result"], result, processed_ids, context_key,
+                                                selected_course_id + " / " + str(selected_assignment.get("title", selected_assignment["id"])))
+                                            bind_sensitive_state(job_owner)
 
                                     except Exception as classroom_error:
-                                        message = redact_secret_values(str(classroom_error), api_key)
-                                        if "401" in message:
+                                        # Body text is never user-visible:
+                                        # classification is allowlisted only.
+                                        code = provider_error_code(classroom_error)
+                                        message = safe_error_detail(classroom_error)
+                                        if code == "AUTH_REJECTED":
                                             st.error(
                                                 "Google authorization expired or was revoked. "
                                                 "Log out and reconnect Google Classroom."
                                             )
-                                        elif "403" in message:
+                                        elif code == "PERMISSION_DENIED":
                                             st.error(
                                                 "Google denied Classroom/Drive access. "
                                                 "Check the OAuth scopes, Google Cloud APIs, "
@@ -3570,7 +3826,8 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                             )
                                         else:
                                             st.error(
-                                                f"Classroom marking failed: {message}"
+                                                f"Classroom marking failed ({message}). "
+                                                "No provider details are shown to protect student data."
                                             )
 
                                         with st.expander("Technical error details"):
@@ -3581,96 +3838,107 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                             last_result = job_state["last_result"]
 
                             if last_result and last_result["processed"]:
-                                processed_rows = [prepare_review_row(row) for row in last_result["processed"]]
+                                # Fail closed: rows recorded under a different
+                                # authenticated account are never rendered.
+                                visible_processed = [row for row in last_result["processed"] if row_owner_allowed(row)]
+                                processed_rows = [prepare_review_row(row) for row in visible_processed]
 
-                                st.subheader("📬 Classroom processing result")
+                                if not processed_rows:
+                                    st.info(
+                                        "No stored Classroom results are available for the "
+                                        "currently signed-in account in this browser session."
+                                    )
+                                    last_result = None
+                                else:
+                                    st.subheader("📬 Classroom processing result")
 
-                                classroom_rounding = st.selectbox(
-                                    "Classroom grade display",
-                                    ["2 decimal places", "Whole points"],
-                                    key="classroom_grade_rounding",
-                                    help="Rounding affects display only; calculations use unrounded marks.",
-                                )
-                                places = 0 if classroom_rounding == "Whole points" else 2
-                                summary_rows = []
-                                for row in processed_rows:
-                                    if row["status"] == "Marked":
-                                        details = classroom_grade_details(row, places)
-                                        summary_rows.append({
-                                            "Student": row["student"],
-                                            "Status": "Marked" if details["is_current"] else "Historical",
-                                            "Scope": details["sample"],
-                                            "Score": details["score"],
-                                            "Percentage": details["percentage"],
-                                            "Original AI suggestion": details["ai_grade"],
-                                            "Current suggested Classroom grade": details["display_grade"],
-                                            "Teacher review": details["approval_status"],
-                                            "Reliability": details["reliability"],
-                                        })
-                                    else:
-                                        summary_rows.append({
-                                            "Student": row["student"], "Status": row["status"],
-                                            "Scope": "—", "Score": "—", "Percentage": "—",
-                                            "Original AI suggestion": "—",
-                                            "Current suggested Classroom grade": "—",
-                                            "Teacher review": "—", "Reliability": row.get("reason") or "—",
-                                        })
-                                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-                                st.info(
-                                    "Grades are suggestions only and are NOT written to Google Classroom. "
-                                    "Sampled grades describe only the marked questions; they are not equivalent "
-                                    "to grading the entire assignment. Review question marks before entering a grade."
-                                )
-                                marked_rows = [r for r in processed_rows if r["status"] == "Marked"]
-                                if marked_rows:
-                                    st.subheader("🧑‍🎓 Individual student reports")
-                                    for row in marked_rows:
-                                        details = classroom_grade_details(row, places)
-                                        student_key = row["review_key"]
-                                        with st.expander(
-                                            f"{row['student']} — {details['score']} "
-                                            f"({details['percentage']}) — {details['approval_status']}"
-                                        ):
-                                            st.markdown(f"**Assessment scope:** {details['sample']}")
-                                            st.markdown(
-                                                f"**Original AI suggested grade:** {details['ai_grade']}  |  "
-                                                f"**Current suggested grade:** {details['display_grade']} "
-                                                f"/ {row.get('classroom_max_points') or '—'}"
-                                            )
-                                            if details["low"] or details["medium"] or details["audit_failure"] or details["incomplete"] or row["result"].get("validation_warnings"):
-                                                st.warning(
-                                                    f"Teacher review advised: {details['low']} Low-confidence, "
-                                                    f"{details['medium']} Medium-confidence questions."
-                                                    + (" The audit did not complete." if details["audit_failure"] else "")
-                                                    + (" Not all selected questions were found." if details["incomplete"] else "")
-                                                    + (" Mark scheme or explanation needs verification." if row["result"].get("validation_warnings") else "")
+                                    classroom_rounding = st.selectbox(
+                                        "Classroom grade display",
+                                        ["2 decimal places", "Whole points"],
+                                        key="classroom_grade_rounding",
+                                        help="Rounding affects display only; calculations use unrounded marks.",
+                                    )
+                                    places = 0 if classroom_rounding == "Whole points" else 2
+                                    summary_rows = []
+                                    for row in processed_rows:
+                                        if row["status"] == "Marked":
+                                            details = classroom_grade_details(row, places)
+                                            summary_rows.append({
+                                                "Student": row["student"],
+                                                "Status": "Marked" if details["is_current"] else "Historical",
+                                                "Scope": details["sample"],
+                                                "Score": details["score"],
+                                                "Percentage": details["percentage"],
+                                                "Original AI suggestion": details["ai_grade"],
+                                                "Current suggested Classroom grade": details["display_grade"],
+                                                "Teacher review": details["approval_status"],
+                                                "Reliability": details["reliability"],
+                                            })
+                                        else:
+                                            summary_rows.append({
+                                                "Student": row["student"], "Status": row["status"],
+                                                "Scope": "—", "Score": "—", "Percentage": "—",
+                                                "Original AI suggestion": "—",
+                                                "Current suggested Classroom grade": "—",
+                                                "Teacher review": "—", "Reliability": row.get("reason") or "—",
+                                            })
+                                    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+                                    st.info(
+                                        "Grades are suggestions only and are NOT written to Google Classroom. "
+                                        "Sampled grades describe only the marked questions; they are not equivalent "
+                                        "to grading the entire assignment. Review question marks before entering a grade."
+                                    )
+                                    marked_rows = [r for r in processed_rows if r["status"] == "Marked"]
+                                    if marked_rows:
+                                        st.subheader("🧑‍🎓 Individual student reports")
+                                        for row in marked_rows:
+                                            details = classroom_grade_details(row, places)
+                                            student_key = row["review_key"]
+                                            with st.expander(
+                                                f"{row['student']} — {details['score']} "
+                                                f"({details['percentage']}) — {details['approval_status']}"
+                                            ):
+                                                st.markdown(f"**Assessment scope:** {details['sample']}")
+                                                st.markdown(
+                                                    f"**Original AI suggested grade:** {details['ai_grade']}  |  "
+                                                    f"**Current suggested grade:** {details['display_grade']} "
+                                                    f"/ {row.get('classroom_max_points') or '—'}"
                                                 )
-                                            if row.get("selected_questions") is not None:
-                                                st.caption(
-                                                    "Selected question numbers: "
-                                                    + ", ".join(row["selected_questions"])
+                                                if details["low"] or details["medium"] or details["audit_failure"] or details["incomplete"] or row["result"].get("validation_warnings"):
+                                                    st.warning(
+                                                        f"Teacher review advised: {details['low']} Low-confidence, "
+                                                        f"{details['medium']} Medium-confidence questions."
+                                                        + (" The audit did not complete." if details["audit_failure"] else "")
+                                                        + (" Not all selected questions were found." if details["incomplete"] else "")
+                                                        + (" Mark scheme or explanation needs verification." if row["result"].get("validation_warnings") else "")
+                                                    )
+                                                if row.get("selected_questions") is not None:
+                                                    st.caption(
+                                                        "Selected question numbers: "
+                                                        + ", ".join(row["selected_questions"])
+                                                    )
+                                                st.checkbox(
+                                                    "I reviewed this result and approve this suggested Classroom grade",
+                                                    key=f"classroom_approval_checkbox_{student_key}",
+                                                    value=details["approved"],
+                                                    disabled=not details["is_current"],
+                                                    on_change=save_classroom_approval,
+                                                    args=(student_key,),
                                                 )
-                                            st.checkbox(
-                                                "I reviewed this result and approve this suggested Classroom grade",
-                                                key=f"classroom_approval_checkbox_{student_key}",
-                                                value=details["approved"],
-                                                disabled=not details["is_current"],
-                                                on_change=lambda k=student_key:
-                                                    st.session_state.setdefault("classroom_grade_approvals", {}).__setitem__(
-                                                        k, st.session_state[f"classroom_approval_checkbox_{k}"]
-                                                    ),
-                                            )
-                                            render_student_report(
-                                                row["student"], row["result"], row["totals"],
-                                                row["groups"], row["marking_model"], row["audit_model"],
-                                                student_key=student_key if details["is_current"] else None,
-                                            )
+                                                render_student_report(
+                                                    row["student"], row["result"], row["totals"],
+                                                    row["groups"], row["marking_model"], row["audit_model"],
+                                                    student_key=student_key if details["is_current"] else None,
+                                                )
                             elif last_result:
                                 st.info(last_result["message"])
 
                 except Exception as classroom_load_error:
+                    # Operator token and Gemini key are never echoed; only the
+                    # exception class and an allowlisted failure code display.
                     st.error(
-                        f"Could not load Google Classroom data: {classroom_load_error}"
+                        "Could not load Google Classroom data. "
+                        + safe_error_detail(classroom_load_error)
                     )
 
 st.subheader("📁 Upload files")
@@ -3754,6 +4022,9 @@ if manual_run_authorized:
     client = None
     document_run = None
     batch_results = []
+    # Owner captured before any provider work; the run may only store its
+    # results if the authenticated subject is still the same at the end.
+    store_owner = sensitive_state_owner()
 
     try:
         client = genai.Client(
@@ -3842,15 +4113,18 @@ if manual_run_authorized:
                         )
 
                     except Exception as student_error:
+                        # Content-free category only: raw provider text can
+                        # echo student submissions or credentials.
+                        failure = marking_failure_reason(student_error)
                         st.warning(
                             f"⚠️ [{completed}/{len(student_pdfs)}] Marking failed "
-                            f"for {sp_name}: {student_error}"
+                            f"for {sp_name}: {failure}"
                         )
                         batch_results.append(
                             {
                                 "student_name": sp_name,
                                 "status": "Failed",
-                                "error": str(student_error),
+                                "error": failure,
                                 "result": None,
                                 "totals": None,
                                 "groups": None,
@@ -3859,14 +4133,28 @@ if manual_run_authorized:
                             }
                         )
 
-            # Store for download/re-render.
-            preserve_result_snapshot(
-                st.session_state.get("last_batch_results", []), "manual",
-                st.session_state.get("last_manual_context", ""),
-                st.session_state.get("last_mark_scheme_name", "Manual submission"))
-            st.session_state["last_batch_results"] = [new_review_row(row, "manual") for row in batch_results]
-            st.session_state["last_manual_context"] = documents.digest(mark_scheme_pdf.getvalue())
-            st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
+            # Store for download/re-render, bound to the owner captured when
+            # this run started. Results after an identity transition are
+            # discarded instead of being attached to a different account.
+            if store_owner is None or sensitive_state_owner() != store_owner:
+                st.error(
+                    "Marking finished, but the signed-in account changed during "
+                    "the run. The results were discarded to protect student data."
+                )
+                # Also drop any context values left by the previous owner and
+                # any widget state from this partially-completed run.
+                invalidate_sensitive_state()
+            else:
+                preserve_result_snapshot(
+                    st.session_state.get("last_batch_results", []), "manual",
+                    st.session_state.get("last_manual_context", ""),
+                    st.session_state.get("last_mark_scheme_name", "Manual submission"))
+                st.session_state["last_batch_results"] = [
+                    new_review_row(row, "manual", owner=store_owner) for row in batch_results
+                ]
+                st.session_state["last_manual_context"] = documents.digest(mark_scheme_pdf.getvalue())
+                st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
+                bind_sensitive_state(store_owner)
 
             marked_count = sum(1 for r in batch_results if r["status"] == "Marked")
             status.update(
@@ -3876,30 +4164,36 @@ if manual_run_authorized:
             )
 
     except Exception as exc:
-        message = redact_secret_values(str(exc), api_key)
+        # Allowlisted classification only: provider bodies (which can echo
+        # credentials or student content) are never displayed.
+        code = provider_error_code(exc)
+        message = safe_error_detail(exc)
 
-        if "reported as leaked" in message.lower():
+        if code == "LEAKED_KEY":
             st.error(
                 "This Gemini API key has been blocked as a leaked key. "
                 "Create a NEW key in Google AI Studio and replace the old one."
             )
-        elif "401" in message or "unauthenticated" in message.lower() or "invalid api key" in message.lower():
+        elif code == "AUTH_REJECTED":
             st.error(
                 "Gemini rejected this API key. Click 'Test API key' in the sidebar "
                 "to verify the replacement key before grading."
             )
-        elif "403" in message or "permission" in message.lower() or "forbidden" in message.lower():
+        elif code == "PERMISSION_DENIED":
             st.error(
                 "The Gemini project is refusing the key. Check the key's "
                 "project/restrictions and that the Gemini API is enabled."
             )
-        elif "429" in message or "quota" in message.lower():
+        elif code == "QUOTA_LIMIT":
             st.error(
                 "The Gemini project has hit a rate/usage limit. Check the project's "
                 "Gemini API usage and billing/quota."
             )
         else:
-            st.error(f"The automatic marking run failed: {message}")
+            st.error(
+                f"The automatic marking run failed ({message}). "
+                "No provider details are shown to protect student data."
+            )
 
         with st.expander("Technical error details"):
             st.code(message)
@@ -3914,7 +4208,13 @@ if manual_run_authorized:
 render_result_snapshots()
 
 if "last_batch_results" in st.session_state:
-    batch_results = [prepare_review_row(row) for row in st.session_state["last_batch_results"]]
+    # Fail closed: verify every row's recorded owner before rendering,
+    # exporting or applying overrides. Rows created under a different
+    # authenticated account are never shown, even in the same browser session.
+    visible_batch = [row for row in st.session_state["last_batch_results"] if row_owner_allowed(row)]
+    if not visible_batch:
+        st.caption("Stored marking results are not available for the currently signed-in account.")
+    batch_results = [prepare_review_row(row) for row in visible_batch]
     marked_results = [r for r in batch_results if r["status"] == "Marked"]
 
     st.divider()
