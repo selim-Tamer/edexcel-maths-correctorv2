@@ -73,12 +73,21 @@ def get_status(client, name, deadline, clock=time):
 
 
 def transfer(client, data, filename, progress=None, clock=time):
+    import pipeline_metrics
+    with pipeline_metrics.job("document", clock):
+        return _transfer(client, data, filename, progress, clock)
+
+
+def _transfer(client, data, filename, progress=None, clock=time):
     """Upload once, poll with bounded retries, preserve bytes, clean failed uploads.
 
     Never retry an ambiguous upload POST: it may have created a server-side file.
     Transfer requests are capped at 120 seconds; processing has a separate 180s budget.
     """
+    import pipeline_metrics
     def emit(stage, started, **extra):
+        if extra.get("done") and stage == "Local preparation":
+            pipeline_metrics.record("preparation", clock.monotonic() - started)
         if progress:
             progress({"stage": stage, "elapsed": max(0, clock.monotonic() - started), **extra})
 
@@ -92,27 +101,30 @@ def transfer(client, data, filename, progress=None, clock=time):
         emit("Local preparation", prepared, bytes=len(data), done=True)
         started = clock.monotonic()
         emit("Transfer to Gemini", started, done=False)
-        remote = client.files.upload(file=tmp_path, config=request_config(120))
+        remote = pipeline_metrics.call("upload", client.files.upload, file=tmp_path, config=request_config(120))
         emit("Transfer to Gemini", started, done=True)
         started = clock.monotonic()
-        deadline = started + 180
-        interval = 0.5
-        polls = 0
-        emit("Gemini processing", started, done=False)
-        while state_of(remote) == "PROCESSING":
-            remaining = deadline - clock.monotonic()
-            if remaining <= 0:
+        try:
+            deadline = started + 180
+            interval = 0.5
+            polls = 0
+            emit("Gemini processing", started, done=False)
+            while state_of(remote) == "PROCESSING":
+                remaining = deadline - clock.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Gemini file processing timed out after 180 seconds.")
+                clock.sleep(min(interval, remaining))
+                remote = get_status(client, remote.name, deadline, clock)
+                polls += 1
+                interval = min(2.0, interval * 2)
+                emit("Gemini processing", started, polls=polls, done=False)
+            if clock.monotonic() > deadline:
                 raise TimeoutError("Gemini file processing timed out after 180 seconds.")
-            clock.sleep(min(interval, remaining))
-            remote = get_status(client, remote.name, deadline, clock)
-            polls += 1
-            interval = min(2.0, interval * 2)
-            emit("Gemini processing", started, polls=polls, done=False)
-        if clock.monotonic() > deadline:
-            raise TimeoutError("Gemini file processing timed out after 180 seconds.")
-        if state_of(remote) not in {"ACTIVE", "SUCCEEDED"}:
-            raise RuntimeError("Gemini could not finish processing the document (failed or unknown file state).")
-        emit("Gemini processing", started, polls=polls, done=True)
+            if state_of(remote) not in {"ACTIVE", "SUCCEEDED"}:
+                raise RuntimeError("Gemini could not finish processing the document (failed or unknown file state).")
+            emit("Gemini processing", started, polls=polls, done=True)
+        finally:
+            pipeline_metrics.record("file_processing", clock.monotonic() - started)
         return remote
     except BaseException:
         if remote is not None:

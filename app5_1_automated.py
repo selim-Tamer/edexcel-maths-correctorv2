@@ -158,7 +158,16 @@ def show_document_progress(action):
             st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
 
 
-def prepare_manual_batch(client, students, scheme, question, audit, random_count, session, run, report=None):
+def prepare_manual_batch(*args, **kwargs):
+    import pipeline_metrics
+    with pipeline_metrics.job("manual_preparation", time) as metrics:
+        result = _prepare_manual_batch(*args, **kwargs)
+        if isinstance(result, dict) and result.get("status") == "Failed":
+            metrics["outcome"] = "failed"
+        return result
+
+
+def _prepare_manual_batch(client, students, scheme, question, audit, random_count, session, run, report=None):
     """Resolve successful result hits BEFORE uploading student/reference documents."""
     started = time.monotonic()
     def event(label, stage, elapsed, done=True):
@@ -1656,23 +1665,39 @@ def discover_question_numbers(client, mark_scheme_file, question_file=None):
     raise RuntimeError("Could not identify questions for random marking. " + " | ".join(errors))
 
 
-def wait_for_marking(futures):
+def wait_for_marking(futures, events=None):
     """Simple main-thread progress; no request diagnostics in the browser."""
     remaining = set(futures)
+    stage = "Marking and checking the original work…"
     started = time.monotonic()
     display = st.empty()
     try:
         while remaining:
             done, remaining = wait(remaining, timeout=0.5, return_when=FIRST_COMPLETED)
+            if events is not None:
+                while True:
+                    try:
+                        stage = events.get_nowait()
+                    except Empty:
+                        break
             if remaining:
-                display.info(f"Marking and checking the original work… {int(time.monotonic() - started)}s elapsed")
+                display.info(f"{stage} {int(time.monotonic() - started)}s elapsed")
             for future in done:
                 yield future
     finally:
         display.empty()
 
 
-def mark_one_submission(
+def mark_one_submission(*args, **kwargs):
+    import pipeline_metrics
+    with pipeline_metrics.job("manual_student", time) as metrics:
+        result = _mark_one_submission(*args, **kwargs)
+        if isinstance(result, dict) and result.get("status") == "Failed":
+            metrics["outcome"] = "failed"
+        return result
+
+
+def _mark_one_submission(
     client,
     student_name: str,
     student_file,
@@ -1683,28 +1708,31 @@ def mark_one_submission(
     scheme_maxima=None,
     scheme_warning=None,
     scheme_answers=None,
+    status_callback=None,
 ):
     """
     Mark one student's already-uploaded file(s) and return a result dict.
 
     Deliberately makes NO Streamlit calls (no st.write/st.warning/etc.) so it
     is safe to run inside a worker thread via ThreadPoolExecutor — Streamlit
-    only supports UI calls from the main script thread. Callers should run
-    several of these concurrently to mark multiple students in parallel,
-    then report progress/results back in the main thread as futures complete.
+    only supports UI calls from the main script thread. Batch callers use one
+    marking worker and report progress/results back in the main thread.
     """
-    raw_result, marking_model = grade_with_model(
+    import pipeline_metrics
+    raw_result, marking_model = pipeline_metrics.call("generation", grade_with_model,
         client=client,
         model_names=PRIMARY_MODELS,
         student_file=student_file,
         mark_scheme_file=mark_scheme_file,
         question_file=question_file,
-        status_callback=None,
+        status_callback=status_callback,
         selected_questions=selected_questions,
         scheme_maxima=scheme_maxima,
     )
 
-    result = normalise_result(raw_result)
+    if status_callback:
+        status_callback("Checking marking evidence…")
+    result = pipeline_metrics.call("validation", normalise_result, raw_result)
     if selected_questions is not None:
         chosen = {str(n).strip() for n in selected_questions}
         result["questions"] = [
@@ -1716,9 +1744,9 @@ def mark_one_submission(
     audit_model = "Not run"
     audit_warning = None
 
-    result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
-    result = verify_math_explanations(result)
-    result = verify_awarded_mark_evidence(result, scheme_answers)
+    result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
+    result = pipeline_metrics.call("validation", verify_math_explanations, result)
+    result = pipeline_metrics.call("validation", verify_awarded_mark_evidence, result, scheme_answers)
 
     if audit_enabled:
         try:
@@ -1729,26 +1757,26 @@ def mark_one_submission(
                 if m != marking_model and m not in AUDIT_MODELS
             ]
 
-            audited, audit_model = audit_result(
+            audited, audit_model = pipeline_metrics.call("audit", audit_result,
                 client=client,
                 result=result,
                 student_file=student_file,
                 mark_scheme_file=mark_scheme_file,
                 model_names=audit_candidates,
-                status_callback=None,
+                status_callback=status_callback,
                 question_file=question_file,
                 scheme_answers=scheme_answers,
             )
-            result = normalise_result(audited)
+            result = pipeline_metrics.call("validation", normalise_result, audited)
         except Exception as audit_error:
             audit_warning = str(audit_error)
 
-    result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
-    result = verify_math_explanations(result)
-    result = verify_awarded_mark_evidence(result, scheme_answers)
-    earned, available, percentage = calculate_totals(result)
+    result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
+    result = pipeline_metrics.call("validation", verify_math_explanations, result)
+    result = pipeline_metrics.call("validation", verify_awarded_mark_evidence, result, scheme_answers)
+    earned, available, percentage = pipeline_metrics.call("validation", calculate_totals, result)
     provisional_grade = percentage_band_grade(percentage)
-    groups = make_group_rows(result["questions"])
+    groups = pipeline_metrics.call("validation", make_group_rows, result["questions"])
 
     return {
         "student_name": student_name,
@@ -2079,7 +2107,16 @@ def classroom_attachment_ids(submission: dict):
     return ids
 
 
-def mark_one_classroom_submission(
+def mark_one_classroom_submission(*args, **kwargs):
+    import pipeline_metrics
+    with pipeline_metrics.job("classroom_student", time) as metrics:
+        result = _mark_one_classroom_submission(*args, **kwargs)
+        if isinstance(result, dict) and result.get("status") == "Failed":
+            metrics["outcome"] = "failed"
+        return result
+
+
+def _mark_one_classroom_submission(
     token: str,
     client,
     submission: dict,
@@ -2099,6 +2136,7 @@ def mark_one_classroom_submission(
     "reason" fields instead, and makes no Streamlit calls, so it's safe to
     run inside a worker thread via ThreadPoolExecutor.
     """
+    import pipeline_metrics
     submission_id = submission["id"]
     student_id = submission.get("userId", "Unknown student")
     student_name = student_id
@@ -2137,7 +2175,7 @@ def mark_one_classroom_submission(
         for file_index, file_id in enumerate(attachment_ids, start=1):
             report_stage(f"Downloading attachment {file_index}/{len(attachment_ids)} from Google Drive")
             download_started = time.monotonic()
-            filename, data, mime = download_drive_file(token, file_id)
+            filename, data, mime = pipeline_metrics.call("download", download_drive_file, token, file_id)
             report_stage(f"Drive download complete: {time.monotonic() - download_started:.1f}s")
 
             # For now, safely accept PDFs and common images.
@@ -2159,7 +2197,7 @@ def mark_one_classroom_submission(
                     f"Attachment {file_index}: {event['stage']} — {event['elapsed']:.1f}s")))
 
         report_stage("Waiting for Gemini to mark the submission")
-        raw_result, marking_model = grade_with_model(
+        raw_result, marking_model = pipeline_metrics.call("generation", grade_with_model,
             client=client,
             model_names=PRIMARY_MODELS,
             student_file=remote_students,
@@ -2170,7 +2208,8 @@ def mark_one_classroom_submission(
             scheme_maxima=scheme_maxima,
         )
 
-        result = normalise_result(raw_result)
+        report_stage("Checking marking evidence…")
+        result = pipeline_metrics.call("validation", normalise_result, raw_result)
         if selected_questions is not None:
             chosen = {str(n).strip() for n in selected_questions}
             result["questions"] = [
@@ -2182,9 +2221,9 @@ def mark_one_classroom_submission(
         audit_model = "Not run"
         audit_warning = None
 
-        result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
-        result = verify_math_explanations(result)
-        result = verify_awarded_mark_evidence(result, scheme_answers)
+        result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
+        result = pipeline_metrics.call("validation", verify_math_explanations, result)
+        result = pipeline_metrics.call("validation", verify_awarded_mark_evidence, result, scheme_answers)
 
         if audit_enabled:
             audit_candidates = [
@@ -2195,25 +2234,25 @@ def mark_one_classroom_submission(
             ]
 
             try:
-                audited, audit_model = audit_result(
+                audited, audit_model = pipeline_metrics.call("audit", audit_result,
                     client=client,
                     result=result,
                     student_file=remote_students,
                     mark_scheme_file=mark_scheme_remote,
                     model_names=audit_candidates,
-                    status_callback=None,
+                    status_callback=report_stage,
                     scheme_answers=scheme_answers,
                 )
-                result = normalise_result(audited)
+                result = pipeline_metrics.call("validation", normalise_result, audited)
             except Exception as audit_error:
                 audit_warning = str(audit_error)
 
-        result = check_question_marks(result, scheme_maxima, selected_questions, scheme_warning)
-        result = verify_math_explanations(result)
-        result = verify_awarded_mark_evidence(result, scheme_answers)
-        earned, available, percentage = calculate_totals(result)
+        result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
+        result = pipeline_metrics.call("validation", verify_math_explanations, result)
+        result = pipeline_metrics.call("validation", verify_awarded_mark_evidence, result, scheme_answers)
+        earned, available, percentage = pipeline_metrics.call("validation", calculate_totals, result)
         provisional_grade = percentage_band_grade(percentage)
-        groups = make_group_rows(result["questions"])
+        groups = pipeline_metrics.call("validation", make_group_rows, result["questions"])
 
         max_points = coursework.get("maxPoints")
         suggested_classroom_grade = None
@@ -2448,6 +2487,7 @@ def run_classroom_marking_job(
             for submission in pending
         }
         progress_area = st.empty()
+        batch_started = time.monotonic()
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -2490,6 +2530,7 @@ def run_classroom_marking_job(
                 if stage_by_submission:
                     with progress_area.container():
                         st.markdown("**Current Classroom marking stages**")
+                        st.caption(f"{int(time.monotonic() - batch_started)}s elapsed for this batch")
                         for future in futures:
                             if future not in remaining and future not in done:
                                 continue
@@ -3638,6 +3679,7 @@ if st.button(
                 f"🧠 Marking {len(student_pdfs)} student(s), one student at a time..."
             )
 
+            marking_events = Queue()
             with ThreadPoolExecutor(max_workers=max_workers) as marking_executor:
                 marking_futures = {}
                 cached_rows = []
@@ -3658,6 +3700,7 @@ if st.button(
                             scheme_maxima,
                             scheme_warning,
                             scheme_answers,
+                            status_callback=marking_events.put,
                         )
                         marking_futures[future] = (sp.name, cache_key)
 
@@ -3670,7 +3713,7 @@ if st.button(
                         f"**{cached['student_name']}** — no new AI marking needed"
                     )
 
-                for future in wait_for_marking(marking_futures):
+                for future in wait_for_marking(marking_futures, marking_events):
                     sp_name, cache_key = marking_futures[future]
                     completed += 1
 
