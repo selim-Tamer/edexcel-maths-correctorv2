@@ -8,6 +8,12 @@ variable-specific provenance (each original denominator with its own
 variables and zero set); pooled excluded values are never compared
 against unrelated variable assignments; non-resolvable denominators
 (stay) inconclusive.
+
+Audit: a denominator is resolvable only when its zero set is provably
+class-complete (degree <= 2 closed forms, or degree 3-4 factoring into
+degree <= 2 irreducible factors); zero denominators are refused, real
+and non-real zeros are partitioned explicitly, and incomplete analysis
+can never generate a verified result.
 Issue 3: C3 source-reference document_id binding and ambiguity rules.
 
 Investigation-only; no network and no student data.
@@ -19,8 +25,8 @@ from investigation.pdf_evidence import extract_pdf_evidence
 from investigation.pdf_test_fixtures import build_pdf
 from investigation.math_claims import verify_math_claims
 from investigation.math_verification import (
-    OUTCOME_CONTRADICTED, OUTCOME_INCONCLUSIVE, OUTCOME_VERIFIED,
-    verify_claim,
+    OUTCOME_CONTRADICTED, OUTCOME_INCONCLUSIVE, OUTCOME_UNSUPPORTED,
+    OUTCOME_VERIFIED, verify_claim,
 )
 
 _REF = {"document_id": "pdf:unit-test", "document_role": "mark_scheme",
@@ -410,6 +416,174 @@ class VariableProvenanceTests(unittest.TestCase):
                       result["evidence"]["completeness"])
         self.assertIn("Integer(0)",
                       result["evidence"]["completeness"])
+
+
+class DenominatorCompletenessTests(unittest.TestCase):
+    """Audit: resolvable=True requires a PROVABLY complete zero set.
+
+    ``sympy.roots()`` completeness is never assumed for degree 3-4:
+    degree <= 2 is closed-form class-complete; degree 3-4 denominators
+    are resolved only when they factor into degree <= 2 irreducible
+    factors; every other shape stays unresolved (domain_analysis
+    incomplete), which cannot generate a ``verified`` result.
+    """
+
+    def _denominators_of(self, text, allow_equation=False):
+        from investigation.safe_math import parse_bounded_expression
+        record = parse_bounded_expression(
+            text, allow_equation=allow_equation)
+        return record
+
+    def test_linear_and_quadratic_denominators_stay_complete(self):
+        record = self._denominators_of("1/(x - 2)")
+        entry = record["original_denominators"][0]
+        self.assertTrue(entry["resolvable"])
+        self.assertEqual(entry["zeros"], ["Integer(2)"])
+        self.assertTrue(record["domain_analysis_complete"])
+        record = self._denominators_of("1/(x**2 - 4)")
+        entry = record["original_denominators"][0]
+        self.assertTrue(entry["resolvable"])
+        self.assertEqual(entry["zeros"], ["Integer(-2)", "Integer(2)"])
+        self.assertEqual(entry["real_zeros"],
+                         ["Integer(-2)", "Integer(2)"])
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_complex_zeros_are_partitioned_explicitly(self):
+        record = self._denominators_of("1/(x**2 + 1)")
+        entry = record["original_denominators"][0]
+        self.assertTrue(entry["resolvable"])
+        self.assertEqual(entry["zeros"], ["I", "Mul(Integer(-1), I)"])
+        self.assertEqual(entry["real_zeros"], [])
+        self.assertEqual(entry["non_real_zeros"],
+                         ["I", "Mul(Integer(-1), I)"])
+
+    def test_irreducible_cubic_denominator_is_not_claimed_complete(self):
+        # x**3 - 2*x + 2: irreducible cubic; sympy.roots() happens to
+        # return closed forms for it in this version, but completeness
+        # is not provable for the class, so theReported record stays
+        # unresolvable instead of guessing.
+        record = self._denominators_of("1/(x**3 - 2*x + 2)")
+        entry = record["original_denominators"][0]
+        self.assertFalse(entry["resolvable"])
+        self.assertEqual(entry["zeros"], [])
+        self.assertFalse(record["domain_analysis_complete"])
+
+    def test_irreducible_quartic_denominator_is_not_claimed_complete(self):
+        record = self._denominators_of("1/(x**4 - x**2 + 1)")
+        entry = record["original_denominators"][0]
+        self.assertFalse(entry["resolvable"])
+        self.assertFalse(record["domain_analysis_complete"])
+
+    def test_quartic_splitting_into_quadratics_is_complete(self):
+        # x**4 - 5*x**2 + 6 = (x**2 - 2)(x**2 - 3): every irreducible
+        # factor has degree <= 2, so the zero set is provably complete.
+        record = self._denominators_of("1/(x**4 - 5*x**2 + 6)")
+        entry = record["original_denominators"][0]
+        self.assertTrue(entry["resolvable"])
+        self.assertEqual(len(entry["zeros"]), 4)
+        for expected in ("Pow(Integer(2), Rational(1, 2))",
+                         "Pow(Integer(3), Rational(1, 2))"):
+            self.assertIn(expected, entry["zeros"])
+            self.assertIn(expected, entry["real_zeros"])
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_cubic_splitting_into_linear_factors_is_complete(self):
+        record = self._denominators_of("1/(x**3 - x)")
+        entry = record["original_denominators"][0]
+        self.assertTrue(entry["resolvable"])
+        self.assertEqual(entry["zeros"],
+                         ["Integer(-1)", "Integer(0)", "Integer(1)"])
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_claimed_zero_of_reachable_radical_root_is_refused(self):
+        # A quadratic-denominator zero (sqrt(2)) IS expressible in the
+        # bounded grammar, so exclusion must catch it exactly.
+        result = verify_claim(_claim("substitution",
+                                     expression="1/(x**2 - 2)",
+                                     assignments={"x": "sqrt(2)"},
+                                     claimed_value="1/2"))
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(result["evidence"]["undefined_assignments"],
+                         [{"variable": "x",
+                           "value": "Pow(Integer(2), Rational(1, 2))"}])
+        result = verify_claim(_claim("substitution",
+                                     expression="1/(x**2 - 2)",
+                                     assignments={"x": "1"},
+                                     claimed_value="-1"))
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+
+    def test_equation_refuses_reachable_radical_zero_of_denominator(self):
+        result = verify_claim(_claim("equation_solutions",
+                                     equation="1/(x**2 - 2) = 0",
+                                     solutions=["sqrt(2)"]))
+        self.assertEqual(result["outcome"], OUTCOME_CONTRADICTED)
+        self.assertEqual(
+            result["evidence"]["rejected_solutions"][0]["status"],
+            "solution_excluded_by_original_domain")
+
+    def test_zero_denominators_are_safely_refused(self):
+        for text in ("1/0", "1/(x - x)", "3/0"):
+            with self.assertRaises(Exception):
+                self._denominators_of(text)
+            result = verify_claim(_claim("substitution", expression=text,
+                                         assignments={},
+                                         claimed_value="1"))
+            self.assertEqual(result["outcome"], OUTCOME_UNSUPPORTED,
+                             text)
+            self.assertEqual(result["evidence"]["refusal_reason"],
+                             "division_by_zero", text)
+
+    def test_mixed_denominators_with_one_unresolved_restriction(self):
+        record = self._denominators_of("1/(x - 1) + 1/(x**3 - 2*x + 2)")
+        self.assertEqual(len(record["original_denominators"]), 2)
+        resolvable = [entry for entry in record["original_denominators"]
+                      if entry["resolvable"]]
+        unresolved = [entry for entry in record["original_denominators"]
+                      if not entry["resolvable"]]
+        self.assertEqual(len(resolvable), 1)
+        self.assertEqual(resolvable[0]["zeros"], ["Integer(1)"])
+        self.assertEqual(len(unresolved), 1)
+        self.assertFalse(record["domain_analysis_complete"])
+        # Incomplete analysis can never produce verified.
+        result = verify_claim(_claim("substitution",
+                                     expression="1/(x - 1) + 1/(x**3 - 2*x + 2)",
+                                     assignments={"x": "2"},
+                                     claimed_value="4/3"))
+        self.assertEqual(result["outcome"], OUTCOME_INCONCLUSIVE)
+        self.assertNotEqual(result["outcome"], OUTCOME_VERIFIED)
+        self.assertTrue(result["evidence"]["domain_analysis_incomplete"])
+
+    def test_previously_fixed_mixed_variable_assignments_still_valid(self):
+        result = verify_claim(_claim("substitution", expression="1/x + y",
+                                     assignments={"x": "2", "y": "0"},
+                                     claimed_value="1/2"))
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+
+    def test_previously_fixed_cancelled_denominators_still_recorded(self):
+        record = self._denominators_of("x/y * y/x")
+        recorded = sorted(entry["denominator"] for entry
+                          in record["original_denominators"])
+        self.assertEqual(len(recorded), 2)
+        self.assertTrue(
+            all(entry["resolvable"]
+                for entry in record["original_denominators"]))
+
+    def test_nonzero_constant_denominator_imposes_no_restriction(self):
+        record = self._denominators_of("1/2 + 1/x")
+        entries = record["original_denominators"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["variables"], ["x"])
+        self.assertTrue(record["domain_analysis_complete"])
+
+    def test_previously_fixed_removable_singularity_unchanged(self):
+        result = verify_claim(_claim("equation_solutions",
+                                     equation="(x**2 - 4)/(x - 2) = 0",
+                                     solutions=["-2"]))
+        self.assertEqual(result["outcome"], OUTCOME_VERIFIED)
+        excluded = verify_claim(_claim("equation_solutions",
+                                       equation="(x**2 - 4)/(x - 2) = 0",
+                                       solutions=["2"]))
+        self.assertEqual(excluded["outcome"], OUTCOME_CONTRADICTED)
 
 
 class SourceReferenceBindingTests(unittest.TestCase):

@@ -40,7 +40,7 @@ so no downstream check can drive Sympy into exponential work.
 import ast
 from math import comb
 
-PARSER_SCHEMA = "investigation.safe_math/1"
+PARSER_SCHEMA = "investigation.safe_math/2"
 
 MAX_EXPR_CHARS = 500
 MAX_EXPR_NODES = 60
@@ -50,6 +50,9 @@ MAX_FLOAT_MAGNITUDE = 1e6
 MAX_EXPONENT_MAGNITUDE = 50
 MAX_EXPANDED_TERMS = 4096
 EXPAND_POWER_BOUND = 20
+# Historical denominator degree cap, superseded by the class-complete
+# factory rule in _resolved_zero_set (degree <= 2, or degree 3-4 that
+# factors into degree <= 2 irreducible factors). Retained for reference.
 MAX_ZERO_DEGREE = 4
 
 DEFAULT_VARIABLES = ("x", "y", "z", "a", "b", "c", "k", "m", "n", "t")
@@ -65,11 +68,14 @@ REFUSAL_EXPONENT_TOO_LARGE = "exponent_too_large"
 REFUSAL_NOT_A_STRING = "not_a_string"
 REFUSAL_UNEXPECTED_EQUALS = "unexpected_equals"
 
+REFUSAL_DIVISION_BY_ZERO = "division_by_zero"
+
 _KNOWN_REFUSALS = frozenset({
     REFUSAL_UNSUPPORTED_SYNTAX, REFUSAL_UNSUPPORTED_FUNCTION,
     REFUSAL_UNKNOWN_SYMBOL, REFUSAL_TOO_LONG, REFUSAL_TOO_COMPLEX,
     REFUSAL_NUMBER_TOO_LARGE, REFUSAL_EXPONENT_TOO_LARGE,
     REFUSAL_NOT_A_STRING, REFUSAL_UNEXPECTED_EQUALS,
+    REFUSAL_DIVISION_BY_ZERO,
 })
 
 
@@ -139,39 +145,57 @@ class _BoundedParser:
         """Record one ORIGINAL denominator with variable-specific provenance.
 
         Each entry keeps the denominator text, the variables it depends
-        on and (only for exactly resolvable univariate denominators) its
-        exact zero set. Radical, multivariate or over-cap denominators
-        are recorded but marked unresolvable: the parser never guesses
-        their restrictions. This provenance is preserved before any
-        Sympy auto-cancellation.
+        on, its zero set (only when PROVABLY class-complete; see
+        :func:`_resolved_zero_set`) and the real/non-real partition of
+        those zeros. Radical, multivariate, over-cap and irreducible
+        degree-3/4 denominators are recorded but marked unresolvable:
+        the parser never guesses their restrictions, and
+        ``domain_analysis_complete`` stays False. This provenance is
+        preserved before any Sympy auto-cancellation. The engine's
+        declared domain is the complex algebraic domain, so EVERY zero
+        (real or non-real) excludes a point; the partition makes the
+        real-domain restriction explicit for evidence without changing
+        that decision.
         """
         if denominator.is_number:
+            # Nonzero constant denominators impose no restriction;
+            # exact zero denominators are refused at the operator site.
             return
-        from sympy import Poly, PolynomialError, roots as sympy_roots
         generators = tuple(sorted(denominator.free_symbols, key=str))
         record = {
             "denominator": canonical_text(denominator),
             "variables": [generator.name for generator in generators],
             "zeros": [],
+            "real_zeros": [],
+            "non_real_zeros": [],
             "resolvable": False,
         }
         self.denominators.append(record)
-        if not generators:
+        if len(generators) != 1:
+            # Multivariate denominators have no enumerated exact zero
+            # set in this stage: unresolvable, never guessed.
             self.domain_complete = False
             return
-        try:
-            poly = Poly(denominator, *generators)
-            degree = poly.total_degree()
-            if degree > MAX_ZERO_DEGREE or len(generators) != 1:
+        roots_list, complete = _resolved_zero_set(denominator, generators[0])
+        if not complete:
+            self.domain_complete = False
+            return
+        real_zeros = []
+        non_real_zeros = []
+        for root in roots_list:
+            if root.is_real:
+                real_zeros.append(canonical_text(root))
+            elif root.is_real is False:
+                non_real_zeros.append(canonical_text(root))
+            else:
+                # Realness undecidable: no guessed restrictions.
                 self.domain_complete = False
                 return
-            zeros = sorted({canonical_text(root) for root
-                            in sympy_roots(poly)})
-            record["zeros"] = zeros
-            record["resolvable"] = True
-            self.excluded.update(zeros)
-        except Exception:
-            self.domain_complete = False
+        record["zeros"] = sorted(canonical_text(root) for root in roots_list)
+        record["real_zeros"] = sorted(real_zeros)
+        record["non_real_zeros"] = sorted(non_real_zeros)
+        record["resolvable"] = True
+        self.excluded.update(record["zeros"])
 
     def parse(self, text):
         tree = _safe_ast_parse(text)
@@ -238,6 +262,11 @@ class _BoundedParser:
         if isinstance(node.op, ast.Mult):
             return Mul(left, right)
         if isinstance(node.op, ast.Div):
+            if right == 0:
+                # Division by an exact zero denominator (constant or
+                # symbolic-constant such as x - x): the quotient has no
+                # value anywhere, so the expression is refused outright.
+                raise ExpressionRefused(REFUSAL_DIVISION_BY_ZERO)
             # The ORIGINAL denominator's zeros are excluded values of the
             # original expression, even if Sympy cancels the fraction later.
             self._note_denominator_zeros(right)
@@ -245,6 +274,8 @@ class _BoundedParser:
         if isinstance(node.op, ast.Pow):
             _check_power(right)
             if right.is_number and right < 0:
+                if left == 0:
+                    raise ExpressionRefused(REFUSAL_DIVISION_BY_ZERO)
                 # A negative power is a division by the base: the base's
                 # zeros are excluded from the original domain.
                 self._note_denominator_zeros(left)
@@ -271,6 +302,53 @@ def _check_power(exponent):
     if isinstance(exponent, Integer) and \
             abs(int(exponent)) > MAX_EXPONENT_MAGNITUDE:
         raise ExpressionRefused(REFUSAL_EXPONENT_TOO_LARGE)
+
+
+def _resolved_zero_set(denominator, generator):
+    """Exact zero set of a univariate polynomial denominator.
+
+    Returns ``(roots, complete)``. ``complete`` is True only when the
+    zero set is PROVABLY exhaustive over the declared (complex)
+    mathematical domain:
+
+    - degree <= 2: the closed-form linear/quadratic solution classes
+      enumerate every root (real and complex); the returned
+      multiplicity count is cross-checked against the degree.
+    - degree 3-4: the polynomial must factor over its exact
+      coefficient field into irreducible factors of degree <= 2.
+      Irreducible cubic/quartic factors are conservatively LEFT
+      UNRESOLVED: Sympy's ``roots()`` output is NOT guaranteed to
+      enumerate every radical root for them, so their absence is never
+      silently claimed complete.
+
+    Anything else (radical shapes, factoring failures) is unresolved.
+    """
+    from sympy import Poly, PolynomialError, factor_list, roots as sympy_roots
+    try:
+        poly = Poly(denominator, generator)
+        degree = poly.total_degree()
+        if degree == 0:
+            return [], True              # nonzero constant: no restriction
+        if degree <= 2:
+            found = dict(sympy_roots(poly))
+            if sum(found.values()) != degree:
+                return [], False         # solver sanity net
+            return list(found), True
+        _content, factors = factor_list(denominator, generator)
+        zeros = []
+        for factor, _multiplicity in factors:
+            factor_poly = Poly(factor, generator)
+            factor_degree = factor_poly.total_degree()
+            if factor_degree == 0:
+                continue                 # exact numeric factor: no zeros
+            if factor_degree > 2:
+                return [], False         # irreducible degree >= 3
+            zeros.extend(sympy_roots(factor_poly))
+        return zeros, True
+    except Exception:
+        # Fail closed: any resolution failure leaves the restriction
+        # unresolved rather than guessed.
+        return [], False
 
 
 def expand_is_bounded(expression):

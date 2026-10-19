@@ -80,9 +80,20 @@ production app.
   - the parser records every ORIGINAL denominator (divisions and
     negative powers) with variable-specific provenance BEFORE any
     Sympy auto-cancellation: its own variables, its exact zero set when
-    it is an exactly resolvable univariate denominator, and a
-    `resolvable` flag; radical, multivariate and over-cap denominators
-    are recorded but never guessed (`domain_analysis_complete` False);
+    that set is PROVABLY class-complete, and a `resolvable` flag;
+    completeness is proven for the supported class only — degree <= 2
+    (closed-form linear/quadratic solutions, multiplicity counts
+    cross-checked) or degree 3-4 that factors into irreducible factors
+    of degree <= 2; irreducible cubic/quartic denominators, and
+    radical shapes, mark the analysis incomplete instead of trusting
+    possibly-incomplete ``sympy.roots()`` output;
+  - zero denominators (exact constants, or symbolic constants such as
+    ``x - x``) are refused at parse (`division_by_zero`); nonzero
+    constant denominators impose no restriction;
+  - zero sets record their real / non-real partition explicitly: the
+    declared domain is the complex algebraic domain, so every zero
+    excludes a point, and the partition makes real-domain
+    restrictions visible in the evidence;
   - exclusion decisions always evaluate the denominator's OWN variable:
     a zero of `x` never rejects an assignment or solution set for `y`,
     and restrictions are never pooled across variables;
