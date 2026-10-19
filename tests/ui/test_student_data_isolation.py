@@ -302,13 +302,58 @@ class ErrorPrivacyTests(unittest.TestCase):
                                                 "oauth-token-synthetic")
         self.assertNotIn("oauth-token-synthetic", message)
         self.assertNotIn("gemini-key-synthetic", message)
-        self.assertIn("401", message)
+        self.assertIn("AUTH_REJECTED", message)
+        # No exception body at all may reach the UI, not even redacted text.
+        self.assertNotIn("Unauthorized", message)
+        self.assertNotIn("Bearer", message)
 
-    def test_manual_batch_error_detail_is_bounded(self):
+    def test_manual_batch_error_detail_is_bounded_and_body_free(self):
         exc = RuntimeError("x" * 5000)
         message = self.app["safe_error_detail"](exc, "unused-secret")
-        self.assertLess(len(message), 700)
-        self.assertTrue(message.endswith("…"))
+        self.assertLess(len(message), 80)
+        self.assertNotIn("xxxx", message)
+
+    def test_unknown_credentials_and_student_like_text_never_reach_the_ui(self):
+        cases = (
+            (RuntimeError(
+                "500 attachment sk-unknown-credential-987 failed; prompt: "
+                "'Synthetic Student wrote 34 and / 2 = 17'"),
+             ["sk-unknown-credential-987", "34 and / 2", "Synthetic Student"],
+             "SERVICE_UNAVAILABLE"),
+            (ValueError(
+                "bad response, token=Bearer unknown-oauth-token-value, student: Amina"),
+             ["Bearer unknown-oauth-token-value", "Amina"],
+             "RESPONSE_INVALID"),
+        )
+        for exc, forbidden_texts, code in cases:
+            with self.subTest(code=code):
+                message = self.app["safe_error_detail"](exc, "unused-secret")
+                for text in forbidden_texts:
+                    self.assertNotIn(text, message)
+                self.assertEqual(message, f"{type(exc).__name__} [{code}]")
+        # The per-student path is content-free as well.
+        shown = self.app["marking_failure_reason"](
+            RuntimeError("Quota exceeded sk-unknown-credential-987 Amina wrote 34"))
+        self.assertIn("rate or usage limit", shown)
+        self.assertNotIn("sk-unknown-credential-987", shown)
+        self.assertNotIn("Amina", shown)
+
+    def test_allowlisted_codes_are_stable_and_complete(self):
+        expected = {
+            RuntimeError("key reported as leaked"): "LEAKED_KEY",
+            RuntimeError("401 Unauthorized"): "AUTH_REJECTED",
+            RuntimeError("API key not valid. Please pass a valid API key."): "AUTH_REJECTED",
+            RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded"): "QUOTA_LIMIT",
+            RuntimeError("403 PERMISSION_DENIED"): "PERMISSION_DENIED",
+            RuntimeError("503 The model is overloaded"): "SERVICE_UNAVAILABLE",
+            RuntimeError("400 INVALID_ARGUMENT bad request"): "REQUEST_INVALID",
+            ValueError("json parse error"): "RESPONSE_INVALID",
+            OSError("mystery synthetic transport failure"): "UNKNOWN",
+        }
+        for exc, code in expected.items():
+            self.assertEqual(self.app["provider_error_code"](exc), code)
+            self.assertTrue(self.app["safe_error_detail"](
+                exc).endswith(f" [{code}]"))
 
     def test_classification_branches_still_match_error_categories(self):
         # The stable categories keep the existing status-code triage working.

@@ -1860,7 +1860,10 @@ def test_api_key(api_key: str):
                 "rate or usage limit."
             )
 
-        return False, f"Gemini returned an authentication/setup error: {message}"
+        return False, (
+            "Gemini returned an authentication/setup error "
+            f"({safe_error_detail(exc)})."
+        )
 
 
 
@@ -1979,18 +1982,59 @@ def redact_secret_values(message: str, *secrets: str) -> str:
     return redacted
 
 
-def safe_error_detail(exc: BaseException, *secrets: str, limit: int = 600) -> str:
-    """Bounded, secret-free technical detail for user-visible diagnostics.
+PROVIDER_ERROR_CODES = (
+    "LEAKED_KEY",
+    "AUTH_REJECTED",
+    "PERMISSION_DENIED",
+    "QUOTA_LIMIT",
+    "SERVICE_UNAVAILABLE",
+    "REQUEST_INVALID",
+    "RESPONSE_INVALID",
+    "UNKNOWN",
+)
 
-    Provider and OAuth exceptions can echo request credentials, headers or
-    uploaded content. Configured secrets (Gemini key, OAuth access token) are
-    removed, line breaks are flattened and the text is bounded before it is
-    ever rendered.
+
+def provider_error_code(exc: BaseException) -> str:
+    """Allowlisted failure code derived from a provider exception.
+
+    The exception body is read only to classify the failure; no part of it is
+    ever returned, so unknown credentials, OAuth headers, request payloads or
+    student content inside a provider message cannot reach the UI.
     """
-    text = redact_secret_values(str(exc), *secrets).replace("\n", " ").strip()
-    if len(text) > limit:
-        text = text[:limit] + " …"
-    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    body = str(exc).lower()
+    if "reported as leaked" in body:
+        return "LEAKED_KEY"
+    if ("401" in body or "unauthenticated" in body or "invalid api key" in body
+            or "api key not valid" in body):
+        return "AUTH_REJECTED"
+    if ("429" in body or "quota" in body or "resource_exhausted" in body
+            or "rate limit" in body):
+        return "QUOTA_LIMIT"
+    if "403" in body or "permission" in body or "forbidden" in body:
+        return "PERMISSION_DENIED"
+    if any(marker in body for marker in (
+            "500", "503", "unavailable", "overloaded", "high demand",
+            "temporarily", "deadline exceeded", "timed out", "timeout")):
+        return "SERVICE_UNAVAILABLE"
+    if any(marker in body for marker in (
+            "400", "404", "invalid_argument", "invalid argument", "bad request",
+            "failed_precondition", "not found", "malformed")):
+        return "REQUEST_INVALID"
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "RESPONSE_INVALID"
+    return "UNKNOWN"
+
+
+def safe_error_detail(exc: BaseException, *secrets: str, limit: int = 600) -> str:
+    """Safe, allowlisted technical detail for user-visible diagnostics.
+
+    Only the exception class name and a stable allowlisted failure code are
+    emitted. Provider exception bodies — which can echo request credentials,
+    OAuth headers or uploaded student content — are never included, so no
+    redaction or truncation of raw text is required. `secrets` and `limit`
+    are accepted for call-site compatibility and are unused.
+    """
+    return f"{type(exc).__name__} [{provider_error_code(exc)}]"
 
 
 def marking_failure_reason(exc: BaseException) -> str:
@@ -3765,14 +3809,16 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                             bind_sensitive_state(job_owner)
 
                                     except Exception as classroom_error:
-                                        message = safe_error_detail(
-                                            classroom_error, api_key, token)
-                                        if "401" in message:
+                                        # Body text is never user-visible:
+                                        # classification is allowlisted only.
+                                        code = provider_error_code(classroom_error)
+                                        message = safe_error_detail(classroom_error)
+                                        if code == "AUTH_REJECTED":
                                             st.error(
                                                 "Google authorization expired or was revoked. "
                                                 "Log out and reconnect Google Classroom."
                                             )
-                                        elif "403" in message:
+                                        elif code == "PERMISSION_DENIED":
                                             st.error(
                                                 "Google denied Classroom/Drive access. "
                                                 "Check the OAuth scopes, Google Cloud APIs, "
@@ -3780,7 +3826,8 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                             )
                                         else:
                                             st.error(
-                                                f"Classroom marking failed: {message}"
+                                                f"Classroom marking failed ({message}). "
+                                                "No provider details are shown to protect student data."
                                             )
 
                                         with st.expander("Technical error details"):
@@ -3887,11 +3934,11 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                 st.info(last_result["message"])
 
                 except Exception as classroom_load_error:
-                    # Operator token and Gemini key are never echoed; keep the
-                    # detail bounded and content-free.
+                    # Operator token and Gemini key are never echoed; only the
+                    # exception class and an allowlisted failure code display.
                     st.error(
                         "Could not load Google Classroom data. "
-                        + safe_error_detail(classroom_load_error, token, api_key)
+                        + safe_error_detail(classroom_load_error)
                     )
 
 st.subheader("📁 Upload files")
@@ -4117,30 +4164,36 @@ if manual_run_authorized:
             )
 
     except Exception as exc:
-        message = safe_error_detail(exc, api_key)
+        # Allowlisted classification only: provider bodies (which can echo
+        # credentials or student content) are never displayed.
+        code = provider_error_code(exc)
+        message = safe_error_detail(exc)
 
-        if "reported as leaked" in message.lower():
+        if code == "LEAKED_KEY":
             st.error(
                 "This Gemini API key has been blocked as a leaked key. "
                 "Create a NEW key in Google AI Studio and replace the old one."
             )
-        elif "401" in message or "unauthenticated" in message.lower() or "invalid api key" in message.lower():
+        elif code == "AUTH_REJECTED":
             st.error(
                 "Gemini rejected this API key. Click 'Test API key' in the sidebar "
                 "to verify the replacement key before grading."
             )
-        elif "403" in message or "permission" in message.lower() or "forbidden" in message.lower():
+        elif code == "PERMISSION_DENIED":
             st.error(
                 "The Gemini project is refusing the key. Check the key's "
                 "project/restrictions and that the Gemini API is enabled."
             )
-        elif "429" in message or "quota" in message.lower():
+        elif code == "QUOTA_LIMIT":
             st.error(
                 "The Gemini project has hit a rate/usage limit. Check the project's "
                 "Gemini API usage and billing/quota."
             )
         else:
-            st.error(f"The automatic marking run failed: {message}")
+            st.error(
+                f"The automatic marking run failed ({message}). "
+                "No provider details are shown to protect student data."
+            )
 
         with st.expander("Technical error details"):
             st.code(message)
