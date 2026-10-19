@@ -42,7 +42,9 @@ for parent in ast.walk(tree):
     if not isinstance(body, list):
         continue
     for index, node in enumerate(body):
-        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "last_result" for t in node.targets):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "last_result" for t in node.targets)
+                and "job_state" in ast.unparse(node.value)):
             block = body[index:index + 2]
 f["job_state"] = state
 exec(compile(ast.Module(body=block, type_ignores=[]), str(SOURCE), "exec"), f)

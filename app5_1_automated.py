@@ -771,7 +771,7 @@ def save_classroom_approval(student_key):
         st.session_state[f"classroom_approval_checkbox_{student_key}"] = False
         return
     st.session_state.setdefault("classroom_grade_approvals", {})[student_key] = bool(
-        st.session_state[f"classroom_approval_checkbox_{student_key}"]
+        st.session_state.get(f"classroom_approval_checkbox_{student_key}", False)
     )
 
 
@@ -4094,6 +4094,9 @@ if manual_run_authorized:
                     "Marking finished, but the signed-in account changed during "
                     "the run. The results were discarded to protect student data."
                 )
+                # Also drop any context values left by the previous owner and
+                # any widget state from this partially-completed run.
+                invalidate_sensitive_state()
             else:
                 preserve_result_snapshot(
                     st.session_state.get("last_batch_results", []), "manual",

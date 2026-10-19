@@ -32,7 +32,8 @@ f.update(st=st, pd=pd)
 f["authenticated_google_identity"] = lambda: "teacher-a-subject"
 f["google_logged_in"] = lambda: True
 result = f["normalise_result"]({{"questions": [model_question(benchmark()["questions"][0], "partial")]}})
-row_a = f["new_review_row"]({{"status": "Marked", "result": result}}, "manual")
+row_a = f["new_review_row"]({{"status": "Marked", "result": result, "student_name": "StudentA",
+    "marking_model": "gemini-synthetic", "audit_model": "Not run"}}, "manual")
 assert row_a["report_owner"] == "google:teacher-a-subject"
 if OWNERLESS_ROW:
     stale = dict(row_a)
@@ -40,15 +41,14 @@ if OWNERLESS_ROW:
     st.session_state["last_batch_results"] = [stale]
 else:
     st.session_state["last_batch_results"] = [row_a]
+    st.session_state["previous_result_snapshots"] = {{"manual": [dict(row_a)]}}
+    st.session_state["classroom_jobs"] = {{
+        "synthetic": {{"processed": set(),
+                       "last_result": {{"processed": [row_a], "active_submission_ids": [], "pending": 0}}}}}}
 st.session_state["sensitive_state_owner"] = "google:teacher-a-subject"
 st.session_state["teacher_overrides"] = {{row_a["review_key"]: {{"1": 1}}}}
 st.session_state["teacher_override_reasons"] = {{row_a["review_key"]: {{"1": "A override"}}}}
 st.session_state["classroom_grade_approvals"] = {{row_a["review_key"]: True}}
-st.session_state["previous_result_snapshots"] = {{"manual": [dict(row_a)]}}
-st.session_state["classroom_jobs"] = {{
-    "synthetic": {{"processed": set(),
-                   "new": row_a,
-                   "last_result": {{"processed": [row_a], "active_submission_ids": [], "pending": 0}}}}}}
 st.session_state["manual_report_owner"] = "stale-anonymous-id"
 
 # The authenticated subject changes (account switch, expiry or logout).
@@ -94,7 +94,8 @@ f["result_owner"] = current_owner
 
 # Synthetic marked rows exactly as the marking engine produced them.
 result = f["normalise_result"]({{"questions": [model_question(benchmark()["questions"][0], "partial")]}})
-f["batch_results"] = [{{"student_name": "StudentA", "status": "Marked", "result": result}}]
+f["batch_results"] = [{{"student_name": "StudentA", "status": "Marked", "result": result,
+    "marking_model": "gemini-synthetic", "audit_model": "Not run"}}]
 st.session_state["last_batch_results"] = []
 st.session_state["last_manual_context"] = "old"
 st.session_state["last_mark_scheme_name"] = "old"
@@ -191,8 +192,9 @@ class StaleRecordWriteTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         errors = [item.value for item in app.error]
         self.assertTrue(any("discarded to protect student data" in e for e in errors), errors)
-        self.assertEqual(app.session_state["last_batch_results"], [])
-        self.assertNotIn("last_manual_context", app.session_state)
+        # The whole previous owner's context is invalidated, not just the batch.
+        for key in ("last_batch_results", "last_manual_context", "last_mark_scheme_name"):
+            self.assertNotIn(key, app.session_state)
         self.assertNotIn("sensitive_state_owner", app.session_state)
 
     def test_results_stored_when_owner_is_unchanged(self):
@@ -216,7 +218,8 @@ class StaleRecordWriteTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         errors = [item.value for item in app.error]
         self.assertTrue(any("discarded to protect student data" in e for e in errors), errors)
-        self.assertEqual(app.session_state["last_batch_results"], [])
+        self.assertNotIn("last_batch_results", app.session_state)
+        self.assertNotIn("sensitive_state_owner", app.session_state)
 
 
 class LogoutCleanupTests(unittest.TestCase):

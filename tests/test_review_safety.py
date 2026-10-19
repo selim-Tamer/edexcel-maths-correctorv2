@@ -127,6 +127,9 @@ class ReviewStateTests(unittest.TestCase):
     def test_new_run_same_filename_cannot_inherit_override_or_approval(self):
         original = self.row()
         first = self.f["new_review_row"](original, "manual")
+        # The S2.1 ownership guard requires result rows registered in an
+        # owner-scoped store; register first's row as the session's own.
+        self.ui.session_state["last_batch_results"] = [first]
         self.f["save_teacher_override"](first["review_key"], "1", 2, "Checked working")
         self.f["prepare_review_row"](first)
         second = self.f["new_review_row"](original, "manual")
@@ -139,6 +142,7 @@ class ReviewStateTests(unittest.TestCase):
 
     def test_rerenders_are_idempotent_and_removing_override_restores_ai(self):
         row = self.f["new_review_row"](self.row(), "manual")
+        self.ui.session_state["last_batch_results"] = [row]  # owner guard store
         self.f["save_teacher_override"](row["review_key"], "1", 2, "Teacher checked")
         self.f["prepare_review_row"](row)
         saved = copy.deepcopy(row)
@@ -150,8 +154,12 @@ class ReviewStateTests(unittest.TestCase):
         self.assertNotIn("teacher_override", row["result"]["questions"][0])
 
     def test_override_callback_invalidates_only_this_review_approval(self):
+        owner = self.f["result_owner"]()
         self.ui.session_state["classroom_grade_approvals"] = {"classroom_a": True, "classroom_b": True}
         self.ui.session_state["classroom_approval_checkbox_classroom_a"] = True
+        # The S2.1 ownership guard: register classroom_a as an owned row.
+        self.ui.session_state["last_batch_results"] = [
+            {"review_key": "classroom_a", "report_owner": owner}]
         self.f["save_teacher_override"]("classroom_a", "1", 2, "checked")
         self.assertNotIn("classroom_a", self.ui.session_state["classroom_grade_approvals"])
         self.assertTrue(self.ui.session_state["classroom_grade_approvals"]["classroom_b"])
@@ -228,7 +236,8 @@ class ClassroomStateTests(unittest.TestCase):
                 continue
             for index, node in enumerate(body):
                 if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
-                    and target.id == "last_result" for target in node.targets)):
+                    and target.id == "last_result" for target in node.targets)
+                    and "job_state" in ast.unparse(node.value)):
                     nodes = body[index:index + 2]
                     break
         self.assertIsNotNone(nodes)

@@ -45,6 +45,10 @@ class ReviewFollowupTests(unittest.TestCase):
         self.f["st"] = self.ui
         row = self.row()
         key = "classroom_review"
+        # The S2.1 ownership guard requires the reviewed row registered in an
+        # owner-scoped store before overrides are accepted.
+        self.ui.session_state["last_batch_results"] = [
+            {"review_key": key, "report_owner": self.f["result_owner"]()}]
         self.ui.session_state["classroom_grade_approvals"] = {key: True}
         self.f["render_teacher_override_controls"](key, row["result"])
         callback = self.ui.buttons["Apply override"]

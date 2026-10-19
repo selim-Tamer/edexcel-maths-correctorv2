@@ -124,15 +124,22 @@ class ResultSnapshotTests(unittest.TestCase):
         row = self.f['new_review_row'](self.row(), 'manual')
         self.ui.session_state['last_batch_results'] = [row]
         self.f['batch_results'] = [{'status': 'Failed', 'result': None}]
+        # The hardened store path binds rows to the owner captured at run
+        # start; the harness provides the same owner the run would capture.
+        self.f['store_owner'] = self.f['result_owner']()
         tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+        matched = False
         for parent in ast.walk(tree):
-            body = getattr(parent, 'body', None)
-            if not isinstance(body, list):
-                continue
-            for i, node in enumerate(body):
-                if isinstance(node, ast.Assign) and any(
-                    ast.unparse(t) == "st.session_state['last_batch_results']" for t in node.targets):
-                    exec(compile(ast.Module(body=body[i-1:i+1], type_ignores=[]), str(SOURCE), 'exec'), self.f)
+            for attribute in ('body', 'orelse', 'finalbody'):
+                body = getattr(parent, attribute, None)
+                if not isinstance(body, list):
+                    continue
+                for i, node in enumerate(body):
+                    if isinstance(node, ast.Assign) and any(
+                        ast.unparse(t) == "st.session_state['last_batch_results']" for t in node.targets):
+                        exec(compile(ast.Module(body=body[i-1:i+1], type_ignores=[]), str(SOURCE), 'exec'), self.f)
+                        matched = True
+        self.assertTrue(matched, 'manual store block not found')
         self.assertEqual(self.ui.session_state['last_batch_results'][0]['status'], 'Failed')
         self.assertEqual(self.ui.session_state['previous_result_snapshots']['manual'][0]['totals']['earned'], 1)
 
