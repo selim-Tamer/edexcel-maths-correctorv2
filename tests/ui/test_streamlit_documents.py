@@ -39,15 +39,22 @@ f["mark_one_submission"]=mark
 f["types"].HttpOptions=lambda **kw:kw
 f.update(genai=SimpleNamespace(Client=lambda **kw:fixture["provider"]),
     api_key="synthetic-never-sent", ready=True,
+    authenticated_google_identity=lambda:"synthetic-teacher-sub",
     student_pdfs=[uploaded(b"student")], mark_scheme_pdf=uploaded(b"scheme","scheme.pdf"),
     question_pdf=None, audit_enabled=False,random_question_count=None,
     document_state=fixture["state"],retain_references=False)
+def norm(text):
+    return text.replace("(","").replace(")","").replace(" ","")
 st.checkbox("Unrelated rerun",key="rerun_control")
 for node in ast.parse(SOURCE.read_text(encoding="utf-8")).body:
-    if isinstance(node,ast.If) and isinstance(node.test,ast.Call):
-        args=node.test.args
-        if args and isinstance(args[0],ast.Constant) and args[0].value=="🚀 Mark Homework Automatically":
-            exec(compile(ast.Module(body=[node],type_ignores=[]),str(SOURCE),"exec"),f)
+    if isinstance(node,ast.Assign) and any(
+            isinstance(t,ast.Name) and t.id in ("manual_run_requested","manual_run_authorized")
+            for t in node.targets):
+        exec(compile(ast.Module(body=[node],type_ignores=[]),str(SOURCE),"exec"),f)
+    elif isinstance(node,ast.If) and norm(ast.unparse(node.test)) in (
+            norm("manual_run_requested and not manual_run_authorized"),
+            norm("manual_run_authorized")):
+        exec(compile(ast.Module(body=[node],type_ignores=[]),str(SOURCE),"exec"),f)
 '''
 class StreamlitDocumentTests(unittest.TestCase):
     def app(self):
