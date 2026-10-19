@@ -44,6 +44,107 @@ Run their tests with:
 python -m unittest investigation.test_pdf_evidence investigation.test_pdf_question_map investigation.test_verification_evidence -v
 ```
 
+## Stage C4 mathematical verification modules (offline)
+
+`safe_math.py`, `math_verification.py`, `math_claims.py` and
+`math_benchmark.py` add an offline, deterministic mathematical
+verification engine for the investigation. It is investigation-only:
+the production app never imports it and it imports nothing from the
+production app.
+
+- `safe_math.py` parses untrusted text with a validated-AST whitelist
+  (operators, bounded numbers, whitelisted variables, `sqrt`/`abs` only)
+  and builds Sympy objects node by node. No `eval`/`exec` and no
+  unrestricted Sympy parsing ever touches raw text; refusals are
+  explicit (`unsupported_syntax`, `unknown_symbol`, `expression_too_long`,
+  `expression_too_complex`, `number_too_large`, `exponent_too_large`).
+  Length/node/depth caps, integer and exponent magnitude caps, and a
+  combinatorial expand bound computed without expanding bound all
+  symbolic work.
+- `math_verification.py` verifies caller-supplied claims into a fixed
+  result contract (`verified` / `contradicted` / `inconclusive` /
+  `unsupported`; no numeric confidence anywhere). Checks cover exact
+  arithmetic, algebraic identities (expansion, factorisation, rational
+  equivalence with domain/excluded-value notes), surd equality, bounded
+  polynomial equation solving (degree cap 4; quadratic checks cap 2),
+  exact substitution, assumption-scoped refinement (`refine`) and
+  50-digit numeric comparison ONLY for explicitly approximate claims.
+  A nonzero canonical difference proves a contradiction only for
+  constant/rational/polynomial classes; symbolic surd/abs forms stay
+  inconclusive. Equivalence is never claimed from numeric sampling,
+  and a contradiction never claims any official document is wrong —
+  every result carries that scope note.
+
+  Original-domain and solution-set completeness rules (PR #25 review):
+
+  - the parser records every ORIGINAL denominator (divisions and
+    negative powers) with variable-specific provenance BEFORE any
+    Sympy auto-cancellation: its own variables, its exact zero set when
+    that set is PROVABLY class-complete, and a `resolvable` flag;
+    completeness is proven for the supported class only — degree <= 2
+    (closed-form linear/quadratic solutions, multiplicity counts
+    cross-checked) or degree 3-4 that factors into irreducible factors
+    of degree <= 2; irreducible cubic/quartic denominators, and
+    radical shapes, mark the analysis incomplete instead of trusting
+    possibly-incomplete ``sympy.roots()`` output;
+  - zero denominators (exact constants, or symbolic constants such as
+    ``x - x``) are refused at parse (`division_by_zero`); nonzero
+    constant denominators impose no restriction;
+  - zero sets record their real / non-real partition explicitly: the
+    declared domain is the complex algebraic domain, so every zero
+    excludes a point, and the partition makes real-domain
+    restrictions visible in the evidence;
+  - exclusion decisions always evaluate the denominator's OWN variable:
+    a zero of `x` never rejects an assignment or solution set for `y`,
+    and restrictions are never pooled across variables;
+  - a claimed solution making any original denominator zero is refused
+    (`solution_excluded_by_original_domain`), and substitution onto an
+    undefined point is contradicted, never verified;
+  - wherever the domain analysis is incomplete (radical denominators
+    and similar), identities and equation solution sets stay
+    `inconclusive`, never `verified`;
+  - a denominator using several variables cannot be resolved exactly,
+    so any claim whose value must be certified on its domain is left
+    `inconclusive` rather than guessed;
+  - `verified` equation solution sets require a provably complete
+    solver for the class (degree <= 2). Degree 3-4 claims with exactly
+    confirmed roots stay `inconclusive`, contradictions from exact
+    residuals remain `contradicted`;
+  - identities (infinitely many solutions on the common domain) and
+    no-solution equations are explicitly distinguished in the evidence;
+    a finite claimed set can never complete an infinite solution set.
+- `math_claims.py` integrates with the other stages: claim
+  `source_references` keep C3 `document_id`/`role`/`sha256`/`page`
+  verbatim, and can be cross-checked against C3 document records: the
+  `sha256` must match, the `document_id` must bind a record sharing
+  that digest (a digest alone never binds a document), and duplicate
+  digest+`document_id` bindings are rejected as ambiguous. C2 findings
+  pass through as untouched deep copies. Mathematical correctness and
+  mark eligibility are reported in separate sections.
+- `math_benchmark.py` is a 28-case synthetic benchmark (`MBC-01`..)
+  independent of the C2 accuracy/case-governance fixtures: it runs the
+  public `verify_claim` path and asserts expected outcomes plus
+  review-required flags (`python -m investigation.math_benchmark`).
+
+Stage C4 corrections for two C3 findings (narrow scope, contracts kept):
+
+1. `pdf_evidence.py` now reports `partial_extraction` at document level
+   when per-page truncation or aggregate text-budget exhaustion occurs,
+   instead of silently claiming a fully `extracted` document;
+   `test_only_budget_exhaustion_is_reported_incomplete` asserts the
+   strengthened status.
+2. `pdf_question_map.py` never attaches a continuation page that bears
+   ANY question heading (matched or unmatched number): a new question
+   starts there, so heuristic continuation cannot cross an unmatched
+   heading boundary. Regression tests cover both the boundary and the
+   unchanged positive continuation path.
+
+Run their tests with:
+
+```sh
+python -m unittest investigation.test_safe_math investigation.test_math_verification investigation.test_math_claims investigation.test_math_benchmark investigation.test_math_security investigation.test_equation_and_domain_integrity -v
+```
+
 ## Live (not executed for this investigation)
 
 Requires explicit human authorization, a separate test-only project with **no billing attached**, and rechecking the current Google free-tier pricing/access. A free-eligible model can charge a billed project. The script cannot check billing; do not use it when billing state is uncertain. Do not supply a production key. Do not place a key in a command line, environment variable, output file or chat.

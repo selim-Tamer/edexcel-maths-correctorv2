@@ -129,6 +129,39 @@ class SpanningAndContinuationTests(unittest.TestCase):
         q1 = result["matches"][0]
         self.assertEqual(q1["pages"], [1])
 
+    def test_continuation_never_crosses_an_unmatched_heading_page(self):
+        # Stage C4 Phase 6 regression: the page between Q1 and Q3 carries
+        # a heading for the (unrequested) number 9, so a new question
+        # starts there; it must NOT be attached to Q1 as continuation.
+        document = _scheme([["Question 1 total 2 marks"],
+                            ["Question 9 total 4 marks", "unmatched row"],
+                            ["Question 3 total 3 marks"]])
+        result = map_question_pages(
+            document, ["Q1", "Q3"],
+            continuation_policy="heuristic_adjacent")
+        q1 = result["matches"][0]
+        self.assertEqual(q1["pages"], [1])
+        self.assertTrue(all(ref["method"] == METHOD_HEADING
+                            for ref in q1["references"]))
+        self.assertEqual(
+            [entry["heading_number"] for entry
+             in result["unmatched_headings"]], ["9"])
+
+    def test_continuation_still_attaches_between_plain_pages(self):
+        # Positive control: without the unmatched heading, the intermediate
+        # page IS still attributed as an opt-in, labelled continuation.
+        document = _scheme([["Question 1 total 2 marks"],
+                            ["ordinary continuation working"],
+                            ["Question 3 total 3 marks"]])
+        result = map_question_pages(
+            document, ["Q1", "Q3"],
+            continuation_policy="heuristic_adjacent")
+        continuations = [ref for ref in result["matches"][0]["references"]
+                         if ref["method"] == METHOD_CONTINUATION]
+        self.assertEqual([ref["page"] for ref in continuations], [2])
+        self.assertTrue(all(ref["data_origin"] == "heuristic_inference"
+                            for ref in continuations))
+
     def test_policy_values_validate(self):
         document = _scheme([["Question 1 total 2 marks"]])
         for policy in CONTINUATION_POLICIES:

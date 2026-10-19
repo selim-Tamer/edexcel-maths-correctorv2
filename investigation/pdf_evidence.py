@@ -328,6 +328,14 @@ def extract_pdf_evidence(data, document_role, document_id=None):
                 document["extraction_status"] = "extraction_failed"
             elif failed_pages:
                 document["extraction_status"] = "partial_extraction"
+            elif any(page["status"] in ("ambiguous_layout",
+                                        "budget_exhausted")
+                     for page in document["pages"]):
+                # Stage C4 Phase 6 correction: per-page truncation or
+                # aggregate budget exhaustion is NOT a complete,
+                # fully-verified extraction, so the document-level status
+                # must say partial even when no page outright failed.
+                document["extraction_status"] = "partial_extraction"
             elif document["extraction_status"] != "unsupported_content":
                 document["extraction_status"] = "extracted"
             if any(p["status"] == "empty_text_layer"

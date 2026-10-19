@@ -184,6 +184,31 @@ class BudgetAndLayoutTests(unittest.TestCase):
         self.assertEqual(statuses, ["budget_exhausted", "budget_exhausted"])
         self.assertIn("budget", document["pages"][1]["warnings"][0])
 
+    def test_document_status_reports_partial_when_budget_capped(self):
+        # Stage C4 Phase 6 regression: aggregate budget exhaustion means
+        # the document is NOT completely extracted, even with no page
+        # failing; the document-level status must not claim full success.
+        data = build_pdf([["Q1 text"], ["Q2 text"], ["Q3 text"]])
+        with mock.patch.object(evidence, "MAX_TOTAL_TEXT_CHARS", 1):
+            document = extract_pdf_evidence(data, "mark_scheme")
+        self.assertEqual(document["extraction_status"],
+                         "partial_extraction")
+        self.assertTrue(any(page["status"] == "budget_exhausted"
+                            for page in document["pages"]))
+
+    def test_document_status_reports_partial_when_truncated(self):
+        # Stage C4 Phase 6 regression: per-page truncation alone (no page
+        # failure at all) must also produce the partial extraction status.
+        data = build_pdf([["Q1 (a) A1: solves 2x + 3 = 11 and shows "
+                           "every step of the working"]])
+        with mock.patch.object(evidence, "MAX_PAGE_TEXT_CHARS", 10):
+            document = extract_pdf_evidence(data, "mark_scheme")
+        self.assertEqual(document["pages"][0]["status"], "ambiguous_layout")
+        self.assertEqual(document["extraction_status"],
+                         "partial_extraction")
+        self.assertTrue(any("truncated" in warning
+                            for warning in document["pages"][0]["warnings"]))
+
     def test_oversized_text_page_is_ambiguous_layout(self):
         data = build_pdf([["A" * (evidence.MAX_PAGE_TEXT_CHARS + 1),
                            "tail line"]])

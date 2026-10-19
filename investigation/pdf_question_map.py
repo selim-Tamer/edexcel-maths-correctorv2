@@ -233,6 +233,7 @@ def map_question_pages(document, question_ids, *, hints=None,
     matches = {question_id: [] for question_id in question_ids}
     unmatched_headings = []
     heading_numbers_by_page = {}
+    heading_bearing_pages = set()
     for page_tokens in tokens:
         for token in page_tokens:
             # Same number must map to at most one requested id: duplicates
@@ -240,6 +241,7 @@ def map_question_pages(document, question_ids, *, hints=None,
             question_id = canonical.get(token["number"])
             heading_numbers_by_page.setdefault(token["page"], set()).add(
                 token["number"])
+            heading_bearing_pages.add(token["page"])
             if question_id is None:
                 unmatched_headings.append({
                     "page": token["page"],
@@ -297,6 +299,12 @@ def map_question_pages(document, question_ids, *, hints=None,
                                                       + 1)):
                 page_record = document["pages"][between - 1]
                 if not page_record["text"].strip():
+                    continue
+                if between in heading_bearing_pages:
+                    # Stage C4 Phase 6 correction: a page bearing ANY
+                    # question heading (matched or unmatched number) starts
+                    # a new question; it is never a continuation page of
+                    # the previous one, however its page order sits.
                     continue
                 matches[question_id].append(page_reference(
                     document, between, method=METHOD_CONTINUATION,
