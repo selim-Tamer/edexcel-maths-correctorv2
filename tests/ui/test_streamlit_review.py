@@ -21,14 +21,16 @@ import streamlit as st
 from support import SOURCE, load_app, benchmark, model_question
 f = load_app()
 f.update(st=st, pd=pd)
-if "review_fixture" not in st.session_state:
+if "classroom_jobs" not in st.session_state or not st.session_state["classroom_jobs"].get("synthetic_context"):
     result = f["normalise_result"]({{"questions": [model_question(benchmark()["questions"][0], "partial")]}})
     row = f["new_review_row"]({{"status":"Marked", "result": result,
         "student":"Synthetic", "submission_id":"s", "marking_model":"fake",
         "audit_model":"Not run", "suggested_classroom_grade":50,
         "classroom_max_points":100, "is_current":True, "revision":"r1"}}, "classroom")
-    st.session_state["review_fixture"] = {{"last_result": {{"processed":[row], "active_submission_ids":["s"]}}}}
-state = st.session_state["review_fixture"]
+    st.session_state["classroom_jobs"] = {{"synthetic_context": {{
+        "processed": set(),
+        "last_result": {{"processed":[row], "active_submission_ids":["s"], "pending":0}}}}}}
+state = st.session_state["classroom_jobs"]["synthetic_context"]
 def withdraw():
     state["last_result"] = f["merge_classroom_results"](
         state["last_result"], {{"processed":[], "active_submission_ids":[], "pending":0}},
@@ -48,8 +50,8 @@ exec(compile(ast.Module(body=block, type_ignores=[]), str(SOURCE), "exec"), f)
 
 class StreamlitReviewTests(unittest.TestCase):
     def test_working_grouping_and_transcription_uncertainty_are_visible(self):
-        script = BOOTSTRAP.replace('state = st.session_state["review_fixture"]', '''
-state = st.session_state["review_fixture"]
+        script = BOOTSTRAP.replace('state = st.session_state["classroom_jobs"]["synthetic_context"]', '''
+state = st.session_state["classroom_jobs"]["synthetic_context"]
 row = state["last_result"]["processed"][0]
 q = row["ai_result"]["questions"][0]
 q["student_answer"] = "34"
@@ -80,7 +82,7 @@ f["check_question_marks"](row["ai_result"], {"1": 2})
         self.assertEqual(len(app.exception), 0)
         self.assertFalse(app.checkbox[0].value)
         self.assertEqual(app.metric[0].value, "2 / 2")
-        row = app.session_state["review_fixture"]["last_result"]["processed"][0]
+        row = app.session_state["classroom_jobs"]["synthetic_context"]["last_result"]["processed"][0]
         self.assertEqual(row["result"]["questions"][0]["teacher_override"]["reason"], "Verified working")
         # A subsequent ordinary rerun must preserve the corrected result.
         app.run()
@@ -101,8 +103,8 @@ f["check_question_marks"](row["ai_result"], {"1": 2})
         self.assertEqual(app.metric[0].value, "1 / 2")
 
     def test_unresolved_full_score_shows_review_without_changing_marks(self):
-        script = BOOTSTRAP.replace('state = st.session_state["review_fixture"]', '''
-state = st.session_state["review_fixture"]
+        script = BOOTSTRAP.replace('state = st.session_state["classroom_jobs"]["synthetic_context"]', '''
+state = st.session_state["classroom_jobs"]["synthetic_context"]
 row = state["last_result"]["processed"][0]
 q = row["ai_result"]["questions"][0]
 q["awarded_marks"] = 2
