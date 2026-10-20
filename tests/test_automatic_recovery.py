@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch, Mock
 from support import load_app, fake_client, remote, benchmark, model_question
 from pipeline_fakes import Clock, ApiError, quota_failure, model_unavailable
+from test_pdf_processing import synthetic_pdf
 import marking_requests as mr
 
 
@@ -117,7 +118,7 @@ class AutomaticRecoveryTests(unittest.TestCase):
 
     def test_actual_classroom_worker_failure_then_success_no_partial_result(self):
         self.f['get_user_profile'] = Mock(return_value={'name': {'fullName': 'Synthetic'}})
-        self.f['download_drive_file'] = Mock(return_value=('synthetic.pdf', b'%PDF synthetic', 'application/pdf'))
+        self.f['download_drive_file'] = Mock(return_value=('synthetic.pdf', synthetic_pdf(), 'application/pdf'))
         self.f['upload_bytes_to_gemini'] = Mock(return_value=remote())
         client = fake_client([ApiError(503)]*3 + [self.payload])
         def mark(n):
@@ -151,7 +152,7 @@ class AutomaticRecoveryTests(unittest.TestCase):
         self.f['list_turned_in_submissions'] = Mock(return_value=submissions)
         self.f['classroom_submission_revision'] = lambda token, submission: submission['id']+'-v1'
         self.f['get_user_profile'] = Mock(return_value={'name': {'fullName': 'Synthetic'}})
-        self.f['download_drive_file'] = Mock(return_value=('synthetic.pdf', b'%PDF synthetic', 'application/pdf'))
+        self.f['download_drive_file'] = Mock(return_value=('synthetic.pdf', synthetic_pdf(), 'application/pdf'))
         self.f['upload_bytes_to_gemini'] = Mock(return_value=remote())
         self.f['upload_pdf'] = Mock(return_value=remote(name='scheme'))
         self.f['prepare_reference_metadata'] = Mock(return_value=(({'1':2}, {'1':'4'}, None), ['1']))

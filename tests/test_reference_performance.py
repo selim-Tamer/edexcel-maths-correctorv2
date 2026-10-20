@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from support import load_app, fake_client
 from pipeline_fakes import Clock, Provider, uploaded
+from test_pdf_processing import synthetic_pdf
 import document_pipeline as dp
 
 
@@ -84,18 +85,19 @@ class ReferencePerformanceTests(unittest.TestCase):
                 client.models = fake_client([payload()]).models
                 session = {'files': dp.FileCache('account', clock=clock), 'metadata': dp.Memo(clock=clock), 'results': dp.Memo(clock=clock)}
                 run = dp.DocumentRun(client, session['files'])
-                scheme = uploaded(b'original scheme', 'scheme.pdf')
+                scheme_data = synthetic_pdf(2)
+                scheme = uploaded(scheme_data, 'scheme.pdf')
                 self.f['select_spread_questions'] = lambda numbers, count: numbers[:count]
                 try:
                     if classroom:
                         _, info, numbers = self.f['prepare_classroom_reference'](client, scheme, session, run, 'assignment', 1, lambda *_: None)
                     else:
-                        result = self.f['prepare_manual_batch'](client, [uploaded(b'original student')], scheme, None, False, 1, session, run)
+                        result = self.f['prepare_manual_batch'](client, [uploaded(b'%PDF-original-student')], scheme, None, False, 1, session, run)
                         info = result['scheme_info']
                         self.assertEqual(result['selected'], ['1'])
-                        self.assertIn(b'original student', client.data.values())
+                        self.assertIn(b'%PDF-original-student', client.data.values())
                     self.assertEqual(info[0], {'1': 2})
-                    self.assertIn(b'original scheme', client.data.values())
+                    self.assertIn(scheme_data, client.data.values())
                     self.assertEqual(client.models.generate_content.call_count, 1)
                 finally:
                     run.close()
@@ -105,10 +107,10 @@ class ReferencePerformanceTests(unittest.TestCase):
         client.models = fake_client([payload()]).models
         session = {'files': dp.FileCache('account'), 'metadata': self.memo, 'results': dp.Memo()}
         plans = []
-        for question in (b'paper one', b'paper two'):
+        for question in (b'%PDF- paper one', b'%PDF- paper two'):
             run = dp.DocumentRun(client, session['files'])
             try:
-                plan = self.f['prepare_manual_batch'](client, [uploaded(b'student')], uploaded(b'scheme'), uploaded(question), False, None, session, run)
+                plan = self.f['prepare_manual_batch'](client, [uploaded(b'%PDF-student')], uploaded(b'%PDF-scheme'), uploaded(question), False, None, session, run)
                 plans.append(plan)
                 session['results'].put(plan['keys'][0], {'status': 'Marked'})
             finally:

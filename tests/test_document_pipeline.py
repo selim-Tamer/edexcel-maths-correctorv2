@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 from support import load_app, SOURCE
+from test_pdf_processing import synthetic_pdf
 from pipeline_fakes import Clock, Provider, ApiError, uploaded
 import document_pipeline as dp
 
@@ -26,7 +27,7 @@ class TransportTests(unittest.TestCase):
 
     def test_poll_backoff_reduces_calls_with_bounded_detection_delay(self):
         clock=Clock(); client=Provider(clock)
-        events=[]; dp.transfer(client,b'x','scan.pdf',events.append,clock)
+        events=[]; dp.transfer(client,b'%PDF-x','scan.pdf',events.append,clock)
         self.assertEqual(client.files.get.call_count,7)
         self.assertEqual(clock.monotonic(),13.5)
         self.assertEqual(events[-1]['elapsed'],11.5)
@@ -34,7 +35,7 @@ class TransportTests(unittest.TestCase):
 
     def test_retry_after_is_obeyed_without_reuploading(self):
         clock=Clock(); client=Provider(clock,processing=0)
-        remote=dp.transfer(client,b'x','scan.pdf',clock=clock)
+        remote=dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
         client.files.get.side_effect=[ApiError(429,'7'),remote]
         self.assertIs(dp.get_status(client,remote.name,clock.monotonic()+30,clock),remote)
         self.assertIn(7,clock.sleeps)
@@ -51,7 +52,7 @@ class TransportTests(unittest.TestCase):
             clock=Clock(); client=Provider(clock)
             client.files.get.side_effect=ApiError(429,retry_after)
             with self.assertRaises((ApiError,TimeoutError)):
-                dp.transfer(client,b'x','scan.pdf',clock=clock)
+                dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
             self.assertEqual(client.files.get.call_count,expected_calls)
             self.assertEqual(client.files.upload.call_count,1)
             client.files.delete.assert_called_once()
@@ -60,16 +61,16 @@ class TransportTests(unittest.TestCase):
         for code in (400,401,403,404):
             clock=Clock(); client=Provider(clock)
             client.files.get.side_effect=ApiError(code)
-            with self.assertRaises(ApiError): dp.transfer(client,b'x','scan.pdf',clock=clock)
+            with self.assertRaises(ApiError): dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
             self.assertEqual(client.files.get.call_count,1)
         clock=Clock(); client=Provider(clock)
         client.files.upload.side_effect=ApiError(503)
-        with self.assertRaises(ApiError): dp.transfer(client,b'x','scan.pdf',clock=clock)
+        with self.assertRaises(ApiError): dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
         self.assertEqual(client.files.upload.call_count,1)
 
     def test_deadline_includes_retries_and_never_oversleeps(self):
         clock=Clock(); client=Provider(clock,processing=1000)
-        with self.assertRaises(TimeoutError): dp.transfer(client,b'x','scan.pdf',clock=clock)
+        with self.assertRaises(TimeoutError): dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
         self.assertEqual(clock.monotonic(),182)
         self.assertLessEqual(client.files.get.call_count,92)
         last_timeout=client.files.get.call_args.kwargs['config']['http_options']['timeout']
@@ -78,7 +79,7 @@ class TransportTests(unittest.TestCase):
 
     def test_provider_overruns_deadline_even_if_returns_active(self):
         clock=Clock(); client=Provider(clock,status_time=181)
-        with self.assertRaises(TimeoutError): dp.transfer(client,b'x','scan.pdf',clock=clock)
+        with self.assertRaises(TimeoutError): dp.transfer(client,b'%PDF-x','scan.pdf',clock=clock)
         client.files.delete.assert_called_once()
 
 
@@ -86,7 +87,7 @@ class FileCacheTests(unittest.TestCase):
     def setUp(self):
         self.clock=Clock(); self.client=Provider(self.clock,transfer=0,processing=0)
         self.cache=dp.FileCache('credential-and-account',clock=self.clock)
-    def run_doc(self, data=b'scheme', owner='assignment:scheme', reference=True,retain=True):
+    def run_doc(self, data=b'%PDF-scheme', owner='assignment:scheme', reference=True,retain=True):
         run=dp.DocumentRun(self.client,self.cache,retain)
         try: return run.acquire(data,'scan.pdf',owner,reference)
         finally: run.close()
@@ -111,19 +112,19 @@ class FileCacheTests(unittest.TestCase):
 
     def test_hash_owner_session_and_credentials_isolation(self):
         first=self.run_doc()
-        self.assertNotEqual(self.run_doc(data=b'changed').name,first.name)
+        self.assertNotEqual(self.run_doc(data=b'%PDF-changed').name,first.name)
         self.assertNotEqual(self.run_doc(owner='other-assignment:scheme').name,first.name)
         for scope in ('credential-and-account','other-credential'):
             run=dp.DocumentRun(self.client,dp.FileCache(scope,clock=self.clock),True)
-            self.assertNotEqual(run.acquire(b'scheme','scan.pdf','assignment:scheme',True).name,first.name)
+            self.assertNotEqual(run.acquire(b'%PDF-scheme','scan.pdf','assignment:scheme',True).name,first.name)
             run.close()
 
     def test_same_run_duplicate_single_flight_and_distinct_student_owners(self):
         run=dp.DocumentRun(self.client,self.cache,True)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            rows=list(executor.map(lambda _:run.acquire(b'x','scan.pdf','student:1'), range(2)))
+            rows=list(executor.map(lambda _:run.acquire(b'%PDF-x','scan.pdf','student:1'), range(2)))
         self.assertEqual(rows[0].name,rows[1].name)
-        self.assertNotEqual(run.acquire(b'x','scan.pdf','student:2').name,rows[0].name)
+        self.assertNotEqual(run.acquire(b'%PDF-x','scan.pdf','student:2').name,rows[0].name)
         self.assertEqual(self.client.files.upload.call_count,2)
         run.close(); self.assertEqual(self.client.files.delete.call_count,2)
 
@@ -159,23 +160,23 @@ class FileCacheTests(unittest.TestCase):
 
     def test_capacity_and_clear_delete_remote_files(self):
         self.cache.capacity=1
-        first=self.run_doc(); self.run_doc(data=b'other')
+        first=self.run_doc(); self.run_doc(data=b'%PDF-other')
         self.client.files.delete.assert_called_once_with(name=first.name)
         self.cache.clear(); self.assertEqual(self.client.files.delete.call_count,2)
 
     def test_active_reference_not_deleted_by_ttl_or_capacity(self):
         self.cache.capacity=1
         run=dp.DocumentRun(self.client,self.cache,True)
-        first=run.acquire(b'scheme','a.pdf','scheme',True)
+        first=run.acquire(b'%PDF-scheme','a.pdf','scheme',True)
         self.clock.sleep(601)
-        second=run.acquire(b'second','b.pdf','question',True)
+        second=run.acquire(b'%PDF-second','b.pdf','question',True)
         self.client.files.delete.assert_not_called()
         run.close()
         self.assertEqual({c.kwargs['name'] for c in self.client.files.delete.call_args_list}, {first.name,second.name})
 
     def test_clear_defers_deletion_of_active_reference_until_close(self):
         run=dp.DocumentRun(self.client,self.cache,True)
-        remote=run.acquire(b'scheme','scheme.pdf','scheme',True)
+        remote=run.acquire(synthetic_pdf(2),'scheme.pdf','scheme',True)
         self.cache.clear()
         self.client.files.delete.assert_not_called()
         run.close()
@@ -192,7 +193,7 @@ class FileCacheTests(unittest.TestCase):
     def test_cleanup_failure_count_and_idempotent_close(self):
         self.client.files.delete.side_effect=ApiError(503)
         run=dp.DocumentRun(self.client,self.cache)
-        run.acquire(b'student','s.pdf','student'); run.close(); run.close()
+        run.acquire(b'%PDF-student','s.pdf','student'); run.close(); run.close()
         self.assertEqual(self.cache.cleanup_failures,1)
         self.assertEqual(self.client.files.delete.call_count,1)
 
@@ -201,8 +202,8 @@ class PreparationTests(unittest.TestCase):
     def setUp(self):
         self.f=load_app(); self.clock=Clock(); self.client=Provider(self.clock,transfer=0,processing=0)
         self.session={'files':dp.FileCache('key-account',clock=self.clock),'metadata':dp.Memo(clock=self.clock),'results':dp.Memo(clock=self.clock)}
-        self.students=[uploaded(b'student1','one.pdf'),uploaded(b'student2','two.pdf')]
-        self.scheme=uploaded(b'scheme','scheme.pdf')
+        self.students=[uploaded(b'%PDF-student1','one.pdf'),uploaded(b'%PDF-student2','two.pdf')]
+        self.scheme=uploaded(synthetic_pdf(2),'scheme.pdf')
         self.f['extract_scheme_maxima']=Mock(return_value=({'1':2},{'1':'4'},None))
         self.f['discover_question_numbers']=Mock(return_value=['1','2','3','4'])
         self.f['select_spread_questions']=Mock(return_value=['1','3'])
@@ -233,8 +234,8 @@ class PreparationTests(unittest.TestCase):
 
     def test_changed_student_scheme_question_audit_and_models_invalidate(self):
         plan=self.prepare(); self.cache_results(plan)
-        cases=[{'students':[uploaded(b'changed','one.pdf'),self.students[1]]},
-               {'scheme':uploaded(b'new scheme')}, {'question':uploaded(b'question')}, {'audit':True}]
+        cases=[{'students':[uploaded(b'%PDF-changed','one.pdf'),self.students[1]]},
+               {'scheme':uploaded(b'%PDF-new-scheme')}, {'question':uploaded(b'%PDF-question')}, {'audit':True}]
         for kwargs in cases:
             with self.subTest(kwargs=kwargs): self.assertTrue(self.prepare(**kwargs)['pending'])
         self.f['PRIMARY_MODELS']=['new-model-config']

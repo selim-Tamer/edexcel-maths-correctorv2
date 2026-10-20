@@ -28,13 +28,13 @@ def benchmark():
     output['cold_single_document']=samples
     clock=Clock(); provider=Provider(clock,status_time=.05)
     cache=dp.FileCache('synthetic-key-account',clock=clock)
-    first=dp.DocumentRun(provider,cache,True); first.acquire(b'scheme','s.pdf','reference',True); first.close()
+    first=dp.DocumentRun(provider,cache,True); first.acquire(b'%PDF-scheme','s.pdf','reference',True); first.close()
     before=clock.monotonic(); provider.files.upload.reset_mock(); provider.files.get.reset_mock()
-    warm=dp.DocumentRun(provider,cache,True); warm.acquire(b'scheme','s.pdf','reference',True); warm.close()
+    warm=dp.DocumentRun(provider,cache,True); warm.acquire(b'%PDF-scheme','s.pdf','reference',True); warm.close()
     output['warm_reference']=dict(virtual_seconds=round(clock.monotonic()-before,3),uploads=provider.files.upload.call_count,status_gets=provider.files.get.call_count)
     # Count the exact old UI preparation statements; use zero-duration fakes here
     # because a shared virtual clock cannot simulate concurrent elapsed time.
-    students=[uploaded(b'student')]; scheme=uploaded(b'scheme','scheme.pdf'); question=uploaded(b'questions','q.pdf')
+    students=[uploaded(b'%PDF-student')]; scheme=uploaded(b'%PDF-scheme','scheme.pdf'); question=uploaded(b'%PDF-questions','q.pdf')
     clock=Clock(); provider=Provider(clock,transfer=0,processing=0); old.time=clock
     old.extract_scheme_maxima=Mock(return_value=({'1':2},{'1':'4'},None))
     old.prepare_manual_baseline(provider,students,scheme,question)
