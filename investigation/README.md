@@ -145,6 +145,52 @@ Run their tests with:
 python -m unittest investigation.test_safe_math investigation.test_math_verification investigation.test_math_claims investigation.test_math_benchmark investigation.test_math_security investigation.test_equation_and_domain_integrity -v
 ```
 
+## Stage C5 mark-scheme review modules (offline)
+
+`scheme_review.py` composes C2 (`scheme_model`, `verification_engine`) and C3
+(`pdf_evidence`, `pdf_question_map`) into a reviewed interpretation of an
+AI-extracted Edexcel 4MA1 mark scheme. It is investigation-only: the production
+marking path does not import it and it imports nothing from the production app.
+
+The official mark scheme remains authoritative. Results keep three information
+channels strictly separate: `extracted` (the proposed interpretation),
+`verified` (deterministic structural/evidence findings) and `teacher`
+(owner-bound approvals). C2 findings pass through unchanged; C5 findings are
+statements about the review record, never claims that Pearson content is wrong.
+Alternative methods are reconciled group-aware by counting the maximum branch
+once; when a branch cannot be resolved the effective total is `null` rather
+than a misleading partial sum. Missing or mismatched excerpts block approval
+and are never filled by inference.
+
+The optional provider review accepts only a caller-supplied local callable; no
+network call, SDK, credential or student data is used. It is bounded to one
+request per invocation, cached per reviewer/assignment/revision/scheme digest/
+packet digest, and its findings are always `origin="gemini_proposal"`,
+non-blocking suggestions requiring acknowledgement. Malformed JSON, unknown
+categories, hallucinated questions/criteria, fabricated excerpts, timeouts,
+quota failures and empty responses are rejected or reported as
+`C5-PROVIDER-REVIEW-UNAVAILABLE`; deterministic checks still run and a missing
+provider finding set is never silently treated as empty.
+
+- `scheme_review_cases.json` is a 26-case synthetic fixture. It is not Pearson
+  material: clean controls, missing/extra marks, wrong mark types, omitted
+  claims, weak evidence, mapping conflicts, alternative branches, dependency
+  faults, follow-through gaps, approval blocking, revision mismatch and mocked
+  provider outcomes.
+- `scheme_review_benchmark.py` runs the public `review_scheme` path over that
+  fixture and reports status accuracy, finding recall/precision, false
+  positives, mapping correctness, total consistency, missing-criterion and
+  dependency/alternative handling, evidence coverage, escalation, C2
+  preservation and provider bounds
+  (`python -m investigation.scheme_review_benchmark`). Exit code 0 requires
+  every expectation to match.
+
+Run the C5 tests with:
+
+```sh
+python -m unittest investigation.test_scheme_review investigation.test_scheme_review_gemini investigation.test_scheme_review_benchmark -v
+```
+
 ## Live (not executed for this investigation)
 
 Requires explicit human authorization, a separate test-only project with **no billing attached**, and rechecking the current Google free-tier pricing/access. A free-eligible model can charge a billed project. The script cannot check billing; do not use it when billing state is uncertain. Do not supply a production key. Do not place a key in a command line, environment variable, output file or chat.

@@ -1,0 +1,849 @@
+{
+  "benchmark_version": "c5.1",
+  "schema": "investigation.scheme_review_cases/1",
+  "provenance": "Synthetic review cases authored for engineering tests, NOT official Pearson 4MA1 material. Every scheme, claim, excerpt and provider response below is invented. Cases exercise the structural review rules of investigation/scheme_review.py and investigation/scheme_review_benchmark.py; no expected finding is a claim about a real mark scheme, a real student script or a real examiner decision. Provider cases use local mock callables only: no network, no credentials, no student data.",
+  "defaults": {
+    "scheme_pages": [
+      "Q1 (a) M1: correct method\nA1: answer 4\n(b) B1: state units"
+    ]
+  },
+  "cases": [
+    {
+      "id": "clean-passthrough",
+      "description": "Negative control: complete, internally consistent synthetic scheme with valid source evidence.",
+      "metrics": ["clean_control", "c2_preservation", "mapping", "total"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "CHECKED",
+        "c5_rules": [],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "missing-criterion",
+      "description": "Declared total exceeds reconciled criteria: one mark is unaccounted for and is not invented.",
+      "metrics": ["missing_criterion", "escalation", "c2_preservation", "total"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 4,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-CRITERION-MISSING"],
+        "c2_rules": ["SCHEME-TOTAL-MISMATCH"],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "total-overcount",
+      "description": "Criteria account for more marks than the question declares; the excess is reported rather than absorbed.",
+      "metrics": ["total", "c2_preservation", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 2,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-TOTAL-OVERCOUNT"],
+        "c2_rules": ["SCHEME-TOTAL-MISMATCH"],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "wrong-mark-type",
+      "description": "Claim declares an A mark for a criterion whose code is B1.",
+      "metrics": ["mark_type", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-MARK-TYPE-CONFLICT"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "omitted-claim",
+      "description": "One criterion has no extraction claim; its evidence is unavailable and nothing is inferred from the code.",
+      "metrics": ["evidence", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-EXTRACTION-CLAIM-MISSING"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 0.6666666666666666,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "low-extraction-confidence",
+      "description": "A criterion was read with low confidence and must be confirmed by a teacher.",
+      "metrics": ["confidence", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "low", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-LOW-EXTRACTION-CONFIDENCE"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "noncanonical-part",
+      "description": "Part is declared as (A): readable but not in canonical case form.",
+      "metrics": ["part", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(A)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-PART-ID-NONCANONICAL"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "unknown-claim",
+      "description": "A claim refers to a criterion that does not exist; it is preserved but never attached.",
+      "metrics": ["claim", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}},
+        "Q9-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-CLAIM-UNKNOWN-CRITERION"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "duplicate-criteria",
+      "description": "Two criteria share one id, making per-criterion alignment ambiguous; C2 owns this finding.",
+      "metrics": ["duplicate", "c2_preservation", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 2,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c1", "code": "M1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": [],
+        "c2_rules": ["SCHEME-DUP-CRITERIA"],
+        "effective_totals": {"Q1": 2},
+        "mapping_questions": ["Q1"],
+        "coverage": 0.5,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "missing-source-evidence",
+      "description": "A claim has no source page at all; the record is preserved but not certified.",
+      "metrics": ["evidence", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": null}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-SOURCE-PAGE-MISSING"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 0.6666666666666666,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "evidence-excerpt-mismatch",
+      "description": "A claimed excerpt is not an exact substring of the supplied page text.",
+      "metrics": ["evidence", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 5"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-SOURCE-EVIDENCE-MISMATCH"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 0.6666666666666666,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "evidence-outside-question-mapping",
+      "description": "Criterion evidence cites a page that the question mapping does not assign to its question.",
+      "metrics": ["mapping", "escalation"],
+      "scheme_pages": [
+        "M1: correct method\nA1: answer 4\nB1: state units",
+        "Q1 (a) Solve the equation"
+      ],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": [
+          "C5-EVIDENCE-OUTSIDE-QUESTION-MAPPING",
+          "C5-EVIDENCE-OUTSIDE-QUESTION-MAPPING",
+          "C5-EVIDENCE-OUTSIDE-QUESTION-MAPPING"
+        ],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "multipage-continuation-heuristic",
+      "description": "Two criteria rely on a continuation page mapped heuristically; both are flagged for confirmation.",
+      "metrics": ["mapping", "escalation"],
+      "scheme_pages": [
+        "Q1 (a) M1: correct method",
+        "A1: answer 4\n(b) B1: state units",
+        "Q2 B1: next question"
+      ],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 2, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 2, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": [
+          "C5-MULTIPAGE-MAPPING-HEURISTIC",
+          "C5-MULTIPAGE-MAPPING-HEURISTIC"
+        ],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "alternatives-resolved",
+      "description": "Two complete alternative branches total three marks each; the branch maximum is counted once, not summed.",
+      "metrics": ["alternative", "total", "c2_preservation", "mapping"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 2, "alternative_group": "G"},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "alternative_group": "G"},
+            {"id": "Q1-c3", "code": "M1", "weight": 2, "alternative_group": "G"},
+            {"id": "Q1-c4", "code": "A1", "weight": 1, "alternative_group": "G"}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 2, "alternative_option": "1", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "alternative_option": "1", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(a)", "mark_type": "M", "marks": 2, "alternative_option": "2", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c4": {"part": "(a)", "mark_type": "A", "marks": 1, "alternative_option": "2", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}}
+      },
+      "expect": {
+        "review_status": "CHECKED",
+        "c5_rules": [],
+        "c2_rules": ["SCHEME-TOTAL-MISMATCH"],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "alternatives-unresolved",
+      "description": "One alternative member lacks its branch label; no partial total is reported.",
+      "metrics": ["alternative", "total", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 4,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1, "alternative_group": "G"},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "alternative_group": "G"},
+            {"id": "Q1-c3", "code": "B1", "weight": 2}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "alternative_option": "1", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 2, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-ALTERNATIVE-STRUCTURE-UNKNOWN"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": null},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "alternative-branch-max-mismatch",
+      "description": "Alternative branches offer different maximum totals; the larger branch is counted but the mismatch needs examiner confirmation.",
+      "metrics": ["alternative", "total", "c2_preservation", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 2, "alternative_group": "G"},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "alternative_group": "G"},
+            {"id": "Q1-c3", "code": "M1", "weight": 1, "alternative_group": "G"},
+            {"id": "Q1-c4", "code": "A1", "weight": 1, "alternative_group": "G"}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 2, "alternative_option": "1", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "alternative_option": "1", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(a)", "mark_type": "M", "marks": 1, "alternative_option": "2", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c4": {"part": "(a)", "mark_type": "A", "marks": 1, "alternative_option": "2", "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-ALTERNATIVE-MAX-MISMATCH"],
+        "c2_rules": ["SCHEME-TOTAL-MISMATCH"],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "forward-dependency",
+      "description": "A criterion depends on a later criterion in the proposed order.",
+      "metrics": ["dependency", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 2,
+          "criteria": [
+            {"id": "Q1-c1", "code": "A1", "weight": 1, "dependencies": ["Q1-c2"]},
+            {"id": "Q1-c2", "code": "M1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-DEPENDENCY-FORWARD"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 2},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "dependency-cycle",
+      "description": "Two criteria depend on each other; C2 reports the cycle and C5 reports the forward edge.",
+      "metrics": ["dependency", "c2_preservation", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 2,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1, "dependencies": ["Q1-c2"]},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-DEPENDENCY-FORWARD"],
+        "c2_rules": ["SCHEME-DEP-CYCLE"],
+        "effective_totals": {"Q1": 2},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "follow-through-without-source",
+      "description": "The first criterion is a follow-through mark with nothing earlier to follow.",
+      "metrics": ["dependency", "follow_through", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 1,
+          "criteria": [
+            {"id": "Q1-c1", "code": "A1ft", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-FOLLOW-THROUGH-UNSUPPORTED"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 1},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "approval-blocked",
+      "description": "A teacher approval is attempted while a hard blocker (missing mark) remains; it is rejected, not acknowledged away.",
+      "metrics": ["approval", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 4,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "decisions": [
+        {
+          "decision_id": "decision-1",
+          "owner_id": "teacher:1",
+          "decision": "approve",
+          "target": {"kind": "scheme", "id": null},
+          "assignment_id": "assignment-1",
+          "revision": 1,
+          "scheme_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "acknowledged_finding_ids": [],
+          "reason": "synthetic approval attempt"
+        }
+      ],
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-CRITERION-MISSING", "C5-APPROVAL-BLOCKED"],
+        "c2_rules": ["SCHEME-TOTAL-MISMATCH"],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "provider-accepted-proposal",
+      "description": "A well-formed mock provider finding is accepted as a proposal only; it changes no verified field.",
+      "metrics": ["provider", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "provider": {
+        "findings": [
+          {
+            "category": "TOTAL_MISMATCH",
+            "question_id": "Q1",
+            "criterion_ids": [],
+            "explanation": "The proposed record may not reconcile with the page.",
+            "confidence": "high",
+            "suggested_action": "Compare the proposal with the source page.",
+            "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}
+          }
+        ]
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": [],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "completed",
+        "provider_categories": ["TOTAL_MISMATCH"]
+      }
+    },
+    {
+      "id": "provider-rejected-hallucination",
+      "description": "A mock provider cites a criterion that does not exist; the whole proposal is rejected and the review still completes deterministically.",
+      "metrics": ["provider", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "provider": {
+        "findings": [
+          {
+            "category": "CRITERION_UNSUPPORTED",
+            "question_id": "Q1",
+            "criterion_ids": ["Q1-ghost"],
+            "explanation": "Synthetic rejected proposal.",
+            "confidence": "low",
+            "suggested_action": "Ignore this synthetic proposal.",
+            "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}
+          }
+        ]
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-PROVIDER-REVIEW-UNAVAILABLE"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "schema_invalid",
+        "provider_categories": []
+      }
+    },
+    {
+      "id": "provider-timeout",
+      "description": "A mock provider times out; deterministic results are preserved and the missing provider finding set is stated explicitly.",
+      "metrics": ["provider", "escalation"],
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "provider": {"error": "timeout"},
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-PROVIDER-REVIEW-UNAVAILABLE"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "timeout",
+        "provider_categories": []
+      }
+    },
+    {
+      "id": "anonymous-provider-refused",
+      "description": "Without a reviewer identity the optional provider is refused and the review remains unreviewed.",
+      "metrics": ["provider", "escalation"],
+      "reviewer": null,
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "provider": {"findings": []},
+      "expect": {
+        "review_status": "UNREVIEWED",
+        "c5_rules": ["C5-PROVIDER-REVIEW-UNAVAILABLE"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "anonymous_refused",
+        "provider_categories": []
+      }
+    },
+    {
+      "id": "scheme-revision-mismatch",
+      "description": "The assignment declares a different scheme digest from the supplied document, making any prior approval stale.",
+      "metrics": ["revision", "escalation"],
+      "assignment": {"scheme_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-SCHEME-REVISION-MISMATCH"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": ["Q1"],
+        "coverage": 1.0,
+        "provider_status": "not_requested"
+      }
+    },
+    {
+      "id": "missing-source-document",
+      "description": "No C3 mark-scheme document was supplied; no criterion can be certified from evidence.",
+      "metrics": ["evidence", "escalation"],
+      "sources_absent": true,
+      "questions": [
+        {
+          "id": "Q1",
+          "total": 3,
+          "criteria": [
+            {"id": "Q1-c1", "code": "M1", "weight": 1},
+            {"id": "Q1-c2", "code": "A1", "weight": 1, "dependencies": ["Q1-c1"]},
+            {"id": "Q1-c3", "code": "B1", "weight": 1}
+          ]
+        }
+      ],
+      "claims": {
+        "Q1-c1": {"part": "(a)", "mark_type": "M", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "M1: correct method"}},
+        "Q1-c2": {"part": "(a)", "mark_type": "A", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "A1: answer 4"}},
+        "Q1-c3": {"part": "(b)", "mark_type": "B", "marks": 1, "extraction_confidence": "high", "source": {"document_role": "mark_scheme", "page": 1, "excerpt": "B1: state units"}}
+      },
+      "expect": {
+        "review_status": "NEEDS_TEACHER_REVIEW",
+        "c5_rules": ["C5-SOURCE-DOCUMENT-MISSING"],
+        "c2_rules": [],
+        "effective_totals": {"Q1": 3},
+        "mapping_questions": [],
+        "coverage": 0.0,
+        "provider_status": "not_requested"
+      }
+    }
+  ]
+}
