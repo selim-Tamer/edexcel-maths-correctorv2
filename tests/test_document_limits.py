@@ -29,6 +29,34 @@ def encrypted_pdf():
 
 
 class LimitConfigurationTests(unittest.TestCase):
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    def subprocess_env_limit(self, env_name, attribute, value, expected):
+        """Fresh interpreter import with an env override, absolute cwd.
+
+        The repository path is derived from this file, never from the
+        runner's current directory: a relative ``cwd=".."`` once escaped the
+        repository during CI discovery (run started at the repo root) and
+        the import failed with an empty stdout. Child failures are surfaced
+        with their stderr so an import error can never masquerade as a
+        merely empty result, and the child inserts the repository path on
+        ``sys.path`` itself so imports work no matter where it executes.
+        """
+        code = (
+            "import os, sys\n"
+            f"os.environ[{env_name!r}] = {value!r}\n"
+            f"sys.path.insert(0, {str(self.REPO_ROOT)!r})\n"
+            "import document_limits as d\n"
+            f"print(d.{attribute} // (1024 * 1024))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, cwd=str(self.cwd))
+        self.assertEqual(
+            result.returncode, 0,
+            f"subprocess failed (cwd={self.cwd}):\n{result.stderr}")
+        self.assertEqual(result.stdout.strip(), expected)
+
     def test_defaults_are_safe_and_bounded(self):
         self.assertEqual(dl.MAX_DOCUMENT_BYTES, 25 * 1024 * 1024)
         self.assertEqual(dl.MAX_CLASSROOM_ATTACHMENT_BYTES, 25 * 1024 * 1024)
@@ -37,23 +65,26 @@ class LimitConfigurationTests(unittest.TestCase):
         self.assertEqual(dl.MAX_PDF_PAGES, 150)
         self.assertEqual(dl.MAX_CLASSROOM_SUBMISSIONS_PER_RUN, 30)
 
-    def test_env_override_is_clamped(self):
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, '.');"
-             "import os; os.environ['MARKER_MAX_DOCUMENT_MIB']='10000';"
-             "import document_limits as d;"
-             "print(d.MAX_DOCUMENT_BYTES // (1024*1024))"],
-            capture_output=True, text=True, cwd="..")
-        self.assertEqual(result.stdout.strip(), "256")
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; sys.path.insert(0, '.');"
-             "import os; os.environ['MARKER_MAX_DOCUMENT_MIB']='garbage';"
-             "import document_limits as d;"
-             "print(d.MAX_DOCUMENT_BYTES // (1024*1024))"],
-            capture_output=True, text=True, cwd="..")
-        self.assertEqual(result.stdout.strip(), "25")
+    def test_env_override_is_clamped_from_any_working_directory(self):
+        for cwd in (self.REPO_ROOT, Path(__file__).resolve().parent):
+            with self.subTest(cwd=str(cwd)):
+                self.cwd = cwd
+                with self.subTest(case="above ceiling -> clamped"):
+                    self.subprocess_env_limit(
+                        "MARKER_MAX_DOCUMENT_MIB", "MAX_DOCUMENT_BYTES",
+                        "10000", "256")
+                with self.subTest(case="garbage -> default kept"):
+                    self.subprocess_env_limit(
+                        "MARKER_MAX_DOCUMENT_MIB", "MAX_DOCUMENT_BYTES",
+                        "garbage", "25")
+                with self.subTest(case="in range -> honoured"):
+                    self.subprocess_env_limit(
+                        "MARKER_MAX_DOCUMENT_MIB", "MAX_DOCUMENT_BYTES",
+                        "35", "35")
+                with self.subTest(case="attachment limit independent"):
+                    self.subprocess_env_limit(
+                        "MARKER_MAX_ATTACHMENT_MIB",
+                        "MAX_CLASSROOM_ATTACHMENT_BYTES", "9", "9")
 
 
 class SingleDocumentValidationTests(unittest.TestCase):
