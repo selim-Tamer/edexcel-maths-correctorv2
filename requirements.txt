@@ -17,6 +17,6 @@ google-genai>=1.40,<3
 pandas>=2.0,<4
 requests>=2.31,<3
 # Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls):
-pypdf==6.20.1
+pypdf==6.21.1
 pypdfium2==5.14.0
 Pillow==12.3.0
