@@ -85,6 +85,11 @@ def _transfer(client, data, filename, progress=None, clock=time):
     Transfer requests are capped at 120 seconds; processing has a separate 180s budget.
     """
     import pipeline_metrics
+    import document_limits
+    # Final trusted boundary (Stage S3): no document reaches the provider
+    # without passing the structural checks, whichever path produced it.
+    document_limits.validate_document(
+        data, filename, allow_images=True, deep=False)
     def emit(stage, started, **extra):
         if extra.get("done") and stage == "Local preparation":
             pipeline_metrics.record("preparation", clock.monotonic() - started)
