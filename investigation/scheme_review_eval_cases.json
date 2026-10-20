@@ -1,0 +1,225 @@
+{
+  "schema": "investigation.scheme_review_eval_cases/1",
+  "description": "Synthetic, offline Phase C5 eval cases. All payloads are invented for engineering tests: no real mark scheme, no Pearson material, no student data. Expected rule ids are declarations of what the deterministic reviewer must report and what it must stay silent about.",
+  "cases": [
+    {
+      "id": "clean_m_a_b_with_evidence",
+      "capability": "false_positives",
+      "clean": true,
+      "evidence": true,
+      "matched_questions": [1, 2, 3],
+      "payload": {
+        "questions": [
+          {"question_number": "1", "max_marks": 3, "criteria": [
+            {"criterion_id": "Q1-c1", "code": "M1", "marks": 2,
+             "dependencies": [], "follow_through": null,
+             "alternative_group": null, "source_page": 2,
+             "source_evidence": "M1 valid method", "note": null},
+            {"criterion_id": "Q1-c2", "code": "A1", "marks": 1,
+             "dependencies": ["Q1-c1"], "follow_through": null,
+             "alternative_group": null, "source_page": 2,
+             "source_evidence": "A1 correct answer", "note": null}
+          ]},
+          {"question_number": "2", "max_marks": 1, "criteria": [
+            {"criterion_id": "Q2-b1", "code": "B1", "marks": 1,
+             "dependencies": [], "follow_through": null,
+             "alternative_group": null, "source_page": 2,
+             "source_evidence": "B1 independent mark", "note": null}
+          ]},
+          {"question_number": "3", "max_marks": 2, "criteria": [
+            {"criterion_id": "Q3-m1", "code": "M1", "marks": 1,
+             "dependencies": [], "follow_through": null,
+             "alternative_group": null, "source_page": 2,
+             "source_evidence": "M1 alternative method", "note": null},
+            {"criterion_id": "Q3-a1", "code": "A1", "marks": 1,
+             "dependencies": [], "follow_through": null,
+             "alternative_group": null, "source_page": 2,
+             "source_evidence": "A1 alternate answer", "note": null}
+          ]}
+        ]
+      },
+      "expected_rule_ids": [],
+      "baseline_detects": []
+    },
+    {
+      "id": "escalation_evidence_absent",
+      "capability": "missing_evidence_escalation",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 2, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null},
+          {"criterion_id": "Q1-c2", "code": "A1", "marks": 1,
+           "dependencies": ["Q1-c1"], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_total_mismatch",
+      "capability": "mark_total_consistency",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 5, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 2,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null},
+          {"criterion_id": "Q1-c2", "code": "A1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-TOTAL-MISMATCH", "C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": ["baseline-total-mismatch"]
+    },
+    {
+      "id": "defect_criteria_missing",
+      "capability": "missing_criteria",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 3, "criteria": []}
+      ]},
+      "expected_rule_ids": ["C5-CRITERIA-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_dependency_undefined",
+      "capability": "dependency_correctness",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 1, "criteria": [
+          {"criterion_id": "Q1-a1", "code": "A1", "marks": 1,
+           "dependencies": ["Q1-ghost"], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-DEP-UNDEFINED", "C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_dependency_cycle",
+      "capability": "dependency_correctness",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 2, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 1,
+           "dependencies": ["Q1-c2"], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null},
+          {"criterion_id": "Q1-c2", "code": "A1", "marks": 1,
+           "dependencies": ["Q1-c1"], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-DEP-CYCLE", "C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_alternative_group_review",
+      "capability": "alternative_handling",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 2, "criteria": [
+          {"criterion_id": "Q1-m1", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": "alt-A", "source_page": null,
+           "source_evidence": null, "note": null},
+          {"criterion_id": "Q1-m1a", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": "alt-A", "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-ALT-SUM-REVIEW", "C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_evidence_conflict",
+      "capability": "evidence_coverage",
+      "evidence": true,
+      "matched_questions": [1],
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 1, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": 2,
+           "source_evidence": "M1 invented wording absent from page",
+           "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-EVIDENCE-CONFLICT"],
+      "min_evidence_ratio": 0.0,
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_mapping_conflict",
+      "capability": "mapping_correctness",
+      "evidence": true,
+      "matched_questions": [],
+      "payload": {"questions": [
+        {"question_number": "9", "max_marks": 1, "criteria": [
+          {"criterion_id": "Q9-b1", "code": "B1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": 2,
+           "source_evidence": "B1 independent mark", "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-MAPPING-CONFLICT"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_marktype_unsupported",
+      "capability": "mark_type_validation",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 1, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "Z9", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-MARKTYPE-UNSUPPORTED",
+                            "C5-SOURCE-PAGE-MISSING"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_marks_negative",
+      "capability": "invalid_mark_allocation",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": -1, "criteria": []}
+      ]},
+      "expected_rule_ids": ["C5-MARKS-NEGATIVE"],
+      "baseline_detects": ["baseline-max-invalid"]
+    },
+    {
+      "id": "defect_duplicate_criteria",
+      "capability": "duplicate_detection",
+      "payload": {"questions": [
+        {"question_number": "1", "max_marks": 2, "criteria": [
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null},
+          {"criterion_id": "Q1-c1", "code": "M1", "marks": 1,
+           "dependencies": [], "follow_through": null,
+           "alternative_group": null, "source_page": null,
+           "source_evidence": null, "note": null}
+        ]}
+      ]},
+      "expected_rule_ids": ["C5-DUP-CRITERIA", "C5-SOURCE-PAGE-MISSING",
+                            "SCHEME-DUP-CRITERIA"],
+      "baseline_detects": []
+    },
+    {
+      "id": "defect_extraction_empty",
+      "capability": "escalation_blocking",
+      "entry": "maxima",
+      "payload": {"maxima": {}, "answers": {}},
+      "expected_rule_ids": ["C5-EXTRACTION-EMPTY"],
+      "baseline_detects": []
+    }
+  ]
+}

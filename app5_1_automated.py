@@ -10,6 +10,7 @@ import random
 import tempfile
 import time
 import document_pipeline as documents
+import scheme_review
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -795,6 +796,97 @@ def save_classroom_approval(student_key):
     )
 
 
+def save_scheme_review_acknowledgement(revision):
+    """Phase C5 Stage 9: record an owner-bound scheme-review acknowledgement.
+
+    Stored per authenticated teacher and marked-scheme revision. Anonymous
+    or provenance-unknown sessions fail closed; logout clears the record
+    because the store is in SENSITIVE_STATE_KEYS.
+    """
+    owner = sensitive_state_owner()
+    stored = st.session_state.get("sensitive_state_owner")
+    widget_key = f"scheme_review_ack_{str(revision)[:24]}"
+    if owner is None or (stored is not None and stored != owner):
+        # Fail closed: never write a record for another teacher, an
+        # unauthenticated session, or an unowned revision; also return the
+        # acknowledgement widget to unchecked so the UI never implies a
+        # failed save succeeded.
+        st.session_state[widget_key] = False
+        return False
+    if stored is None:
+        st.session_state["sensitive_state_owner"] = owner
+    st.session_state.setdefault("scheme_review_approvals", {})[revision] = {
+        "owner": owner,
+        "revision": revision,
+        "recorded_at": time.time(),
+    }
+    return True
+
+
+def scheme_review_acknowledgement_state(revision):
+    """Fail-closed acknowledgement lookup: absent, owner_mismatch or recorded."""
+    approval = (st.session_state.get("scheme_review_approvals") or {}).get(revision)
+    if not approval:
+        return "absent"
+    if sensitive_state_owner() != approval.get("owner"):
+        return "owner_mismatch"
+    return "recorded"
+
+
+def scheme_review_for_info(info):
+    """Rebuild the deterministic scheme review from one extraction triple.
+
+    Pure recomputation over cached maxima/answers (no provider calls); used
+    by UI surfaces that never hold the metadata Memo key.
+    """
+    try:
+        maxima, answers, _ = info
+        return scheme_review.review_extracted_maxima(maxima, answers)
+    except Exception:
+        return None
+
+
+def render_scheme_review_panel(info):
+    """Teacher-visible C5 review of the mark-scheme extraction (proposals only)."""
+    if info is None:
+        return
+    review = scheme_review_for_info(info)
+    if review is None:
+        return
+    try:
+        summary = scheme_review.review_summary(review)
+    except Exception:
+        return
+    with st.expander("📋 Official mark-scheme review (deterministic checks)", expanded=False):
+        st.caption(
+            "Offline deterministic checks only. AI interpretations remain "
+            "proposals and the official mark scheme stays authoritative; "
+            "these findings never change awarded marks or maxima.")
+        for line in summary["messages"]:
+            st.warning(line)
+        if not summary["messages"]:
+            st.success(
+                "No unresolved mark-scheme review findings; teacher "
+                "confirmation of the extraction is still expected.")
+        st.caption(
+            f"Review status: {summary['status']}. Scheme review revision: "
+            f"{summary['revision_short'] or 'n/a'}")
+        can_acknowledge = sensitive_state_owner() is not None
+        if not can_acknowledge:
+            st.caption(
+                "Acknowledgement requires an authenticated teacher account "
+                "and is recorded per account and scheme revision.")
+        st.checkbox(
+            "I verified this review against the official mark scheme",
+            key=f"scheme_review_ack_{summary['revision_short']}",
+            value=scheme_review_acknowledgement_state(summary["revision"])
+            == "recorded",
+            disabled=not can_acknowledge,
+            on_change=save_scheme_review_acknowledgement,
+            args=(summary["revision"],),
+        )
+
+
 def classroom_grade_details(row, rounding_places=2):
     """Current suggested grade and review flags; no extra AI API calls."""
     student_key = row["review_key"]
@@ -1006,6 +1098,20 @@ def prepare_reference_metadata(client, remote, metadata, scheme_key, inventory_k
     if inventory_key is not None and numbers is None:
         numbers = discover_question_numbers(client, remote, question_file)
         metadata.put(inventory_key, numbers)
+    # Phase C5: deterministic review of the extraction, computed once and
+    # cached beside the extraction itself. Findings extend the teacher
+    # warning channel; nothing here changes marks or maxima.
+    review = metadata.get((scheme_key, "scheme_review"))
+    if review is None:
+        maxima, answers, _ = info
+        review = scheme_review.review_extracted_maxima(
+            maxima, answers,
+            question_numbers=list(numbers) if numbers else None)
+        metadata.put((scheme_key, "scheme_review"), review)
+    extra = scheme_review.teacher_messages(review)
+    if extra:
+        lines = ([info[2]] if info[2] else []) + extra
+        info = (info[0], info[1], "\n".join(lines))
     return info, numbers
 
 
@@ -2199,6 +2305,7 @@ SENSITIVE_STATE_KEYS = (
     "teacher_override_reasons",
     "classroom_grade_approvals",
     "classroom_jobs",
+    "scheme_review_approvals",
 )
 SENSITIVE_WIDGET_PREFIXES = (
     "override_q_",
@@ -2207,6 +2314,7 @@ SENSITIVE_WIDGET_PREFIXES = (
     "apply_override_",
     "classroom_approval_checkbox_",
     "classroom_remark_",
+    "scheme_review_ack_",
 )
 
 
@@ -2987,6 +3095,7 @@ def run_classroom_marking_job(
             scheme_maxima, scheme_answers, scheme_warning = info
         if scheme_warning:
             st.warning(scheme_warning)
+        render_scheme_review_panel(info)
         selected_questions = None
         homework_question_count = None
         if random_count is not None:
@@ -4361,6 +4470,7 @@ if manual_run_authorized:
                 st.warning(scheme_warning)
             if selected_questions is not None:
                 st.info("Random questions for all students: " + ", ".join(selected_questions))
+            render_scheme_review_panel(plan["scheme_info"])
 
             # Process student marking jobs sequentially to keep Gemini request
             # volume conservative and avoid multiple students being marked at once.
