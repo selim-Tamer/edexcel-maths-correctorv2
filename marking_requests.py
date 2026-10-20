@@ -78,8 +78,13 @@ def provider_deadline(exc):
 
 
 class MarkingFailure(RuntimeError):
-    """Only allowlisted explanations and a random support reference reach UI."""
-    def __init__(self, category, request_id):
+    """Only allowlisted explanations and a random support reference reach UI.
+
+    `remaining` is an optional, informational epoch-agnostic wait hint (whole
+    seconds of the provider-dictated cooldown that stopped this client); it
+    changes no message, category and no attempt limit.
+    """
+    def __init__(self, category, request_id, remaining=None):
         explanations = {
             'quota_limited': 'The marking service is rate-limited. Try again later.',
             'timeout': 'The marking service timed out. Review the original PDFs or try again later.',
@@ -98,13 +103,16 @@ class MarkingFailure(RuntimeError):
         }
         self.category = category if category in explanations else 'transport_or_client_error'
         self.request_id = request_id
+        self.remaining = remaining if isinstance(remaining, (int, float)) and remaining and remaining > 0 else None
         super().__init__('Marking did not complete. No new marks were saved. '
                          + explanations[self.category] + ' Reference: ' + request_id)
 
 
 def failure(record, category, stop_reason):
     record.update(outcome='failed', failure_category=category, stop_reason=stop_reason)
-    return MarkingFailure(category, record['request_id'])
+    return MarkingFailure(
+        category, record['request_id'],
+        remaining=record.get('cooldown_remaining_seconds'))
 
 
 def state_for(client):
@@ -430,6 +438,7 @@ def generate(client, models, contents, system, schema, config_factory, parse, pr
                             continue
                         attempt['quota_scope'] = 'shared_or_unknown'
                         state['account_until'] = clock.monotonic() + seconds
+                        record['cooldown_remaining_seconds'] = seconds
                         break
                     if code in (401, 403, 400, 404):
                         attempt['outcome'] = 'request_rejected'
