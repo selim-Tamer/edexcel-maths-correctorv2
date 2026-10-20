@@ -152,3 +152,59 @@ that is still turned in retains its review and approval.
 ## Document preparation performance
 
 Run `python tests/benchmark_document_pipeline.py` for a zero-network comparison against PR #4. The main stdlib suite enforces its request budgets. `python -m unittest discover -s tests/ui -p "test_*.py" -v` includes the actual manual Mark button and ordinary rerun checks in Streamlit AppTest. See [PDF_PERFORMANCE.md](PDF_PERFORMANCE.md) for measurements, cache privacy, lifecycle, request limits and unmeasured live stages. Never add supplied student PDFs to test fixtures.
+
+
+## Installation
+
+Production deployment (Streamlit Community Cloud) consumes exactly one manifest:
+`requirements.txt` in the repository root. Local developers mirror it:
+
+    python -m pip install -r requirements.txt
+    streamlit run app5_1_automated.py
+
+Offline test/benchmark dependencies (PDF stack + ReportLab fixture generation +
+SymPy verification research) live in `tests/pdf-requirements.txt` and are never
+part of production installation.
+
+Python support: CI validates Python 3.11 and 3.14 (Streamlit UI matrix);
+3.11+ is the documented floor.
+
+## Dependency policy and supply chain (Stage S5)
+
+Constraints are intentional, not accidental (findings F-10, F-11, F-12):
+
+- Every straight dependency in `requirements.txt` carries a bounded range
+  (`>=x,<y`) validated by the CI matrix, or an exact pin for the
+  untrusted-input PDF stack (`pypdf`, `pypdfium2`, `Pillow`). No open-ended
+  floors. Numerical code and model-param behaviour must be re-verified when a
+  range is widened.
+- `Authlib>=1.3.2,<2` stays despite no direct imports: the app uses Streamlit's
+  native `st.login("google")` OIDC sign-in, and Streamlit imports `authlib.jose`
+  from `streamlit/auth_util.py` under its `auth` extra. Removing it breaks
+  Google sign-in on Streamlit Cloud. `tests/test_supply_chain.py` guards this.
+- `sympy` is development-only (offline verification research/benchmarks in
+  `investigation/`); the deployed app performs plain Python arithmetic.
+- There is intentionally no lockfile: Streamlit Community Cloud does not
+  consume one, and duplicating the manifest would create two drifting sources
+  of truth. Reproducibility instead comes from pinned PDF stack versions,
+  CI-validated windows, and auditing the fully resolved set.
+- Updates arrive as reviewable Dependabot PRs (`.github/dependabot.yml`
+  pipelines: root manifest, tests manifest, GitHub Actions).
+- All workflow actions are pinned to full-length commit SHAs; workflows run
+  least-privilege (`contents: read`) and reference no repository secrets.
+- `tests/test_supply_chain.py` enforces these guarantees on every PR.
+
+### Automated vulnerability scanning and response
+
+A `dependency-audit` CI job runs pip-audit (PyPA/GitHub advisory data) against
+the resolved production and test dependency sets. The job fails on any
+published advisory or resolution error (`--strict`), so a skipped audit can
+never be reported as clean. Nobody should add a suppression to force it green;
+maintainers respond to findings by:
+
+1. Reading the advisory ID in the job log; confirming whether the vulnerable
+   component is actually used (same method as S5: import/reachability review).
+2. Patching with the smallest compatible upgrade, or documenting a C-category
+   (unreachable/monitor) decision in the stage log when no fix exists.
+3. Reviewing Dependabot alerts as a second opinion; rely on scanner IDs, not
+   on local logs when in doubt.

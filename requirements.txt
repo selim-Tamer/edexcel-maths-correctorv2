@@ -1,8 +1,22 @@
-streamlit>=1.64.0
-Authlib>=1.3.2
-google-genai>=1.40
-pandas>=2.0
-requests>=2.31
+# AI Maths Marker production manifest. This exact file is what Streamlit
+# Community Cloud installs (it does not consume lockfiles); keep it the
+# single source of truth for deployment.
+#
+# Constraint policy (S5, finding F-10): direct dependencies use bounded
+# ranges that the CI matrix validates, or exact pins for the untrusted-input
+# PDF stack. Dependabot proposes reviewable updates and a pip-audit CI job
+# scans the resolved set (see TESTING.md "Dependency policy and supply chain").
+streamlit>=1.64.0,<1.67
+# REQUIRED for Google sign-in: the app calls st.login("google"), and
+# Streamlit's native OIDC auth (its "auth" extra) imports authlib.jose from
+# streamlit/auth_util.py. No direct Authlib imports exist in this codebase,
+# but removing this line breaks st.login on Streamlit Cloud
+# (S5 finding F-12: retained, not unused).
+Authlib>=1.3.2,<2
+google-genai>=1.40,<3
+pandas>=2.0,<4
+requests>=2.31,<3
+# Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls):
 pypdf==6.20.1
 pypdfium2==5.14.0
 Pillow==12.3.0
