@@ -169,7 +169,27 @@ def prepare_manual_batch(*args, **kwargs):
 
 def _prepare_manual_batch(client, students, scheme, question, audit, random_count, session, run, report=None):
     """Resolve successful result hits BEFORE uploading student/reference documents."""
+    import document_limits as dlimits
     started = time.monotonic()
+    # Stage S3: batch resource limits before any hashing, caching or upload.
+    # Transfer performs the authoritative size/format check on each document;
+    # these checks stop obviously excessive batches from even being assembled.
+    if len(students) > dlimits.MAX_MANUAL_BATCH_FILES:
+        raise dlimits.DocumentValidationError(
+            dlimits.BATCH_TOO_MANY_FILES,
+            f"The marking batch contains too many documents "
+            f"(maximum {dlimits.MAX_MANUAL_BATCH_FILES}).")
+    batch_items = list(students) + [scheme] + ([question] if question else [])
+    total_bytes = sum(getattr(item, "size", 0) or 0 for item in batch_items)
+    if total_bytes > dlimits.MAX_MANUAL_BATCH_TOTAL_BYTES:
+        raise dlimits.DocumentValidationError(
+            dlimits.BATCH_TOO_LARGE,
+            f"The marking batch exceeds the maximum total upload size of "
+            f"{dlimits.humanize_bytes(dlimits.MAX_MANUAL_BATCH_TOTAL_BYTES)}.")
+    for item in batch_items:
+        if not item.getvalue():
+            raise dlimits.DocumentValidationError(dlimits.EMPTY_DOCUMENT)
+
     def event(label, stage, elapsed, done=True):
         if report:
             report(label, {"stage": stage, "elapsed": elapsed, "done": done})
@@ -2332,16 +2352,78 @@ def get_user_profile(token: str, user_id: str):
     )
 
 
+def _drive_supported_mime(mime, name):
+    """Only PDFs/images/Google Docs are markable; checked BEFORE any download.
+
+    A specific, non-markable MIME type (e.g. application/zip) is rejected
+    outright — a matching file-name suffix cannot resurrect it. Only generic
+    MIME labels fall back to the file-name suffix.
+    """
+    if mime in ("application/pdf", "application/vnd.google-apps.document"):
+        return True
+    if mime.startswith("image/"):
+        return True
+    if mime in ("application/octet-stream", ""):
+        return (name or "").lower().endswith(
+            (".pdf", ".png", ".jpg", ".jpeg", ".webp"))
+    return False
+
+
+def _download_bounded(token, url, params, limit):
+    """Read a Drive response body in chunks, aborting past the byte limit.
+
+    Oversized, fibbing-metadata and runaway responses are cut mid-stream so a
+    file exceeding ``limit`` never fully materialises in memory.
+    """
+    import document_limits
+    response = requests.get(
+        url,
+        headers=classroom_headers(token),
+        params=params,
+        timeout=120,
+        stream=True,
+    )
+    try:
+        if response.status_code >= 400:
+            # Never echo Drive filenames or response bodies: they can carry
+            # student names and content. The status code is not sensitive.
+            raise RuntimeError(
+                f"Could not download the Drive attachment "
+                f"(HTTP {response.status_code}).")
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=262144):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                raise document_limits.DocumentValidationError(
+                    document_limits.DOCUMENT_TOO_LARGE,
+                    "A Classroom attachment exceeds the maximum supported "
+                    "size of " + document_limits.humanize_bytes(limit) + ".")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
+
+
 def download_drive_file(token: str, file_id: str):
     """
-    Download a Drive attachment.
+    Download a Drive attachment with bounded resources (Stage S3).
+    Metadata is checked first: unsupported types are rejected before any body
+    download, and the declared size is screened before the body is streamed
+    in chunks that abort as soon as the attachment limit is exceeded — so a
+    file that lies about its size can never fill memory.
     PDFs/images are downloaded directly. Google Docs are exported to PDF.
     """
+    import document_limits
     meta = classroom_request(
         "GET",
         f"{DRIVE_BASE}/files/{file_id}",
         token,
-        params={"fields": "id,name,mimeType,capabilities"},
+        params={"fields": "id,name,mimeType,capabilities,size"},
     )
 
     name = meta.get("name", f"drive_file_{file_id}")
@@ -2349,35 +2431,38 @@ def download_drive_file(token: str, file_id: str):
 
     capabilities = meta.get("capabilities", {})
     if capabilities and capabilities.get("canDownload") is False:
-        raise RuntimeError(f"Google Drive does not allow downloading '{name}'.")
+        raise RuntimeError("Google Drive does not allow downloading this attachment.")
+
+    limit = document_limits.MAX_CLASSROOM_ATTACHMENT_BYTES
+    declared = meta.get("size")
+    if declared is not None:
+        try:
+            declared_bytes = int(declared)
+        except (ValueError, TypeError):
+            declared_bytes = None
+        if declared_bytes is not None and declared_bytes > limit:
+            raise document_limits.DocumentValidationError(
+                document_limits.DOCUMENT_TOO_LARGE,
+                "A Classroom attachment exceeds the maximum supported size of "
+                + document_limits.humanize_bytes(limit) + ".")
 
     if mime == "application/vnd.google-apps.document":
-        response = requests.get(
-            f"{DRIVE_BASE}/files/{file_id}/export",
-            headers=classroom_headers(token),
-            params={"mimeType": "application/pdf"},
-            timeout=60,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Could not export Google Doc '{name}' to PDF: "
-                f"{response.status_code} {response.text[:1000]}"
-            )
-        return name.rsplit(".", 1)[0] + ".pdf", response.content, "application/pdf"
+        data = _download_bounded(
+            token, f"{DRIVE_BASE}/files/{file_id}/export",
+            {"mimeType": "application/pdf"}, limit)
+        if not document_limits.has_pdf_signature(data):
+            raise document_limits.DocumentValidationError(
+                document_limits.INVALID_PDF)
+        return name.rsplit(".", 1)[0] + ".pdf", data, "application/pdf"
 
-    response = requests.get(
-        f"{DRIVE_BASE}/files/{file_id}",
-        headers=classroom_headers(token),
-        params={"alt": "media"},
-        timeout=120,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Could not download '{name}': "
-            f"{response.status_code} {response.text[:1000]}"
-        )
+    if not _drive_supported_mime(mime, name):
+        raise document_limits.DocumentValidationError(
+            document_limits.UNSUPPORTED_TYPE,
+            f"Unsupported submitted file type ({mime}).")
 
-    return name, response.content, mime
+    data = _download_bounded(
+        token, f"{DRIVE_BASE}/files/{file_id}", {"alt": "media"}, limit)
+    return name, data, mime
 
 
 def upload_bytes_to_gemini(client, data: bytes, filename: str, progress=None):
@@ -2471,18 +2556,14 @@ def _mark_one_classroom_submission(
             filename, data, mime = pipeline_metrics.call("download", download_drive_file, token, file_id)
             report_stage(f"Drive download complete: {time.monotonic() - download_started:.1f}s")
 
-            # For now, safely accept PDFs and common images.
-            # Unsupported Drive types are skipped with an explanation.
-            supported = (
-                mime == "application/pdf"
-                or mime.startswith("image/")
-                or filename.lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".webp"))
-            )
-
-            if not supported:
-                raise RuntimeError(
-                    f"Unsupported submitted file type: {mime} ({filename})"
-                )
+            # Stage S3: bounded content validation (size, signature, encrypted
+            # PDFs, page count). The PDF role is decided by the declared MIME;
+            # the boundary check itself is content-free and never echoes the
+            # filename (which can carry a student's name).
+            import document_limits
+            doc_name = None if mime == "application/pdf" else filename
+            document_limits.validate_document(
+                data, doc_name, allow_images=True, deep=True)
 
             report_stage(f"Uploading {filename} to Gemini")
             remote_students.append(upload_bytes_to_gemini(
@@ -2667,7 +2748,11 @@ def retire_classroom_rows(previous, submission_ids, context, label):
 
 def prepare_classroom_reference(client, upload, session, run, context, random_count, report):
     """Cache only successful reference interpretation, scoped to this assignment."""
+    import document_limits
     data = upload.getvalue()
+    # Stage S3: bounded validation of the mark scheme before any upload.
+    document_limits.validate_document(
+        data, getattr(upload, "name", None), deep=True)
     key = (session["files"].scope, context, documents.digest(data), APP_VERSION, tuple(PRIMARY_MODELS))
     remote = run.acquire(data, upload.name, "classroom:scheme:" + context, True,
                          lambda event: report("Classroom mark scheme", event))
@@ -2742,6 +2827,21 @@ def run_classroom_marking_job(
             "message": "No new turned-in submissions found.",
             "active_submission_ids": active_submission_ids,
         }
+
+    # Stage S3: cap the resources a single run consumes. Anything beyond the
+    # cap is NOT marked or discarded — it stays TURNED_IN and is picked up on
+    # the next check, so nothing is silently dropped.
+    import document_limits
+    deferred = []
+    if len(pending) > document_limits.MAX_CLASSROOM_SUBMISSIONS_PER_RUN:
+        deferred = pending[document_limits.MAX_CLASSROOM_SUBMISSIONS_PER_RUN:]
+        pending = pending[:document_limits.MAX_CLASSROOM_SUBMISSIONS_PER_RUN]
+        st.warning(
+            f"Marking the first {len(pending)} pending submission(s) this run "
+            f"(resource limit {document_limits.MAX_CLASSROOM_SUBMISSIONS_PER_RUN}). "
+            f"The remaining {len(deferred)} submission(s) stay untouched and "
+            "will be marked on the next check for this assignment."
+        )
 
     # A preparation/upload failure must not leave an older revision approved.
     previous = st.session_state.get("classroom_jobs", {}).get(document_context, {}).get("last_result")
@@ -2910,10 +3010,15 @@ def run_classroom_marking_job(
                     else:
                         already_processed_ids.discard(revisions[row["submission_id"]])
     
+        deferred_note = (
+            f" {len(deferred)} submission(s) deferred to the next run by the "
+            "batch resource limit." if deferred else "")
         return {
             "pending": len(pending),
             "processed": processed,
-            "message": f"Processed {len(processed)} submission(s).",
+            "deferred": list(deferred),
+            "message": f"Processed {len(processed)} submission(s)."
+                       + deferred_note,
             "active_submission_ids": active_submission_ids,
         }
 
@@ -4026,7 +4131,39 @@ if manual_run_authorized:
     # results if the authenticated subject is still the same at the end.
     store_owner = sensitive_state_owner()
 
+    import document_limits as dlimits
     try:
+        # Stage S3 pre-flight: reject unsafe, encrypted, oversized or
+        # mislabeled uploads before ANY Gemini client construction, upload or
+        # quota-consuming operation. Messages are index-labelled and
+        # content-free; filenames can carry student names.
+        preflight = [f"student document {index + 1}"
+                     for index in range(len(student_pdfs or []))]
+        preflight.append("the mark scheme")
+        if question_pdf:
+            preflight.append("the question paper")
+        uploads_for_preflight = list(student_pdfs or []) + [mark_scheme_pdf] + (
+            [question_pdf] if question_pdf else [])
+        if len(preflight) > dlimits.MAX_MANUAL_BATCH_FILES:
+            raise dlimits.DocumentValidationError(
+                dlimits.BATCH_TOO_MANY_FILES,
+                f"The marking batch contains too many documents "
+                f"(maximum {dlimits.MAX_MANUAL_BATCH_FILES}).")
+        if sum(getattr(item, "size", 0) or 0 for item in uploads_for_preflight) \
+                > dlimits.MAX_MANUAL_BATCH_TOTAL_BYTES:
+            raise dlimits.DocumentValidationError(
+                dlimits.BATCH_TOO_LARGE,
+                f"The marking batch exceeds the maximum total upload size of "
+                f"{dlimits.humanize_bytes(dlimits.MAX_MANUAL_BATCH_TOTAL_BYTES)}.")
+        for label, upload in zip(preflight, uploads_for_preflight):
+            try:
+                dlimits.validate_document(
+                    upload.getvalue(), getattr(upload, "name", None),
+                    deep=True)
+            except dlimits.DocumentValidationError as item_error:
+                raise dlimits.DocumentValidationError(
+                    item_error.code, f"The {label} was rejected ({item_error}).")
+
         client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(timeout=120_000),
@@ -4162,6 +4299,14 @@ if manual_run_authorized:
                 state="complete",
                 expanded=False,
             )
+
+    except dlimits.DocumentValidationError as validation_error:
+        # Structural rejection before any provider call: no marking run
+        # started, nothing uploaded, no quota consumed, nothing stored.
+        st.error(
+            "Upload rejected by the document safety checks. "
+            f"{validation_error} Nothing was sent to Gemini."
+        )
 
     except Exception as exc:
         # Allowlisted classification only: provider bodies (which can echo

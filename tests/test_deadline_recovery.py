@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from support import fake_client, load_app, remote, benchmark, model_question
 from pipeline_fakes import Clock, ApiError, model_unavailable
+from test_pdf_processing import synthetic_pdf
 import marking_requests as mr
 import pipeline_metrics as pm
 
@@ -117,7 +118,7 @@ class DeadlineRecoveryTests(unittest.TestCase):
         from unittest.mock import Mock
         f = load_app(); f['time'] = self.clock
         f['get_user_profile'] = Mock(return_value={'name': {'fullName': 'PRIVATE'}})
-        f['download_drive_file'] = Mock(return_value=('PRIVATE.pdf', b'%PDF synthetic', 'application/pdf'))
+        f['download_drive_file'] = Mock(return_value=('PRIVATE.pdf', synthetic_pdf(), 'application/pdf'))
         f['upload_bytes_to_gemini'] = Mock(return_value=remote())
         client = fake_client([deadline_error(), deadline_error()])
         submission = {'id':'a', 'userId':'a', 'assignmentSubmission': {'attachments':[{'driveFile':{'id':'a'}}]}}
@@ -137,11 +138,11 @@ class DeadlineRecoveryTests(unittest.TestCase):
         from pipeline_fakes import Provider
         provider = Provider(self.clock, transfer=2, processing=3)
         with patch.object(mr, 'diagnostics_enabled', return_value=True), patch.object(mr, '_console_logger') as logger:
-            document_pipeline.transfer(provider, b'%PDF synthetic original', 'PRIVATE.pdf', clock=self.clock)
+            document_pipeline.transfer(provider, b'%PDF- synthetic original', 'PRIVATE.pdf', clock=self.clock)
         record = json.loads(logger.return_value.info.call_args.args[1])
         self.assertEqual(record['stages_seconds']['upload'], 2)
         self.assertGreaterEqual(record['stages_seconds']['file_processing'], 3)
-        self.assertEqual(list(provider.data.values()), [b'%PDF synthetic original'])
+        self.assertEqual(list(provider.data.values()), [b'%PDF- synthetic original'])
         self.assertNotIn('PRIVATE', json.dumps(record))
 
     def test_mismatched_deadline_evidence_is_not_enough(self):

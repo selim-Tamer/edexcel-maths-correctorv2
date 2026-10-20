@@ -16,6 +16,7 @@ import pandas as pd
 import streamlit as st
 from support import load_app, SOURCE, benchmark, model_question
 from pipeline_fakes import Clock, Provider, uploaded
+from test_pdf_processing import synthetic_pdf
 import document_pipeline as documents
 f=load_app()
 f.update(st=st, pd=pd)
@@ -40,7 +41,8 @@ f["types"].HttpOptions=lambda **kw:kw
 f.update(genai=SimpleNamespace(Client=lambda **kw:fixture["provider"]),
     api_key="synthetic-never-sent", ready=True,
     authenticated_google_identity=lambda:"synthetic-teacher-sub",
-    student_pdfs=[uploaded(b"student")], mark_scheme_pdf=uploaded(b"scheme","scheme.pdf"),
+    student_pdfs=[uploaded(synthetic_pdf(1), "student.pdf")],
+    mark_scheme_pdf=uploaded(synthetic_pdf(2),"scheme.pdf"),
     question_pdf=None, audit_enabled=False,random_question_count=None,
     document_state=fixture["state"],retain_references=False)
 def norm(text):

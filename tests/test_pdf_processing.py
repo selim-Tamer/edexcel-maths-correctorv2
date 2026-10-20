@@ -88,13 +88,21 @@ class PdfProcessingTests(unittest.TestCase):
                     else:
                         client.files.get.assert_not_called()
 
-    def test_corrupt_or_empty_pdf_rejected_by_service_is_propagated(self):
-        for data in (b"", b"%PDF-corrupt"):
-            for manual in (True, False):
-                with self.subTest(data=data, manual=manual):
-                    f = load_app()
-                    client = fake_client()
-                    client.files.upload.side_effect = None
-                    client.files.upload.return_value = remote("FAILED")
-                    with self.assertRaisesRegex(RuntimeError, "could not finish processing"):
-                        self.invoke(f, client, data, manual)
+    def test_empty_pdf_rejected_before_upload_and_corrupt_pdf_rejected_locally(self):
+        import document_limits
+        # Empty file: rejected at the transfer boundary, no provider or temp use.
+        for manual in (True, False):
+            with self.subTest(data="empty", manual=manual):
+                f = load_app()
+                client = fake_client()
+                f["time"] = Clock()
+                with self.assertRaises(document_limits.DocumentValidationError):
+                    self.invoke(f, client, b"", manual)
+                client.files.upload.assert_not_called()
+                self.assertFalse(client.files.get.called)
+        # Signed-but-corrupt PDF: rejected by the deep validation layer used
+        # by the manual pre-flight and Classroom attachment checks.
+        with self.subTest(data="corrupt"):
+            with self.assertRaisesRegex(
+                    document_limits.DocumentValidationError, "malformed"):
+                document_limits.validate_document(b"%PDF-corrupt", "synthetic.pdf", deep=True)

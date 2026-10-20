@@ -1,0 +1,7 @@
+# Stage S3 (finding F-03): server-side upload cap matching the document
+# resource limits in document_limits.py. Streamlit's default (~200 MB per
+# file) allowed a single upload to reach the session buffer unbounded; the
+# app's own validations and the Gemini transfer boundary stay in place as
+# deeper layers.
+[server]
+maxUploadSize = 25

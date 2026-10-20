@@ -9,6 +9,7 @@ import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
+from test_pdf_processing import synthetic_pdf
 from support import SOURCE, benchmark, fake_client, load_app, model_question, remote, response
 
 
@@ -84,7 +85,7 @@ class SafetyRegressionTests(unittest.TestCase):
         q["student_answer"] = "999"
         client = fake_client([{"questions": [q]}, {"corrections": []}])
         self.f["get_user_profile"] = Mock(return_value={})
-        self.f["download_drive_file"] = Mock(return_value=("synthetic.pdf", b"pdf", "application/pdf"))
+        self.f["download_drive_file"] = Mock(return_value=("synthetic.pdf", synthetic_pdf(), "application/pdf"))
         self.f["upload_bytes_to_gemini"] = Mock(return_value=remote())
         row = self.f["mark_one_classroom_submission"](
             "dummy", client, {"id": "s", "assignmentSubmission": {
@@ -104,9 +105,9 @@ class SafetyRegressionTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     if manual:
                         self.f["upload_pdf"](client, SimpleNamespace(
-                            name="synthetic.pdf", getvalue=lambda: b"synthetic"))
+                            name="synthetic.pdf", getvalue=lambda: b"%PDF- synthetic"))
                     else:
-                        self.f["upload_bytes_to_gemini"](client, b"synthetic", "synthetic.pdf")
+                        self.f["upload_bytes_to_gemini"](client, b"%PDF- synthetic", "synthetic.pdf")
                 client.files.delete.assert_called_once_with(name="failed-upload")
 
 
@@ -356,7 +357,7 @@ class UploadOwnershipTests(unittest.TestCase):
                 f["time"] = Clock()
                 client.files.get.side_effect = (lambda **kw: remote("PROCESSING", "pending")) if failure == "timeout" else RuntimeError("poll error")
                 with self.assertRaises((RuntimeError, TimeoutError)):
-                    f["upload_bytes_to_gemini"](client, b"synthetic", "synthetic.pdf")
+                    f["upload_bytes_to_gemini"](client, b"%PDF- synthetic", "synthetic.pdf")
                 client.files.delete.assert_called_once_with(name="pending")
 
     def test_cleanup_error_preserves_original_processing_error(self):
@@ -365,4 +366,4 @@ class UploadOwnershipTests(unittest.TestCase):
         client.files.upload.return_value = remote("FAILED")
         client.files.delete.side_effect = RuntimeError("delete failed")
         with self.assertRaisesRegex(RuntimeError, "could not finish processing"):
-            self.f["upload_bytes_to_gemini"](client, b"synthetic", "synthetic.pdf")
+            self.f["upload_bytes_to_gemini"](client, b"%PDF- synthetic", "synthetic.pdf")

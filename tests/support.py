@@ -74,9 +74,29 @@ def remote(state="ACTIVE", name="synthetic-file"):
     return SimpleNamespace(name=name, state=SimpleNamespace(name=state))
 
 
-def response(data=None, status=200, content=b"{}", text="synthetic error"):
-    return SimpleNamespace(status_code=status, content=content, text=text,
-                           json=lambda: data if data is not None else {})
+class StreamResponse(SimpleNamespace):
+    """Fake streaming download response (context-manageable)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+
+def response(data=None, status=200, content=b"{}", text="synthetic error",
+             chunks=None):
+    body = content if chunks is None else b"".join(chunks)
+    wrapped = StreamResponse(
+        status_code=status, content=body, text=text,
+        json=lambda: data if data is not None else {},
+        headers={},
+        close=lambda: None,
+        iter_content=lambda chunk_size=8192: iter(
+            [chunk for chunk in (chunks if chunks is not None else [body])
+             if chunk]))
+    return wrapped
 
 
 def benchmark():
