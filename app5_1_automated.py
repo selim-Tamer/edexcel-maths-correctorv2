@@ -1758,16 +1758,32 @@ def _mark_one_submission(
     marking worker and report progress/results back in the main thread.
     """
     import pipeline_metrics
-    raw_result, marking_model = pipeline_metrics.call("generation", grade_with_model,
-        client=client,
-        model_names=PRIMARY_MODELS,
-        student_file=student_file,
-        mark_scheme_file=mark_scheme_file,
-        question_file=question_file,
-        status_callback=status_callback,
-        selected_questions=selected_questions,
-        scheme_maxima=scheme_maxima,
-    )
+    # Stage S4: skip models the process-global cooldown already knows are
+    # unavailable or quota-blocked (recorded by every generation path), so a
+    # fresh Gemini client cannot bypass a per-model cooldown held by another
+    # run or session.
+    usable_models = [m for m in PRIMARY_MODELS if not model_on_quota_cooldown(m)]
+    try:
+        raw_result, marking_model = pipeline_metrics.call("generation", grade_with_model,
+            client=client,
+            model_names=usable_models,
+            student_file=student_file,
+            mark_scheme_file=mark_scheme_file,
+            question_file=question_file,
+            status_callback=status_callback,
+            selected_questions=selected_questions,
+            scheme_maxima=scheme_maxima,
+        )
+    except Exception as marking_exc:
+        # Stage S4: bridge shared/unknown-scope quota failures into the
+        # process-global cooldown. Each run creates a fresh Gemini client whose
+        # per-client retry state starts empty; without this bridge a next run
+        # or another session would repeat calls to a provider-dictated
+        # cooldown. Content-free: only the exception's classification
+        # attributes are read, never its message text.
+        import gemini_limits
+        gemini_limits.bridge_marking_failure(marking_exc)
+        raise
 
     if status_callback:
         status_callback("Checking marking evidence…")
@@ -3620,12 +3636,25 @@ with st.sidebar:
                 "Nothing was sent to a provider."
             )
         else:
-            ok, message = test_api_key(api_key)
-            if ok:
-                st.success(message)
+            import gemini_limits
+            try:
+                # Stage S4: even this lightweight check consumes requests on
+                # the configured key, so it is rate-limited per authenticated
+                # account (rolling window); anonymous sessions never reach it.
+                probe_token = gemini_limits.acquire_probe(
+                    authenticated_google_identity())
+            except gemini_limits.RateLimitDenied as denied:
+                st.error(denied.message)
             else:
-                # Provider errors may echo request credentials; keep them server-side.
-                st.error("API key test failed. Check the key, model access and quota.")
+                try:
+                    ok, message = test_api_key(api_key)
+                finally:
+                    probe_token.release()
+                if ok:
+                    st.success(message)
+                else:
+                    # Provider errors may echo request credentials; keep them server-side.
+                    st.error("API key test failed. Check the key, model access and quota.")
 
     if not api_key:
         st.caption("No API key loaded.")
@@ -3869,7 +3898,18 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                     # captured now; results returned after an
                                     # identity transition are discarded.
                                     job_owner = sensitive_state_owner()
+                                    classroom_permit = None
+                                    import gemini_limits
                                     try:
+                                        # Stage S4: server-side per-account
+                                        # concurrency/rate gate for the whole
+                                        # Classroom run; one permit covers the
+                                        # batch (internal per-model fallback and
+                                        # audit attempts need no extra permits).
+                                        classroom_permit = (
+                                            gemini_limits.acquire_job(
+                                                job_owner,
+                                                gemini_limits.CLASSROOM_MARKING))
                                         classroom_client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(timeout=120_000),
@@ -3913,6 +3953,13 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                 selected_course_id + " / " + str(selected_assignment.get("title", selected_assignment["id"])))
                                             bind_sensitive_state(job_owner)
 
+                                    except gemini_limits.RateLimitDenied as denied:
+                                        # Stage S4: content-free refusal at the
+                                        # server boundary; the run was not
+                                        # started, so nothing was listed,
+                                        # downloaded, uploaded or generated.
+                                        st.error(denied.message)
+
                                     except Exception as classroom_error:
                                         # Body text is never user-visible:
                                         # classification is allowlisted only.
@@ -3937,6 +3984,13 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
 
                                         with st.expander("Technical error details"):
                                             st.code(message)
+
+                                    finally:
+                                        if classroom_permit is not None:
+                                            # Stage S4: release the run
+                                            # reservation after success, failure
+                                            # or cancellation.
+                                            classroom_permit.release()
 
                             # Render the most recent batch (persists across reruns, e.g. from
                             # expanding a report below, without re-hitting the Classroom API).
@@ -4126,12 +4180,14 @@ if manual_run_requested and not manual_run_authorized:
 if manual_run_authorized:
     client = None
     document_run = None
+    manual_permit = None
     batch_results = []
     # Owner captured before any provider work; the run may only store its
     # results if the authenticated subject is still the same at the end.
     store_owner = sensitive_state_owner()
 
     import document_limits as dlimits
+    import gemini_limits
     try:
         # Stage S3 pre-flight: reject unsafe, encrypted, oversized or
         # mislabeled uploads before ANY Gemini client construction, upload or
@@ -4163,6 +4219,17 @@ if manual_run_authorized:
             except dlimits.DocumentValidationError as item_error:
                 raise dlimits.DocumentValidationError(
                     item_error.code, f"The {label} was rejected ({item_error}).")
+
+        # Stage S4: server-side per-account concurrency/rate gate, acquired
+        # AFTER the S3 pre-flight succeeds so a content rejection consumes no
+        # job-start budget and no provider call has happened yet. Owner is the
+        # server-side authenticated identity; the gate caps active runs per
+        # account, caps rapid repeated starts, applies the global caps and
+        # enforces the bridged shared-quota cooldown before any Gemini client
+        # exists. Denied runs raise a content-free RateLimitDenied handled
+        # below; nothing is uploaded or generated in that case.
+        manual_permit = gemini_limits.acquire_job(
+            authenticated_google_identity(), gemini_limits.MANUAL_MARKING)
 
         client = genai.Client(
             api_key=api_key,
@@ -4308,6 +4375,11 @@ if manual_run_authorized:
             f"{validation_error} Nothing was sent to Gemini."
         )
 
+    except gemini_limits.RateLimitDenied as denied:
+        # Stage S4: content-free refusal at the server boundary; the run was
+        # not started, so nothing was uploaded, generated or stored.
+        st.error(denied.message)
+
     except Exception as exc:
         # Allowlisted classification only: provider bodies (which can echo
         # credentials or student content) are never displayed.
@@ -4346,6 +4418,11 @@ if manual_run_authorized:
     finally:
         if document_run is not None:
             document_run.close()
+        if manual_permit is not None:
+            # Stage S4: release the run reservation after success, failure or
+            # cancellation; permits also age out via JOB_HOLD_SECONDS if this
+            # rerun is killed abruptly, so nothing locks an account forever.
+            manual_permit.release()
 
 
 

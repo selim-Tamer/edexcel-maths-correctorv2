@@ -41,6 +41,8 @@ jobs:
         run: python tests/benchmark_automatic_recovery.py
       - name: Offline provider deadline benchmark
         run: python tests/benchmark_deadline_recovery.py
+      - name: Offline gemini rate-limit gate benchmark
+        run: python tests/benchmark_gemini_limits.py
       - name: Run marking regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Run offline accuracy evaluator regression tests
