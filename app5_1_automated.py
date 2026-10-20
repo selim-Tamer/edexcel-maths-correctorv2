@@ -1824,7 +1824,9 @@ def _mark_one_submission(
             )
             result = pipeline_metrics.call("validation", normalise_result, audited)
         except Exception as audit_error:
-            audit_warning = str(audit_error)
+            # S6-R1: audit failures may originate from provider errors; store
+            # only the allowlisted class/code pair.
+            audit_warning = safe_error_detail(audit_error)
 
     result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
     result = pipeline_metrics.call("validation", verify_math_explanations, result)
@@ -2099,6 +2101,73 @@ def marking_failure_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {category} (no details are shown to protect student data)"
 
 
+SAFE_HTTP_STATUS_CODES = (400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504)
+
+
+def _safe_http_status(text: str):
+    """A legitimate HTTP status code visible in an error, else None (S6-R1).
+
+    Only well-known code values are allowed, so the emitted detail can never
+    smuggle a surrounding identifier. The digits themselves carry no student
+    or credential content.
+    """
+    match = re.search(r"\b(\d{3})\b", str(text))
+    if match and int(match.group(1)) in SAFE_HTTP_STATUS_CODES:
+        return int(match.group(1))
+    return None
+
+
+def classroom_failure_reason(exc: BaseException) -> str:
+    """Content-free failure category for one Classroom worker result (S6-R1).
+
+    Classroom worker paths surface failures from Google Classroom/Drive,
+    Gemini transfer/validation, attachment checks and inheritable worker
+    crashes. Raw provider text can echo HTTP response bodies, student
+    filenames, Drive identifiers or credential material, so — matching
+    ``marking_failure_reason`` — only the exception class, a stable
+    allowlisted category from ``provider_error_code``, and (when safely
+    matched) a legitimate HTTP status code are emitted. Rejections carrying
+    the content-free ``DocumentValidationError`` contract keep their code,
+    which already guarantees no filenames, bytes or student data.
+    """
+    try:
+        import document_limits
+        if isinstance(exc, document_limits.DocumentValidationError):
+            return (f"{type(exc).__name__}: the document was rejected "
+                    f"({exc.code}; {exc}) "
+                    "(no details are shown to protect student data)")
+    except ImportError:
+        pass
+    code = provider_error_code(exc)
+    lowered = str(exc).lower()
+    timeout_like = (isinstance(exc, TimeoutError)
+                    or "timed out" in lowered or "timeout" in lowered
+                    or "connection" in lowered or "deadline" in lowered)
+    if code == "QUOTA_LIMIT":
+        category = "a Google or AI provider rate or usage limit was reached"
+    elif code == "AUTH_REJECTED":
+        category = "the Google or AI provider rejected the session credentials"
+    elif code == "PERMISSION_DENIED":
+        category = "the Google provider refused access for this account"
+    elif code == "LEAKED_KEY":
+        category = "the AI provider blocked the configured key"
+    elif code in ("SERVICE_UNAVAILABLE", "UNKNOWN") and timeout_like:
+        category = "a Google or AI provider request timed out or was cut off"
+    elif code == "SERVICE_UNAVAILABLE":
+        category = "a Google or AI provider is temporarily unavailable"
+    elif code == "REQUEST_INVALID":
+        category = "the Google or AI request could not be processed"
+    elif code == "RESPONSE_INVALID":
+        category = "the provider response could not be parsed into a marking result"
+    else:
+        category = "an unrecognized marking error occurred"
+    reason = f"{type(exc).__name__}: {category}"
+    status = _safe_http_status(str(exc))
+    if status is not None:
+        reason += f" (HTTP status {status})"
+    return reason + " (no details are shown to protect student data)"
+
+
 def authenticated_google_identity():
     """Server-side guard for every path that can consume operator Gemini quota.
 
@@ -2308,10 +2377,10 @@ def classroom_request(method: str, url: str, token: str, **kwargs):
     )
 
     if response.status_code >= 400:
-        detail = response.text[:2000]
-        raise RuntimeError(
-            f"Google API error {response.status_code}: {detail}"
-        )
+        # S6-R1 privacy: provider error bodies can echo credentials, student
+        # content and Drive identifiers, so only the status code is raised.
+        # The classification helpers turn the code into a safe category.
+        raise RuntimeError(f"Google API error {response.status_code}.")
 
     if not response.content:
         return {}
@@ -2385,21 +2454,46 @@ def _drive_supported_mime(mime, name):
     return False
 
 
-def _download_bounded(token, url, params, limit):
-    """Read a Drive response body in chunks, aborting past the byte limit.
+def _download_bounded(token, url, params, limit, duration=None, clock=None):
+    """Read a Drive response body in chunks, aborting past the byte limit or
+    the whole-transfer wall-clock deadline (S6-R4).
 
     Oversized, fibbing-metadata and runaway responses are cut mid-stream so a
-    file exceeding ``limit`` never fully materialises in memory.
+    file exceeding ``limit`` never fully materialises in memory, and a
+    deliberately slow trickle can no longer keep a marking worker occupied
+    indefinitely: a monotonic-clock deadline is checked around the request
+    and before every buffered chunk. ``duration``/``clock`` are injectable
+    for deterministic tests; production uses the configured attachment
+    download budget and ``time.monotonic``.
+
+    Hard-guarantee note: the socket read timeout still bounds a *single*
+    blocked read (see below), so expiry of the aggregate deadline is checked
+    between reads — a best-effort aggregate bound whose worst case adds one
+    read timeout to the deadline. A strict per-byte deadline would require
+    replacing requests with a non-blocking transport (out of scope).
     """
     import document_limits
+    if duration is None:
+        duration = document_limits.MAX_ATTACHMENT_DOWNLOAD_SECONDS
+    if clock is None:
+        clock = time
+    # Per-operation socket timeout (connect/read): kept from S3 at <=120s and
+    # additionally capped by the configured budget, so one stalled read can
+    # never far exceed the whole-transfer deadline by itself.
+    read_timeout = min(120, max(1, duration))
+    started = clock.monotonic()
+    deadline = started + duration
     response = requests.get(
         url,
         headers=classroom_headers(token),
         params=params,
-        timeout=120,
+        timeout=read_timeout,
         stream=True,
     )
     try:
+        if started > deadline or clock.monotonic() > deadline:
+            raise document_limits.DocumentValidationError(
+                document_limits.DOWNLOAD_TIMEOUT)
         if response.status_code >= 400:
             # Never echo Drive filenames or response bodies: they can carry
             # student names and content. The status code is not sensitive.
@@ -2411,6 +2505,14 @@ def _download_bounded(token, url, params, limit):
         for chunk in response.iter_content(chunk_size=262144):
             if not chunk:
                 continue
+            if clock.monotonic() > deadline:
+                # Partial content is discarded and the response closed in the
+                # finally block; the failure stays retryable and content-free.
+                raise document_limits.DocumentValidationError(
+                    document_limits.DOWNLOAD_TIMEOUT,
+                    "The attachment download took longer than the supported "
+                    "time budget of " + str(int(duration)) + " seconds. Please "
+                    "try again.")
             total += len(chunk)
             if total > limit:
                 raise document_limits.DocumentValidationError(
@@ -2635,7 +2737,9 @@ def _mark_one_classroom_submission(
                 )
                 result = pipeline_metrics.call("validation", normalise_result, audited)
             except Exception as audit_error:
-                audit_warning = str(audit_error)
+                # S6-R1: audit failures may originate from provider errors;
+                # store only the allowlisted class/code pair.
+                audit_warning = safe_error_detail(audit_error)
 
         result = pipeline_metrics.call("validation", check_question_marks, result, scheme_maxima, selected_questions, scheme_warning)
         result = pipeline_metrics.call("validation", verify_math_explanations, result)
@@ -2679,7 +2783,9 @@ def _mark_one_classroom_submission(
             "submission_id": submission_id,
             "student": student_name,
             "status": "Failed",
-            "reason": str(mark_error),
+            # S6-R1: content-free category; raw provider text never reaches
+            # results, the UI or any export.
+            "reason": classroom_failure_reason(mark_error),
             "audit_warning": None,
             "result": None,
             "totals": None,
@@ -2977,12 +3083,14 @@ def run_classroom_marking_job(
                     try:
                         row = future.result()
                     except Exception as worker_error:
-                        # Keep one unexpected worker failure from aborting the batch.
+                        # Keep one unexpected worker failure from aborting the
+                        # batch, with the same content-free reason contract as
+                        # the submission-level path (S6-R1).
                         row = {
                             "submission_id": submission["id"],
                             "student": submission.get("userId", "Unknown student"),
                             "status": "Failed",
-                            "reason": str(worker_error),
+                            "reason": classroom_failure_reason(worker_error),
                             "audit_warning": None,
                             "result": None,
                             "totals": None,

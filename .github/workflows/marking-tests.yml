@@ -41,6 +41,8 @@ jobs:
         run: python tests/benchmark_local_processing.py
       - name: Permissive PDF inspection benchmark
         run: python tests/benchmark_pdf_inspection.py
+      - name: Offline PDF parser deadline benchmark
+        run: python tests/benchmark_parser_deadline.py
       - name: Offline marking request benchmark
         run: python tests/benchmark_marking_requests.py
       - name: Offline service recovery benchmark
