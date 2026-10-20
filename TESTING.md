@@ -153,6 +153,29 @@ that is still turned in retains its review and approval.
 
 Run `python tests/benchmark_document_pipeline.py` for a zero-network comparison against PR #4. The main stdlib suite enforces its request budgets. `python -m unittest discover -s tests/ui -p "test_*.py" -v` includes the actual manual Mark button and ordinary rerun checks in Streamlit AppTest. See [PDF_PERFORMANCE.md](PDF_PERFORMANCE.md) for measurements, cache privacy, lifecycle, request limits and unmeasured live stages. Never add supplied student PDFs to test fixtures.
 
+### Parser and download resource budgets (post-S6)
+
+Two wall-clock bounds are tunable by environment variables (see
+`document_limits.py`) and enforced by default:
+
+- Deep PDF metadata inspection runs in a disposable child process with a
+  hard deadline (`MARKER_PDF_PARSE_SECONDS`, default 20 s, clamped 2-300 s).
+  A stalled parser is terminated and the document is rejected with the
+  content-free `PDF_PARSE_TIMEOUT` category; simultaneous parser children
+  are capped by `MARKER_MAX_PARSER_PROCESSES` (default 2).
+  `python tests/benchmark_parser_deadline.py` measures the isolation
+  overhead on synthetic documents and proves the deadline terminates a
+  stalled parser. `MARKER_PDF_PARSER_ISOLATED=0` opts out of isolation for
+  debugging only, and then the deadline guarantee does not apply.
+- Classroom/Drive attachment downloads carry an aggregate transfer budget
+  (`MARKER_MAX_DOWNLOAD_SECONDS`, default 300 s, clamped 30-1800 s) on top
+  of the ≤120 s per-socket-operation timeout; a transfer expiring it is
+  rejected with `DOWNLOAD_TIMEOUT` and stays retryable. The per-read socket
+  timeout still bounds a single stalled read, so the aggregate bound is
+  checked between reads (best-effort, worst case budget + one read
+  timeout). Classroom failure reasons remain content-free categories
+  (`classroom_failure_reason`), never raw provider exception text.
+
 
 ## Installation
 
