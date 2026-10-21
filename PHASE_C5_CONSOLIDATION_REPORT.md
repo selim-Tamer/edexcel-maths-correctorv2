@@ -18,7 +18,7 @@ C5 branch reviewed: `accuracy/c5-mark-scheme-reviewer`.
 | Implementation A commit | `9c6cc5e` |
 | Implementation B commit (= branch HEAD before consolidation) | `a2af273403a9f1e6ae660bbdb8563c8f76cb7798` |
 | Consolidation branch | `accuracy/c5-consolidated-reviewer` |
-| Consolidation commit | *(filled at commit time)* |
+| Consolidation commit | `75e0568` (recorded in the follow-up report-fix commit) |
 
 Both original C5 commits are preserved in history; neither was rewritten or force-pushed.
 
