@@ -3,8 +3,10 @@
 Reviews whether an AI-extracted interpretation of an official Pearson Edexcel
 mark scheme actually represents that scheme. The OFFICIAL SCHEME IS ALWAYS
 AUTHORITATIVE: every Gemini-assisted interpretation processed here is a
-PROPOSAL. Review output can only raise teacher-visible findings, never change
-awarded student marks, maxima, or marking behaviour.
+PROPOSAL. Review output never changes awarded student marks or maxima; it
+adds teacher-visible validation warnings, forces a teacher-review status
+while findings are unresolved, and affects result-caching eligibility until
+a teacher acts.
 
 Relationship to earlier phases:
 - C2 (investigation.scheme_model / verification_engine) is the structural
@@ -25,8 +27,11 @@ Three information channels are kept strictly separated, never merged:
 - ``extracted``: what the model believes the scheme says (verbatim, bounded).
 - ``verified``: what deterministic checks establish (findings + checks run).
 - ``teacher``: what a teacher has explicitly accepted (status, approver,
-  approved revision). Approvals are owner-bound and revision-aware: a stale
-  scheme revision, a different teacher, or new findings invalidate approval.
+  approved revision). ``approval_state`` re-evaluates an approval against a
+  caller-supplied owner, the record revision and any new findings, and fails
+  closed. Owner binding and revision enforcement at approval time are
+  enforced in the app's acknowledgement layer today; engine-side validation
+  gaps are recorded as C6 pre-work in PHASE_C5_CONSOLIDATION_REPORT.md §10.
 
 Gemini-assisted review is OFFLINE-ONLY in this phase. The response schema,
 strict parsing, outcome classification and findings validation are fully
@@ -937,9 +942,10 @@ def _reconcile_alternative_groups(question, criteria, groups, declared,
 
     Returns (findings, explained). ``explained`` is a dict describing a
     legitimate criteria-sum≠total situation that the branch-max structure
-    accounts for (so the mapped C2 total finding can be marked as explained,
-    retained for traceability, and de-blocked), or None when nothing is
-    explained. Unlabelled/ambiguous groups are escalated and never summed.
+    fully accounts for; the redundant mapped C2 total mismatch for such a
+    question is suppressed by ``_mark_explained_total_mismatches`` rather
+    than double-reported. Returns None when nothing is explained.
+    Unlabelled/ambiguous groups are escalated and never summed.
     """
     number = question["question_number"]
     findings = []
@@ -977,8 +983,11 @@ def _reconcile_alternative_groups(question, criteria, groups, declared,
     }
     if effective_total == declared and weighted_sum != declared:
         # The structure is fully consistent; the raw sum differs only because
-        # branches were counted once. No new finding; the mapped C2 total
-        # mismatch is explained (retained, de-blocked) rather than erased.
+        # branches were counted once. No new finding is emitted here, and the
+        # redundant mapped C2 total mismatch is suppressed downstream by
+        # _mark_explained_total_mismatches. The criteria keep their group and
+        # branch labels in the extracted channel, so the inputs that justify
+        # the suppression stay auditable in the record.
         return findings, explained
     if effective_total < declared:
         findings.append(_finding(
@@ -1223,11 +1232,15 @@ def _mark_explained_total_mismatches(c2_findings, explained_totals):
     A labelled alternative structure that legitimately reconciles to the
     declared total (branches counted once) fully accounts for the raw
     criteria-sum≠total situation. That C2 total mismatch is therefore not a
-    real inconsistency, so it is dropped here rather than surfaced as noise.
-    The alternative reconciliation itself is reported separately by
-    ``check_question_totals`` (a C5 finding), so the explanation remains
-    visible for traceability. A total mismatch the structure does NOT explain
-    is retained untouched.
+    real inconsistency and is suppressed here: for such a question
+    ``check_question_totals`` emits no finding either, so the consistent
+    labelled structure reviews cleanly with zero findings (behaviour pinned
+    by the ``labelled-alternatives-match`` differential oracle case). The
+    audit trace is the group/branch labels the criteria keep in the record's
+    extracted channel plus this deterministic, documented rule — no per-review
+    trace object is persisted. A total mismatch the structure does NOT
+    explain is retained untouched (and ``check_question_totals`` reports its
+    own shortfall/overcount finding alongside it).
     """
     if not explained_totals:
         return
@@ -1434,7 +1447,14 @@ def review_extracted_maxima(maxima, answers=None, question_numbers=None,
 # Teacher approval state (Phase C5 Stage 9).
 
 def resolve_findings(record, finding_ids, teacher_id):
-    """Teacher explicitly resolves findings; cannot blanket-approve."""
+    """Teacher explicitly resolves findings; never grants approval itself.
+
+    Approval still requires a separate ``approve_scheme_review`` call with no
+    remaining blocking findings. C6 pre-work (report §10): the teacher
+    identity is caller-asserted here and non-waivable findings are not yet
+    protected from resolution at the engine layer; production never calls
+    this function today.
+    """
     findings = (record.get("verified") or {}).get("findings") or []
     requested = {str(finding_id) for finding_id in finding_ids}
     for finding in findings:
@@ -1464,12 +1484,18 @@ def _blocking_findings(record):
 
 
 def approve_scheme_review(record, teacher_id, scheme_revision):
-    """Teacher-approved state, bound to owner and exact scheme revision.
+    """Teacher-approved state; stores the approver and the granted revision.
 
     Missing or contradictory evidence can never be silently certified:
     unresolved blocking findings must be explicitly resolved by the teacher
-    first. Approval stores the revision it was granted against; different
-    scheme revisions or different teachers invalidate it.
+    first, and assisted-channel output blocks approval outright. The
+    approver must be a non-blank identity and the granted revision is stored
+    on the record. Note (C6 pre-work, report §10): the revision argument is
+    NOT compared against the record's own revision here, and the teacher
+    identity is caller-asserted; strict re-evaluation (stale revision,
+    different teacher, new findings) is performed by ``approval_state`` at
+    read time. Production today never calls this function — the Streamlit
+    surface records an owner-bound acknowledgement only.
     """
     if not teacher_id or not str(teacher_id).strip():
         raise SchemeReviewApprovalError("teacher_approval_identity_missing")

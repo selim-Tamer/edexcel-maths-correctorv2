@@ -99,5 +99,124 @@ class ReviewStateKeysTests(unittest.TestCase):
         self.assertIsNone(self.f["scheme_review_for_info"](None))
 
 
+class StaleReviewReuseTests(unittest.TestCase):
+    """M3 regression: a cached C5 review always matches the extraction in use.
+
+    The review cached under the scheme key must never be reused for
+    different maxima, answers or question inventory: any material input
+    change recomputes the review, so the warning channel always reflects the
+    extraction currently being used. Synthetic data and mocked extraction
+    only; no provider call is possible.
+    """
+
+    def setUp(self):
+        self.f = load_app()
+        self.clock = Clock()
+        self.client = Provider(self.clock, transfer=0, processing=0)
+        self.files = dp.FileCache("key-account", clock=self.clock)
+        self.metadata = dp.Memo(clock=self.clock)
+        self.scheme_key = ("scope", "manual:scheme", "digest", "v", ("m1",))
+        self.review_key = (self.scheme_key, "scheme_review")
+
+    def reference(self, maxima, answers, warning=None, numbers=None,
+                  extractor=None):
+        """One prepare_reference_metadata call with an explicit extraction."""
+        mock = extractor if extractor is not None else Mock()
+        mock.return_value = (maxima, answers, warning)
+        self.f["extract_scheme_maxima"] = mock
+        inventory_key = None
+        if numbers is not None:
+            inventory_key = ("scope", "inventory")
+            self.metadata.put(inventory_key, list(numbers))
+        run = dp.DocumentRun(self.client, self.files)
+        try:
+            return self.f["prepare_reference_metadata"](
+                self.client, uploaded(b"%PDF-scheme", "scheme.pdf"),
+                self.metadata, self.scheme_key,
+                inventory_key=inventory_key)
+        finally:
+            run.close()
+
+    def count_review_calls(self):
+        """Wrap the deterministic review to count invocations (restored)."""
+        module = self.f["scheme_review"]
+        original = module.review_extracted_maxima
+        counter = Mock(wraps=original)
+        module.review_extracted_maxima = counter
+        self.addCleanup(setattr, module, "review_extracted_maxima", original)
+        return counter
+
+    def stored(self, metadata=None):
+        return (metadata or self.metadata).get(self.review_key)
+
+    def test_a_same_extraction_reuses_the_cached_review(self):
+        reviews = self.count_review_calls()
+        first, _ = self.reference({"1": 2}, {"1": "4"})
+        first_stored = self.stored()
+        second, _ = self.reference({"1": 2}, {"1": "4"})
+        second_stored = self.stored()
+        self.assertEqual(first, second)
+        self.assertEqual(first_stored[0], second_stored[0])
+        self.assertEqual(first_stored[1]["scheme_revision"],
+                         second_stored[1]["scheme_revision"])
+        self.assertEqual(reviews.call_count, 1)
+
+    def test_b_changed_maxima_recompute_the_review(self):
+        reviews = self.count_review_calls()
+        first, _ = self.reference({"1a!": 2}, {"1": "4"}, warning="transient")
+        self.assertIn("[C5-QID-INVALID]", first[2])
+        second, _ = self.reference({"1": 2}, {"1": "4"}, warning=None)
+        self.assertIsNone(second[2])
+        self.assertEqual(reviews.call_count, 2)
+
+    def test_c_changed_answers_recompute_the_review(self):
+        first, _ = self.reference({"1": 2}, {"1": "4"}, warning="unclear")
+        first_revision = self.stored()[1]["scheme_revision"]
+        second, _ = self.reference({"1": 2}, {"1": "9"}, warning="unclear")
+        second_revision = self.stored()[1]["scheme_revision"]
+        self.assertNotEqual(first_revision, second_revision)
+        expected = sr.review_extracted_maxima({"1": 2}, {"1": "9"})
+        self.assertEqual(second_revision, expected["scheme_revision"])
+
+    def test_d_failed_extraction_then_retry_uses_current_results(self):
+        first, _ = self.reference({}, {}, warning=None)
+        self.assertIn("[C5-EXTRACTION-EMPTY]", first[2])
+        second, _ = self.reference({"1": 2}, {"1": "4"}, warning=None)
+        self.assertIsNone(second[2])
+
+    def test_e_question_inventory_change_recomputes_the_review(self):
+        first, _ = self.reference({"1": 2}, {"1": "4"}, numbers=["1", "9"])
+        self.assertIn("C5-QUESTION-NOT-INTERPRETED", first[2])
+        second, _ = self.reference({"1": 2}, {"1": "4"}, numbers=["1"])
+        self.assertIsNone(second[2])
+
+    def test_f_review_cache_does_not_cross_sessions(self):
+        first, _ = self.reference({"1a!": 2}, {"1": "4"}, warning="transient")
+        self.assertIn("[C5-QID-INVALID]", first[2])
+        first_stored = self.stored()
+        other_metadata = dp.Memo(clock=self.clock)
+        self.assertIsNone(other_metadata.get(self.review_key))
+        self.f["extract_scheme_maxima"] = Mock(
+            return_value=({"1": 2}, {"1": "4"}, None))
+        run = dp.DocumentRun(self.client, self.files)
+        try:
+            info, _ = self.f["prepare_reference_metadata"](
+                self.client, uploaded(b"%PDF-scheme", "scheme.pdf"),
+                other_metadata, self.scheme_key)
+        finally:
+            run.close()
+        self.assertIsNone(info[2])
+        self.assertIsNotNone(other_metadata.get(self.review_key))
+        self.assertEqual(self.stored(), first_stored)
+
+    def test_g_repeated_reviews_add_no_provider_calls(self):
+        extractor = Mock(return_value=({"1": 2}, {"1": "4"}, None))
+        for _ in range(3):
+            self.reference({"1": 2}, {"1": "4"}, extractor=extractor)
+        self.assertEqual(extractor.call_count, 1)
+        self.client.files.upload.assert_not_called()
+        self.client.files.get.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

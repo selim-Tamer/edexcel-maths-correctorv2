@@ -861,7 +861,8 @@ def render_scheme_review_panel(info):
         st.caption(
             "Offline deterministic checks only. AI interpretations remain "
             "proposals and the official mark scheme stays authoritative; "
-            "these findings never change awarded marks or maxima.")
+            "these findings never change awarded marks or maxima — they add "
+            "review warnings and require teacher confirmation.")
         for line in summary["messages"]:
             st.warning(line)
         if not summary["messages"]:
@@ -1080,6 +1081,24 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
 
 
+def scheme_review_inputs_digest(maxima, answers, numbers):
+    """Deterministic digest of every material C5 review input.
+
+    Keying the cached review to this digest guarantees it is reused only for
+    the exact extraction results (maxima, answers and question inventory) it
+    was computed from; any change in any material input recomputes the review
+    instead of serving a stale one. The digest is derived from structured
+    values (never used as a global key) and lives inside the per-session
+    metadata store, scoped by the existing scheme key.
+    """
+    payload = json.dumps(
+        {"maxima": maxima or {}, "answers": answers or {},
+         "question_numbers": list(numbers) if numbers else None},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def prepare_reference_metadata(client, remote, metadata, scheme_key, inventory_key=None, question_file=None):
     """One cold reference call when possible; never treat partial maxima as inventory."""
     info = metadata.get((scheme_key, "scheme"))
@@ -1098,16 +1117,24 @@ def prepare_reference_metadata(client, remote, metadata, scheme_key, inventory_k
     if inventory_key is not None and numbers is None:
         numbers = discover_question_numbers(client, remote, question_file)
         metadata.put(inventory_key, numbers)
-    # Phase C5: deterministic review of the extraction, computed once and
-    # cached beside the extraction itself. Findings extend the teacher
-    # warning channel; nothing here changes marks or maxima.
-    review = metadata.get((scheme_key, "scheme_review"))
-    if review is None:
-        maxima, answers, _ = info
+    # Phase C5: deterministic review of the extraction CURRENTLY in use. The
+    # cached review is keyed to a digest of every material review input
+    # (maxima, answers and question inventory), so a re-extraction that
+    # differs in any way recomputes the review instead of reusing a stale
+    # one; a review can therefore never suppress or introduce a warning for
+    # data it was not computed from. Findings extend the teacher warning
+    # channel; nothing here changes marks or maxima.
+    maxima, answers, _ = info
+    review_digest = scheme_review_inputs_digest(maxima, answers, numbers)
+    cached_review = metadata.get((scheme_key, "scheme_review"))
+    if (isinstance(cached_review, tuple) and len(cached_review) == 2
+            and cached_review[0] == review_digest):
+        review = cached_review[1]
+    else:
         review = scheme_review.review_extracted_maxima(
             maxima, answers,
             question_numbers=list(numbers) if numbers else None)
-        metadata.put((scheme_key, "scheme_review"), review)
+        metadata.put((scheme_key, "scheme_review"), (review_digest, review))
     extra = scheme_review.teacher_messages(review)
     if extra:
         lines = ([info[2]] if info[2] else []) + extra
