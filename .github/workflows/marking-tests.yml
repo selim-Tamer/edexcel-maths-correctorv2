@@ -61,6 +61,8 @@ jobs:
         run: python -m unittest investigation.test_accuracy_regression -v
       - name: Run offline scheme-review eval regression tests
         run: python -m unittest investigation.test_scheme_review_eval -v
+      - name: Run C5 consolidation differential gate
+        run: python -m unittest investigation.test_c5_consolidation_differential -v
 
   streamlit-ui-tests:
     runs-on: ubuntu-latest

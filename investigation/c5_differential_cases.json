@@ -1,0 +1,375 @@
+{
+  "schema": "investigation.c5_differential_cases/1",
+  "description": "Shared synthetic scenarios for the Phase C5 consolidation differential. Expected outcomes are authored from explicit Edexcel-style M/A/B rules, NOT copied from either reviewer. Each case is translated into both engines' input shapes; the authoritative (consolidated) engine must match the oracle. Original A/B behaviour is recorded for divergence evidence only.",
+  "provenance": {
+    "official_mark_scheme": false,
+    "student_data": false,
+    "network": false,
+    "note": "NOT official Pearson material; synthetic structural fixtures only"
+  },
+  "cases": [
+    {
+      "id": "clean-mab",
+      "description": "Single question, M1+A1+B1 = 3, declared total 3, evidence present. Clean control.",
+      "total": 3,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": 1,
+          "source_page": 1,
+          "source_evidence": "M1: method"
+        },
+        {
+          "id": "Q1-c2",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c1"
+          ],
+          "source_page": 1,
+          "source_evidence": "A1: answer 4"
+        },
+        {
+          "id": "Q1-c3",
+          "code": "B1",
+          "marks": 1,
+          "source_page": 1,
+          "source_evidence": "B1: units"
+        }
+      ],
+      "page_text": "Q1 (a) M1: method A1: answer 4 (b) B1: units",
+      "expect": {
+        "authoritative_status": "CHECKED",
+        "authoritative_rule_ids": [],
+        "blocking": false
+      }
+    },
+    {
+      "id": "total-shortfall",
+      "description": "Declared total 4 but criteria sum to 3; a criterion is missing. Must block, never invent a mark.",
+      "total": 4,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": 1,
+          "source_page": 1,
+          "source_evidence": "M1 method"
+        },
+        {
+          "id": "Q1-c2",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c1"
+          ],
+          "source_page": 1,
+          "source_evidence": "A1 answer"
+        },
+        {
+          "id": "Q1-c3",
+          "code": "B1",
+          "marks": 1,
+          "source_page": 1,
+          "source_evidence": "B1 units"
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer B1 units",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-TOTAL-MISMATCH"
+        ],
+        "blocking": true
+      }
+    },
+    {
+      "id": "total-overcount",
+      "description": "Declared total 2 but criteria sum to 3. Over-allocation must be flagged as verified inconsistency.",
+      "total": 2,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": 2,
+          "source_page": 1,
+          "source_evidence": "M1 method"
+        },
+        {
+          "id": "Q1-c2",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c1"
+          ],
+          "source_page": 1,
+          "source_evidence": "A1 answer"
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-TOTAL-MISMATCH"
+        ],
+        "blocking": true
+      }
+    },
+    {
+      "id": "dependency-cycle",
+      "description": "c1 -> c2 -> c1 cycle. Must be detected and block.",
+      "total": 2,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c2"
+          ],
+          "source_page": 1,
+          "source_evidence": "M1 method"
+        },
+        {
+          "id": "Q1-c2",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c1"
+          ],
+          "source_page": 1,
+          "source_evidence": "A1 answer"
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-DEP-CYCLE"
+        ],
+        "blocking": true
+      }
+    },
+    {
+      "id": "evidence-conflict",
+      "description": "Criterion cites a verbatim excerpt absent from the cited page. Contradiction, verified, blocking.",
+      "total": 1,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "B1",
+          "marks": 1,
+          "source_page": 1,
+          "source_evidence": "not present on the page"
+        }
+      ],
+      "page_text": "Q1 B1: state units",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-EVIDENCE-CONFLICT"
+        ],
+        "blocking": true
+      }
+    },
+    {
+      "id": "unlabelled-alternatives",
+      "description": "Alternative group whose members carry no alternative_option labels. Structure cannot be resolved; never summed, never certified silently. Must escalate.",
+      "total": 3,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": 1,
+          "source_page": 1
+        },
+        {
+          "id": "Q1-c2",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-c1"
+          ],
+          "alternative_group": "alt",
+          "source_page": 1
+        },
+        {
+          "id": "Q1-c3",
+          "code": "A1",
+          "marks": 1,
+          "alternative_group": "alt",
+          "source_page": 1
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-ALT-SUM-REVIEW"
+        ],
+        "blocking": false,
+        "divergence_note": "Escalated for explicit teacher reconciliation (status NEEDS_TEACHER_REVIEW) but the finding is acknowledgement-grade, not a proven defect, so it is non-blocking by design."
+      }
+    },
+    {
+      "id": "labelled-alternatives-match",
+      "description": "Option A = {M1,A1} (2 marks), option B = {M1',A1'} (2 marks), declared total 2. Correct reconciliation counts the max branch once = 2, matching declared. Oracle: no total finding, status CHECKED. This is the divergence case where original B over-escalates.",
+      "total": 2,
+      "criteria": [
+        {
+          "id": "Q1-m1",
+          "code": "M1",
+          "marks": 1,
+          "alternative_group": "method",
+          "alternative_option": "A",
+          "source_page": 1,
+          "source_evidence": "M1 method"
+        },
+        {
+          "id": "Q1-a1",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-m1"
+          ],
+          "alternative_group": "method",
+          "alternative_option": "A",
+          "source_page": 1,
+          "source_evidence": "A1 answer"
+        },
+        {
+          "id": "Q1-m1b",
+          "code": "M1",
+          "marks": 1,
+          "alternative_group": "method",
+          "alternative_option": "B",
+          "source_page": 1,
+          "source_evidence": "M1 alt method"
+        },
+        {
+          "id": "Q1-a1b",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-m1b"
+          ],
+          "alternative_group": "method",
+          "alternative_option": "B",
+          "source_page": 1,
+          "source_evidence": "A1 alt answer"
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer M1 alt method A1 alt answer",
+      "expect": {
+        "authoritative_status": "CHECKED",
+        "authoritative_rule_ids": [],
+        "blocking": false,
+        "divergence_note": "Original B flags any alternative group (C5-ALT-SUM-REVIEW). Consolidated reconciles labelled branches by max and does not double-count, so a fully-consistent labelled structure is CHECKED. Original A already reached CHECKED for this shape."
+      }
+    },
+    {
+      "id": "labelled-alternatives-overcount",
+      "description": "Option A = 2 marks, option B = 3 marks, declared total 2. Max branch = 3 > declared 2. Verified over-allocation, blocking.",
+      "total": 2,
+      "criteria": [
+        {
+          "id": "Q1-m1",
+          "code": "M1",
+          "marks": 1,
+          "alternative_group": "method",
+          "alternative_option": "A",
+          "source_page": 1,
+          "source_evidence": "M1 method"
+        },
+        {
+          "id": "Q1-a1",
+          "code": "A1",
+          "marks": 1,
+          "dependencies": [
+            "Q1-m1"
+          ],
+          "alternative_group": "method",
+          "alternative_option": "A",
+          "source_page": 1,
+          "source_evidence": "A1 answer"
+        },
+        {
+          "id": "Q1-m1b",
+          "code": "M1",
+          "marks": 1,
+          "alternative_group": "method",
+          "alternative_option": "B",
+          "source_page": 1,
+          "source_evidence": "M1 alt method"
+        },
+        {
+          "id": "Q1-a1b",
+          "code": "A1",
+          "marks": 2,
+          "dependencies": [
+            "Q1-m1b"
+          ],
+          "alternative_group": "method",
+          "alternative_option": "B",
+          "source_page": 1,
+          "source_evidence": "A1 alt answer"
+        }
+      ],
+      "page_text": "Q1 M1 method A1 answer M1 alt method A1 alt answer",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-TOTAL-MISMATCH"
+        ],
+        "blocking": true,
+        "divergence_note": "Original B emits C5-ALT-SUM-REVIEW (generic) for any group. Consolidated computes the effective total (3) and reports the precise over-allocation as C5-TOTAL-MISMATCH, which is stronger and blocking."
+      }
+    },
+    {
+      "id": "invalid-mark-type",
+      "description": "Criterion code 'X9' is not a supported M/A/B/dM code. Mark type is explicitly UNKNOWN, never guessed.",
+      "total": 1,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "X9",
+          "marks": 1,
+          "source_page": 1
+        }
+      ],
+      "page_text": "Q1 X9 thing",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-MARKTYPE-UNSUPPORTED"
+        ],
+        "blocking": true
+      }
+    },
+    {
+      "id": "negative-marks",
+      "description": "Negative mark allocation is impossible; recorded as unknown and flagged.",
+      "total": 1,
+      "criteria": [
+        {
+          "id": "Q1-c1",
+          "code": "M1",
+          "marks": -1,
+          "source_page": 1
+        }
+      ],
+      "page_text": "Q1 M1 method",
+      "expect": {
+        "authoritative_status": "NEEDS_TEACHER_REVIEW",
+        "authoritative_rule_ids": [
+          "C5-MARKS-NEGATIVE",
+          "SCHEME-FIELD-MISSING",
+          "SCHEME-TOTAL-UNRECONCILABLE"
+        ],
+        "blocking": true,
+        "divergence_note": "Original A rejects the whole request with SchemeReviewError (loses the signal). Original B represents the impossible value as an explicit C5-MARKS-NEGATIVE finding and keeps reviewing, so the C2 structural consequences (unweighable field, unreconcilable total) also surface. B is stronger: never abort on a single bad criterion."
+      }
+    }
+  ]
+}

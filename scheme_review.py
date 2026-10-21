@@ -641,6 +641,24 @@ def _normalize_criterion(raw, question_number, part):
             "explicitly unknown.",
             suggested_action="Confirm alternative methods from the official "
             "notes."))
+    # Optional branch label for an alternative-method group. When every member
+    # of a group carries a distinct, non-empty label the branches can be
+    # reconciled by maximum (never summed); when absent or malformed the group
+    # stays unresolved and is escalated, never silently summed.
+    alternative_option = raw.get("alternative_option")
+    if alternative_option is not None and (
+            not isinstance(alternative_option, str)
+            or not alternative_option.strip()
+            or len(alternative_option) > MAX_ID_CHARS):
+        alternative_option = None
+        findings.append(_finding(
+            CATEGORY_ALTERNATIVE_METHOD_CONFLICT, "C5-ALT-OPTION-SHAPE",
+            question_number=question_number, part=part, severity="low",
+            state=C2_INSUFFICIENT,
+            explanation="Alternative-branch label invalid; the branch is "
+            "explicitly unknown and its group is not reconciled.",
+            suggested_action="Confirm the alternative branch from the official "
+            "notes."))
     source_page = raw.get("source_page")
     if source_page is not None and (isinstance(source_page, bool)
                                     or not isinstance(source_page, int)
@@ -672,6 +690,7 @@ def _normalize_criterion(raw, question_number, part):
         "dependencies": dependencies,
         "follow_through": follow_through,
         "alternative_group": alternative_group,
+        "alternative_option": alternative_option,
         "source_page": source_page,
         "source_evidence": source_evidence,
         "note": note,
@@ -852,11 +871,20 @@ def check_question_totals(questions, *, flat=False):
 
     ``flat=True`` runs the plain sum-vs-total check only where the C2 engine
     could not run (fallback protection); normally C2 owns that rule so no
-    issue is reported twice. Alternative-group questions always emit the
-    human-review finding: separating whole-method alternatives from
-    per-criterion alternatives requires examiner judgement.
+    issue is reported twice.
+
+    Alternative-method handling (ported from the investigation reviewer):
+    when every member of every alternative group carries a distinct branch
+    label, the effective total is standalone criteria + the maximum branch
+    total per group. Branches are counted ONCE (the largest), never summed.
+    A fully consistent labelled structure produces no finding. An
+    unlabelled or ambiguous group is escalated (never summed) so a teacher
+    reconciles it. Returns (findings, explained_total_mismatch) where the
+    second element maps question numbers whose criteria-sum differs from the
+    total solely because alternative branches were counted once.
     """
     findings = []
+    explained = {}
     for question in questions:
         number = question["question_number"]
         criteria = [c for c in question["criteria"]
@@ -882,8 +910,11 @@ def check_question_totals(questions, *, flat=False):
             continue
         declared = question["max_marks"]
         if groups:
-            findings += _alternative_group_findings(question, declared,
-                                                    weighted_sum)
+            group_findings, group_explained = _reconcile_alternative_groups(
+                question, criteria, groups, declared, weighted_sum)
+            findings += group_findings
+            if group_explained is not None:
+                explained[number] = group_explained
         elif flat and weighted_sum != declared:
             findings.append(_finding(
                 CATEGORY_TOTAL_MISMATCH, "C5-TOTAL-MISMATCH",
@@ -897,38 +928,119 @@ def check_question_totals(questions, *, flat=False):
                 "allocations are inconsistent.",
                 suggested_action="Find the missing or misallocated criterion "
                 "before trusting this question's totals."))
-    return findings
+    return findings, explained
 
 
-def _alternative_group_findings(question, declared, weighted_sum):
-    """Alternative methods must never be added as independent marks.
+def _reconcile_alternative_groups(question, criteria, groups, declared,
+                                  weighted_sum):
+    """Reconcile alternative groups by branch maximum; never sum branches.
 
-    A deterministic separation of whole-method alternatives from per-criterion
-    alternatives requires examiner documentation, so a human-review finding is
-    produced whenever alternative groups exist; the review is never silent.
+    Returns (findings, explained). ``explained`` is a dict describing a
+    legitimate criteria-sum≠total situation that the branch-max structure
+    accounts for (so the mapped C2 total finding can be marked as explained,
+    retained for traceability, and de-blocked), or None when nothing is
+    explained. Unlabelled/ambiguous groups are escalated and never summed.
     """
     number = question["question_number"]
-    groups = {}
-    for criterion in question["criteria"]:
-        if criterion["alternative_group"] is not None:
-            groups.setdefault(criterion["alternative_group"], []).append(
-                criterion["criterion_id"] or "?")
-    detail = {"alternative_groups": {name: sorted(members)
-                                     for name, members in groups.items()},
-              "cumulative_interpretation_sum": weighted_sum,
-              "declared_total": declared}
-    # Deliberate deterministic reporting, not a verdict:
+    findings = []
+    standalone = [c for c in criteria if c["alternative_group"] is None]
+    standalone_total = sum(c["marks"] for c in standalone)
+    group_total = 0
+    unresolved = False
+    options_detail = {}
+    for name in sorted(groups):
+        members = groups[name]
+        labels = [c.get("alternative_option") for c in members]
+        if any(label is None for label in labels) or len(set(labels)) < 2:
+            # Cannot separate branches deterministically: escalate, never sum.
+            unresolved = True
+            break
+        by_option = {}
+        for member, label in zip(members, labels):
+            by_option.setdefault(label, []).append(member)
+        option_totals = {label: sum(c["marks"] for c in members)
+                         for label, members in by_option.items()}
+        group_total += max(option_totals.values())
+        options_detail[name] = option_totals
+    if unresolved:
+        findings.extend(_alternative_group_findings(
+            question, declared, weighted_sum, groups))
+        return findings, None
+
+    effective_total = standalone_total + group_total
+    explained = {
+        "declared_total": declared,
+        "raw_criterion_weight_sum": weighted_sum,
+        "effective_total": effective_total,
+        "alternative_options": options_detail,
+        "reason": "alternative_branches_counted_once",
+    }
+    if effective_total == declared and weighted_sum != declared:
+        # The structure is fully consistent; the raw sum differs only because
+        # branches were counted once. No new finding; the mapped C2 total
+        # mismatch is explained (retained, de-blocked) rather than erased.
+        return findings, explained
+    if effective_total < declared:
+        findings.append(_finding(
+            CATEGORY_CRITERION_MISSING, "C5-CRITERIA-MISSING",
+            question_number=number, severity="high", state=C2_VERIFIED,
+            evidence={"declared_total": declared,
+                      "effective_total": effective_total,
+                      "shortfall": declared - effective_total},
+            explanation=f"Question '{number}' declares {declared} mark(s) but "
+            f"its reconciled criteria (alternative branches counted once) "
+            f"account for {effective_total}. Criteria or marks may be "
+            "missing; nothing is invented to fill the gap.",
+            suggested_action="Find the missing criterion before trusting this "
+            "question's totals."))
+        return findings, None
+    if effective_total > declared:
+        findings.append(_finding(
+            CATEGORY_TOTAL_MISMATCH, "C5-TOTAL-MISMATCH",
+            question_number=number,
+            criterion_ids=[c["criterion_id"] for c in criteria],
+            severity="high", state=C2_VERIFIED,
+            evidence={"declared_total": declared,
+                      "effective_total": effective_total,
+                      "excess": effective_total - declared,
+                      "alternative_options": options_detail},
+            explanation=f"Question '{number}' declares {declared} mark(s) but "
+            f"its reconciled criteria (alternative branches counted once) "
+            f"account for {effective_total}; the largest alternative branch "
+            "already exceeds the declared maximum.",
+            suggested_action="Check the alternative-method notes: the maximum "
+            "must cover the largest single branch, not their sum."))
+        return findings, None
+    # effective_total == declared and weighted_sum == declared: fully
+    # consistent and already reconciled; nothing to report.
+    return findings, explained
+
+
+def _alternative_group_findings(question, declared, weighted_sum, groups):
+    """Unlabelled/ambiguous alternative groups must never be summed.
+
+    A human-review finding is produced whenever alternative groups exist but
+    their branches cannot be separated deterministically; the review is never
+    silent and the raw sum is never treated as authoritative.
+    """
+    number = question["question_number"]
+    detail = {"alternative_groups": {
+        name: sorted(c["criterion_id"] or "?" for c in members)
+        for name, members in groups.items()},
+        "cumulative_interpretation_sum": weighted_sum,
+        "declared_total": declared}
     findings = [_finding(
         CATEGORY_ALTERNATIVE_METHOD_CONFLICT, "C5-ALT-SUM-REVIEW",
         question_number=number,
-        criterion_ids=[cid for members in groups.values() for cid in members],
+        criterion_ids=[c["criterion_id"] or "?" for members in groups.values()
+                       for c in members],
         severity="medium", state=C2_HUMAN_REVIEW,
         evidence=detail,
-        explanation="Alternative-method groups exist; whether group members "
-        "are whole alternative methods, mutually exclusive alternatives, or "
-        "independent parts needs examiner judgement. Cumulative summation "
-        "must never be assumed for totals; the marked total reconciliation "
-        "is delegated to teacher review.",
+        explanation="Alternative-method groups exist without separable branch "
+        "labels; whether group members are whole alternative methods, "
+        "mutually exclusive alternatives, or independent parts needs examiner "
+        "judgement. Cumulative summation must never be assumed for totals; "
+        "the marked total reconciliation is delegated to teacher review.",
         suggested_action="Check the official special/alternative-method notes "
         "before trusting the maximum.")]
     return findings
@@ -1064,7 +1176,9 @@ def _run_all_checks(questions, question_numbers=None, evidence_document=None,
     c2_findings = None
     if _c2_engine is not None:
         c2_findings = run_c2_verification(questions)
-    findings.extend(check_question_totals(questions, flat=c2_findings is None))
+    total_findings, explained_totals = check_question_totals(
+        questions, flat=c2_findings is None)
+    findings.extend(total_findings)
     findings.extend(check_criteria_coverage(questions, question_numbers))
     findings.extend(check_follow_through_support(questions))
     findings.extend(check_source_pages(questions))
@@ -1078,6 +1192,7 @@ def _run_all_checks(questions, question_numbers=None, evidence_document=None,
                 "gaps, not substitutes for C2.",
                 suggested_action="Re-check the payload structure."))
         else:
+            _mark_explained_total_mismatches(c2_findings, explained_totals)
             findings.extend(c2_findings)
     else:
         findings.append(_finding(
@@ -1100,6 +1215,28 @@ def run_c2_verification(questions):
         return None
     except Exception:  # safety: never propagate model errors into marking
         return None
+
+
+def _mark_explained_total_mismatches(c2_findings, explained_totals):
+    """Remove a C2 total mismatch that a verified alternative structure explains.
+
+    A labelled alternative structure that legitimately reconciles to the
+    declared total (branches counted once) fully accounts for the raw
+    criteria-sum≠total situation. That C2 total mismatch is therefore not a
+    real inconsistency, so it is dropped here rather than surfaced as noise.
+    The alternative reconciliation itself is reported separately by
+    ``check_question_totals`` (a C5 finding), so the explanation remains
+    visible for traceability. A total mismatch the structure does NOT explain
+    is retained untouched.
+    """
+    if not explained_totals:
+        return
+    drop = [
+        index for index, finding in enumerate(c2_findings)
+        if finding.get("rule_id") in ("C5-TOTAL-MISMATCH", "SCHEME-TOTAL-MISMATCH")
+        and explained_totals.get(finding.get("question_number")) is not None]
+    for index in reversed(drop):
+        c2_findings.pop(index)
 
 
 def bind_evidence(questions, document, mapping):
