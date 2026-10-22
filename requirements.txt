@@ -6,11 +6,11 @@
 # ranges that the CI matrix validates, or exact pins for the untrusted-input
 # PDF stack. Dependabot proposes reviewable updates and a pip-audit CI job
 # scans the resolved set (see TESTING.md "Dependency policy and supply chain").
-# Bounded range; the CI matrix tests the resolved version. Pillow==13.0.0
-# below is only installable with streamlit>=1.66.1 (1.66.0 and earlier cap
-# pillow<13), and pip resolves the newest in-range release, so the effective
-# floor for the pinned PDF stack is 1.66.1.
-streamlit>=1.64.0,<1.67
+# Bounded range; the CI matrix tests the resolved version. The floor matches
+# the effective minimum for the pinned PDF stack: streamlit 1.66.1 is the
+# first release admitting Pillow 13.0.0 (1.66.0 and earlier cap pillow<13),
+# and pip resolves the newest in-range release.
+streamlit>=1.66.1,<1.67
 # REQUIRED for Google sign-in: the app calls st.login("google"), and
 # Streamlit's native OIDC auth (its "auth" extra) imports authlib.jose from
 # streamlit/auth_util.py. No direct Authlib imports exist in this codebase,
@@ -21,9 +21,11 @@ google-genai>=1.40,<3
 pandas>=2.0,<4
 requests>=2.31,<3
 # Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls).
-# pypdf 6.21.1 fixes CVE-2026-113786; Pillow 13.0.0 fixes the 12.3.0
-# advisory set (dependency-audit job, S5). Bump only via pip-audit-clean,
-# CI-validated updates.
-pypdf==6.21.1
+# pypdf 6.21.1 fixes CVE-2026-113786; 6.21.2 additionally fixes three
+# crafted-PDF long-runtime advisories on the xref/object-loading path
+# (GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4, GHSA-6c7f-9265-g8fw). Pillow
+# 13.0.0 fixes the 12.3.0 advisory set (dependency-audit job, S5). Bump only
+# via pip-audit-clean, CI-validated updates.
+pypdf==6.21.2
 pypdfium2==5.14.0
 Pillow==13.0.0

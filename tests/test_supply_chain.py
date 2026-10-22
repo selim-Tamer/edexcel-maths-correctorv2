@@ -78,7 +78,7 @@ class ProductionRequirements(TestCase):
 
     def test_frameworks_stay_within_ci_validated_window(self):
         expectations = {
-            "streamlit": ((1, 64, 0), (1, 67)),
+            "streamlit": ((1, 66, 1), (1, 67)),
             "google-genai": ((1, 40), (3,)),
             "pandas": ((2, 0), (4,)),
             "requests": ((2, 31), (3,)),

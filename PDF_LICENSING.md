@@ -35,7 +35,7 @@ Sources: [PyMuPDF licensing](https://pymupdf.io/licensing),
 
 | Component | Licence verified | Role and conclusion |
 |---|---|---|
-| pypdf 6.21.1 | BSD-3-Clause | Copies selected pages, resources, ink annotations and form fields. Cannot render a preview by itself. |
+| pypdf 6.21.2 | BSD-3-Clause | Copies selected pages, resources, ink annotations and form fields. Cannot render a preview by itself. |
 | pypdfium2 5.14.0 | Wrapper: Apache-2.0 OR BSD-3-Clause; PDFium and bundled dependencies have their own notices | Fast digital-text extraction and annotated/form-aware preview rendering. Pair with pypdf for excerpts. |
 | Pillow 13.0.0 | MIT-CMU, with bundled component notices | Lossless PNG preview encoding. Explicit runtime dependency, already used by Streamlit. |
 | ReportLab 5.0.1 | BSD | Test-only synthetic fixture generation; not added to deployment requirements. |
