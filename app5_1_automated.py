@@ -11,6 +11,7 @@ import tempfile
 import time
 import document_pipeline as documents
 import scheme_review
+import teacher_authorization
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -2333,6 +2334,7 @@ SENSITIVE_STATE_KEYS = (
     "classroom_grade_approvals",
     "classroom_jobs",
     "scheme_review_approvals",
+    "teacher_authorization_state",
 )
 SENSITIVE_WIDGET_PREFIXES = (
     "override_q_",
@@ -2380,6 +2382,9 @@ def invalidate_sensitive_state():
     preferences) is preserved; only records tied to one teacher's marking
     results are removed.
     """
+    # C6-B1: revoke the teacher-authorization authority FIRST so every
+    # issued context dies with the state, then drop the stored grants.
+    teacher_authorization.revoke_teacher_authorization(st.session_state)
     for key in SENSITIVE_STATE_KEYS:
         st.session_state.pop(key, None)
     for key in sensitive_widget_keys():
@@ -2408,6 +2413,52 @@ def reconcile_sensitive_state():
         invalidate_sensitive_state()
     elif stored is not None:
         st.session_state.pop("sensitive_state_owner", None)
+
+
+def record_classroom_grants(courses, assignments, course_id):
+    """C6-B1: remember teacher grants proven by trusted Classroom listings.
+
+    Called only after a successful server-side listing made with the
+    authenticated teacher's own token (list_teacher_courses /
+    list_assignments). Recording is best-effort bookkeeping: any failure is
+    swallowed so marking never depends on it, and a missing grant can only
+    fail closed (privileged scheme approval stays unavailable). No provider
+    call is made here.
+    """
+    subject = authenticated_google_identity()
+    if subject is None:
+        return
+    try:
+        teacher_authorization.remember_classroom_grants(
+            st.session_state, subject, courses, course_id, assignments)
+    except teacher_authorization.TeacherAuthorizationError:
+        return
+    # Keep the owner binding consistent with the authorization state just
+    # written, so rerun reconciliation never treats it as unowned leftovers
+    # (same pattern as save_scheme_review_acknowledgement).
+    owner = sensitive_state_owner()
+    if owner is not None and st.session_state.get("sensitive_state_owner") is None:
+        st.session_state["sensitive_state_owner"] = owner
+
+
+def remember_manual_upload(pdf_bytes):
+    """C6-B1: register the actual uploaded PDF bytes as this session's manual
+    document grant. The digest is computed server-side from the real bytes;
+    a browser-supplied digest is never accepted. Anonymous sessions register
+    nothing. Best-effort: failures never block the existing manual flow."""
+    subject = authenticated_google_identity()
+    if subject is None:
+        return
+    try:
+        teacher_authorization.record_manual_pdf_grant(
+            st.session_state, subject, pdf_bytes)
+    except teacher_authorization.TeacherAuthorizationError:
+        return
+    # Same owner-binding discipline as the Classroom wrapper: the grant
+    # store must survive rerun reconciliation for the SAME teacher.
+    owner = sensitive_state_owner()
+    if owner is not None and st.session_state.get("sensitive_state_owner") is None:
+        st.session_state["sensitive_state_owner"] = owner
 
 
 def row_owner_allowed(row):
@@ -4021,6 +4072,13 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                 try:
                     courses = list_teacher_courses(token)
 
+                    # C6-B1: this teacherId=me listing was fetched with the
+                    # authenticated teacher's own token, so it is trusted
+                    # evidence of course-level teacher access. Remember the
+                    # grants (best-effort; no provider call, marking is
+                    # unaffected if this fails).
+                    record_classroom_grants(courses, [], None)
+
                     if not courses:
                         st.warning(
                             "No active Google Classroom courses where this account "
@@ -4044,6 +4102,13 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                             token,
                             selected_course_id,
                         )
+
+                        # C6-B1: the published-assignment listing for a
+                        # teacher-verified course is the trusted evidence of
+                        # assignment access; remember the revision-bound
+                        # grants it proves (best-effort, in-memory only).
+                        record_classroom_grants(
+                            courses, assignments, selected_course_id)
 
                         if not assignments:
                             st.warning(
@@ -4604,6 +4669,10 @@ if manual_run_authorized:
                 st.session_state["last_manual_context"] = documents.digest(mark_scheme_pdf.getvalue())
                 st.session_state["last_mark_scheme_name"] = mark_scheme_pdf.name
                 bind_sensitive_state(store_owner)
+                # C6-B1: register the actual uploaded bytes (digest computed
+                # server-side) as this session's manual-review document
+                # grant, bound to the authenticated owner.
+                remember_manual_upload(mark_scheme_pdf.getvalue())
 
             marked_count = sum(1 for r in batch_results if r["status"] == "Marked")
             status.update(

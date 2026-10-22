@@ -27,11 +27,10 @@ Three information channels are kept strictly separated, never merged:
 - ``extracted``: what the model believes the scheme says (verbatim, bounded).
 - ``verified``: what deterministic checks establish (findings + checks run).
 - ``teacher``: what a teacher has explicitly accepted (status, approver,
-  approved revision). ``approval_state`` re-evaluates an approval against a
-  caller-supplied owner, the record revision and any new findings, and fails
-  closed. Owner binding and revision enforcement at approval time are
-  enforced in the app's acknowledgement layer today; engine-side validation
-  gaps are recorded as C6 pre-work in PHASE_C5_CONSOLIDATION_REPORT.md §10.
+  approved revision). ``approval_state`` re-evaluates the exact registered
+  snapshot and live server authorization; stored metadata alone grants no
+  approval. The existing app still uses its separate owner-bound warning
+  acknowledgement, not these privileged APIs.
 
 Gemini-assisted review is OFFLINE-ONLY in this phase. The response schema,
 strict parsing, outcome classification and findings validation are fully
@@ -46,6 +45,8 @@ prose). Reviewer output always keeps ``review_required`` true on findings.
 import hashlib
 import json
 import re
+
+from scheme_authorization import AuthorizationError, identifier, validate_context
 
 try:
     from investigation import verification_engine as _c2_engine
@@ -140,8 +141,7 @@ MARK_VALUE_MAX = 20
 _HOMEWORK_QUESTION_PATTERN = re.compile(r"^[1-9]\d{0,3}$")
 _INTEGER_PATTERN = re.compile(r"^-?\d+$")
 
-# Findings that may never be silently certified (approval is blocked until the
-# teacher explicitly resolves them). Missing evidence and proven conflicts.
+# Missing evidence and proven conflicts require correction and revalidation.
 EVIDENCE_BLOCKING_CATEGORIES = (
     CATEGORY_SOURCE_EVIDENCE_MISSING,
     CATEGORY_SOURCE_EVIDENCE_CONFLICT,
@@ -337,19 +337,36 @@ def build_review(interpretation, *, specification=None, assignment_id=None,
         "teacher": empty_teacher_section(),
         "warnings": [],
     }
+    # Preserve complete inputs for privileged revalidation, independently of
+    # bounded display excerpts. Oversized/non-JSON inputs remain read-only.
+    record["approval_inputs"] = None
+    try:
+        raw = json.dumps({"interpretation": interpretation,
+                          "evidence_document": evidence_document,
+                          "question_mapping": question_mapping,
+                          "question_numbers": question_numbers}, allow_nan=False)
+        if len(raw) <= MAX_SERIALIZED_CHARS:
+            record["approval_inputs"] = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        pass
     record["teacher"]["status"] = determine_status(record)
     return record
 
 
-def determine_status(record):
+def determine_status(record, authorization=None):
     """Status derivation; explicit, never inferred beyond findings."""
+    if not _status_shape_valid(record):
+        return STATUS_NEEDS_REVIEW
     teacher = record.get("teacher") or {}
     status = teacher.get("status")
     findings = list((record.get("verified") or {}).get("findings") or [])
     assisted = record.get("assisted") or {}
     assisted_findings = list(assisted.get("findings") or [])
-    if status in (STATUS_APPROVED, STATUS_REJECTED):
-        return status
+    if status == STATUS_APPROVED:
+        state, _ = approval_state(record, authorization, record.get("scheme_revision"))
+        return STATUS_APPROVED if state == "approved" else STATUS_NEEDS_REVIEW
+    if status == STATUS_REJECTED:
+        return STATUS_REJECTED
     if findings or assisted_findings or assisted.get("failure_note"):
         return STATUS_NEEDS_REVIEW
     if _checks_ran(record):
@@ -387,16 +404,31 @@ def teacher_messages(record, limit=MAX_TEACHER_MESSAGES):
     return messages
 
 
-def review_summary(record):
+def review_summary(record, authorization=None):
     """Bounded display summary for teacher-facing surfaces."""
-    status = record.get("teacher", {}).get("status") or determine_status(record)
+    if not _status_shape_valid(record):
+        return {"status": STATUS_NEEDS_REVIEW, "revision": "",
+                "revision_short": "", "messages": ["Invalid review record."],
+                "historical_approval": False}
+    status = determine_status(record, authorization)
     revision = str(record.get("scheme_revision") or "")
     return {
         "status": status,
         "revision": revision,
         "revision_short": revision[:24],
         "messages": teacher_messages(record),
+        "historical_approval": bool((record.get("teacher") or {}).get("approved_by")),
     }
+
+
+def _status_shape_valid(record):
+    return (type(record) is dict and type(record.get("teacher")) is dict
+            and type(record.get("verified")) is dict
+            and type(record["verified"].get("findings")) is list
+            and all(type(item) is dict for item in record["verified"]["findings"])
+            and (record.get("assisted") is None or
+                 (type(record["assisted"]) is dict and
+                  type(record["assisted"].get("findings", [])) is list)))
 
 
 # ---------------------------------------------------------------------------
@@ -1446,113 +1478,235 @@ def review_extracted_maxima(maxima, answers=None, question_numbers=None,
 # ---------------------------------------------------------------------------
 # Teacher approval state (Phase C5 Stage 9).
 
-def resolve_findings(record, finding_ids, teacher_id):
-    """Teacher explicitly resolves findings; never grants approval itself.
+def _approval_error(code):
+    raise SchemeReviewApprovalError(code)
 
-    Approval still requires a separate ``approve_scheme_review`` call with no
-    remaining blocking findings. C6 pre-work (report §10): the teacher
-    identity is caller-asserted here and non-waivable findings are not yet
-    protected from resolution at the engine layer; production never calls
-    this function today.
+
+def _authorized(authorization):
+    try:
+        return validate_context(authorization)
+    except AuthorizationError as exc:
+        raise SchemeReviewApprovalError(str(exc)) from None
+
+
+def _snapshot(record):
+    """Hash every reviewed field, including complete source inputs/resolutions."""
+    try:
+        if not _status_shape_valid(record):
+            _approval_error("invalid_review_record")
+        payload = {key: value for key, value in record.items() if key != "teacher"}
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False)
+        if len(encoded) > MAX_SERIALIZED_CHARS * 3:
+            _approval_error("review_snapshot_too_large")
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except SchemeReviewApprovalError:
+        # F2: SchemeReviewApprovalError subclasses ValueError; without this
+        # clause every intentional refusal raised inside the try would be
+        # swallowed by the broad handler below and re-raised under the wrong
+        # diagnostic code (e.g. review_snapshot_too_large -> invalid_review_record).
+        raise
+    except (TypeError, ValueError, RecursionError):
+        # Serialization failures on corrupted/non-finite records still fail
+        # closed under the generic code.
+        _approval_error("invalid_review_record")
+
+
+def bind_scheme_review(record, authorization, *, review_id, document_digest):
+    """Register a revalidated snapshot in a trusted session authority.
+
+    Server code must supply the actual PDF SHA-256 and fresh review ID from its
+    own document/review storage, never a browser claim. Maxima-only production
+    warning records intentionally cannot use this privileged API.
     """
-    findings = (record.get("verified") or {}).get("findings") or []
-    requested = {str(finding_id) for finding_id in finding_ids}
-    for finding in findings:
-        if finding["finding_id"] in requested:
-            finding["teacher_resolved"] = True
-            finding["resolved_by"] = teacher_id
+    owner = _authorized(authorization)
+    _snapshot(record)
+    if not identifier(review_id) or not identifier(record.get("scheme_revision")):
+        _approval_error("review_identity_and_revision_required")
+    if type(document_digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", document_digest):
+        _approval_error("document_digest_required")
+    if record.get("assignment_id") != authorization.assignment_id:
+        _approval_error("assignment_mismatch")
+    if "approval_binding" in record or record["teacher"] != {
+            "status": determine_status(record), "approved_by": None,
+            "approved_revision": None}:
+        _approval_error("fresh_review_required")
+    inputs = record.get("approval_inputs")
+    if type(inputs) is not dict or inputs.get("evidence_document") is None or inputs.get("question_mapping") is None:
+        _approval_error("review_source_inputs_required")
+    try:
+        # Legacy display normalization accepts floats. Privileged approval
+        # must not certify a silently truncated official allocation (C5 L1).
+        for question in inputs["interpretation"]["questions"]:
+            allocations = [question.get("max_marks")] + [
+                criterion.get("marks") for criterion in question.get("criteria", [])]
+            if any(type(value) not in (int, str) for value in allocations):
+                _approval_error("exact_mark_allocations_required")
+        rebuilt = build_review(**inputs, specification=record.get("specification"),
+                               assignment_id=record.get("assignment_id"),
+                               scheme_revision=record["scheme_revision"])
+        if (record["verified"] != rebuilt["verified"] or
+                record["extracted"] != rebuilt["extracted"]):
+            _approval_error("review_revalidation_failed")
+        questions = record["extracted"]["questions"]
+        if not questions or any(not q["criteria"] for q in questions):
+            _approval_error("full_review_required")
+    except SchemeReviewApprovalError:
+        # F2: keep the specific refusal code (exact_mark_allocations_required,
+        # full_review_required, ...) instead of relabelling it as a generic
+        # revalidation failure; SchemeReviewApprovalError IS a ValueError.
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+        # Genuinely corrupted records still fail closed under the generic code.
+        _approval_error("review_revalidation_failed")
+    registry = authorization._authority._reviews
+    if review_id in registry or len(registry) >= 100:
+        # F3: superseded review entries (identity no longer re-verifies) must
+        # not permanently consume the registry capacity; pruning can never
+        # revive them because a removed entry can no longer be looked up.
+        authorization._authority.prune_superseded()
+    if review_id in registry or len(registry) >= 100:
+        _approval_error("fresh_review_identity_required")
+    binding = {"owner": owner, "assignment_id": authorization.assignment_id,
+               "assignment_revision": authorization._identity.assignment_revision,
+               "review_id": review_id, "document_digest": document_digest}
+    candidate = dict(record, approval_binding=binding)
+    digest = _snapshot(candidate)
+    record["approval_binding"] = binding
+    registry[review_id] = {"snapshot": digest, "binding": dict(binding),
+                           "identity": authorization._identity,
+                           "initial_teacher": dict(record["teacher"]),
+                           "decision": None}
+    return record
+
+
+def _bound_review(record, authorization):
+    owner = _authorized(authorization)
+    _snapshot(record)
+    binding = record.get("approval_binding")
+    if type(binding) is not dict or not identifier(binding.get("review_id")):
+        _approval_error("bound_review_required")
+    entry = authorization._authority._reviews.get(binding["review_id"])
+    if (entry is None or binding != entry["binding"] or binding.get("owner") != owner
+            or binding.get("assignment_id") != authorization.assignment_id
+            or record.get("assignment_id") != authorization.assignment_id
+            or entry["identity"] != authorization._identity):
+        _approval_error("review_authorization_mismatch")
+    if entry["snapshot"] != _snapshot(record):
+        _approval_error("review_content_changed")
+    if record["teacher"] != (entry["decision"] or entry["initial_teacher"]):
+        _approval_error("review_decision_changed")
+    return entry
+
+
+def _resolvable(finding):
+    # Only heuristic mapping uncertainty can be confirmed without changing the
+    # interpretation. All other findings require correction and a new review.
+    return (finding.get("rule_id") == "C5-MAPPING-UNCERTAIN"
+            and finding.get("category") == CATEGORY_QUESTION_MAPPING_UNCERTAIN
+            and finding.get("state") == C2_INSUFFICIENT
+            and finding.get("origin") == "deterministic")
+
+
+def resolve_findings(record, finding_ids, authorization, *, reason=None, evidence=None):
+    """Resolve ONE allowlisted finding with attributable, bound source evidence.
+
+    No blanket waiver. Evidence is {document_digest, page, excerpt}; it must
+    match a cited criterion and the mapped page in the registered source.
+    """
+    entry = _bound_review(record, authorization)
+    if entry["decision"] is not None:
+        _approval_error("fresh_review_required")
+    if type(finding_ids) is not list or len(finding_ids) != 1 or type(finding_ids[0]) is not str:
+        _approval_error("individual_finding_required")
+    matches = [f for f in record["verified"]["findings"] if f["finding_id"] == finding_ids[0]]
+    if len(matches) != 1 or not _resolvable(matches[0]):
+        _approval_error("finding_requires_correction_and_revalidation")
+    if type(reason) is not str or not reason.strip() or len(reason) > MAX_NOTE_CHARS:
+        _approval_error("resolution_reason_required")
+    if type(evidence) is not dict or set(evidence) != {"document_digest", "page", "excerpt"}:
+        _approval_error("resolution_evidence_required")
+    page, excerpt = evidence["page"], evidence["excerpt"]
+    if (evidence["document_digest"] != entry["binding"]["document_digest"]
+            or type(page) is not int or page < 1 or type(excerpt) is not str
+            or not excerpt.strip() or len(excerpt) > MAX_EXCERPT_CHARS):
+        _approval_error("resolution_evidence_invalid")
+    finding = matches[0]
+    inputs = record["approval_inputs"]
+    pages = inputs["evidence_document"].get("pages", [])
+    mapping = inputs["question_mapping"].get("matches", [])
+    questions = record["extracted"]["questions"]
+    valid = (any(p.get("page") == page and p.get("status") == "extracted"
+                 and excerpt in p.get("text", "") for p in pages)
+             and any(m.get("question_id") == finding["question_number"]
+                     and page in m.get("pages", []) for m in mapping)
+             and any(q["question_number"] == finding["question_number"]
+                     and any(c["source_page"] == page and c["source_evidence"] == excerpt
+                             for c in q["criteria"]) for q in questions))
+    if not valid:
+        _approval_error("resolution_evidence_unverified")
+    # All checks precede mutation. Exact source text stays in session only.
+    finding.update(teacher_resolved=True, resolved_by=entry["binding"]["owner"],
+                   resolution_reason=reason.strip(), resolution_evidence=dict(evidence))
+    entry["snapshot"] = _snapshot(record)
     refresh_status(record)
     return record
 
 
 def _blocking_findings(record):
-    """Findings that cannot be waived silently.
-
-    Anything VERIFIED blocks; evidence-availability conflicts/mapping faults
-    block until explicit teacher resolution, as does an extraction that
-    produced nothing to review at all.
-    """
-    blocking = []
-    for finding in unresolved_findings(record):
-        if finding["state"] == C2_VERIFIED:
-            blocking.append(finding)
-        elif finding["category"] in EVIDENCE_BLOCKING_CATEGORIES:
-            blocking.append(finding)
-        elif finding["rule_id"] in BLOCKING_RULES:
-            blocking.append(finding)
-    return blocking
+    """Structural hard-blocker classification (unchanged C5 contract)."""
+    return [finding for finding in unresolved_findings(record)
+            if finding["state"] == C2_VERIFIED
+            or finding["category"] in EVIDENCE_BLOCKING_CATEGORIES
+            or finding["rule_id"] in BLOCKING_RULES]
 
 
-def approve_scheme_review(record, teacher_id, scheme_revision):
-    """Teacher-approved state; stores the approver and the granted revision.
-
-    Missing or contradictory evidence can never be silently certified:
-    unresolved blocking findings must be explicitly resolved by the teacher
-    first, and assisted-channel output blocks approval outright. The
-    approver must be a non-blank identity and the granted revision is stored
-    on the record. Note (C6 pre-work, report §10): the revision argument is
-    NOT compared against the record's own revision here, and the teacher
-    identity is caller-asserted; strict re-evaluation (stale revision,
-    different teacher, new findings) is performed by ``approval_state`` at
-    read time. Production today never calls this function — the Streamlit
-    surface records an owner-bound acknowledgement only.
-    """
-    if not teacher_id or not str(teacher_id).strip():
-        raise SchemeReviewApprovalError("teacher_approval_identity_missing")
-    if scheme_revision is None:
-        raise SchemeReviewApprovalError("approval_revision_required")
-    blocking = _blocking_findings(record)
-    if blocking:
-        raise SchemeReviewApprovalError(
-            "unresolved_finding_" + blocking[0]["category"])
+def approve_scheme_review(record, authorization, scheme_revision):
+    """Approve only the current registered, authorized, fully resolved review."""
+    entry = _bound_review(record, authorization)
+    if not identifier(scheme_revision) or scheme_revision != record.get("scheme_revision"):
+        _approval_error("approval_revision_mismatch")
+    if entry["decision"] is not None and entry["decision"]["status"] == STATUS_REJECTED:
+        _approval_error("rejected_review_requires_regeneration")
+    # Even soft uncertainties require an individual verified resolution before
+    # approval, while retaining C5's separate structural-blocker classification.
+    blockers = unresolved_findings(record)
+    if blockers:
+        _approval_error("unresolved_finding_" + blockers[0]["category"])
     assisted = record.get("assisted") or {}
     if assisted.get("findings") or assisted.get("failure_note"):
-        # Assisted suggestions (or a recorded assisted failure) are never a
-        # basis for certifying this record; approval stays fail-closed until
-        # the assisted channel is a clean, completed no-findings pass or
-        # removed by regenerating the record offline.
-        raise SchemeReviewApprovalError("assisted_review_unresolved")
-    record["teacher"] = {
-        "status": STATUS_APPROVED,
-        "approved_by": str(teacher_id),
-        "approved_revision": str(scheme_revision),
-    }
+        _approval_error("assisted_review_unresolved")
+    decision = {"status": STATUS_APPROVED, "approved_by": entry["binding"]["owner"],
+                "approved_revision": scheme_revision}
+    entry["decision"] = dict(decision)
+    record["teacher"] = decision
     return record
 
 
-def reject_scheme_review(record, teacher_id):
-    if not teacher_id or not str(teacher_id).strip():
-        raise SchemeReviewApprovalError("teacher_approval_identity_missing")
-    record["teacher"] = {
-        "status": STATUS_REJECTED,
-        "approved_by": str(teacher_id),
-        "approved_revision": record.get("scheme_revision"),
-    }
+def reject_scheme_review(record, authorization):
+    entry = _bound_review(record, authorization)
+    decision = {"status": STATUS_REJECTED, "approved_by": entry["binding"]["owner"],
+                "approved_revision": record["scheme_revision"]}
+    entry["decision"] = dict(decision)
+    record["teacher"] = decision
     return record
 
 
-def approval_state(record, teacher_id, scheme_revision):
-    """Explicit approval evaluation; never inferred, always fail-closed.
-
-    Returns (state, reason) where state is one of
-    "absent"|"approved"|"stale_revision"|"different_teacher".
-    Teacher identity, revision and (still) unresolved findings must all be
-    consistent for approval to remain valid.
-    """
-    teacher = record.get("teacher") or {}
-    if teacher.get("status") != STATUS_APPROVED:
-        return "absent", teacher.get("status")
-    if teacher.get("approved_by") != str(teacher_id):
-        return "different_teacher", "approved_by_another_teacher"
-    # The record's own revision must still match what was approved; a
-    # regenerated record for another scheme revision invalidates it.
-    if str(record.get("scheme_revision")) != teacher.get("approved_revision"):
-        return "stale_revision", "scheme_revision_changed"
-    if teacher.get("approved_revision") != str(scheme_revision):
-        return "stale_revision", "scheme_revision_changed"
-    if unresolved_findings(record):
-        return "stale_revision", "new_findings_after_approval"
-    return "approved", None
+def approval_state(record, authorization, scheme_revision):
+    """Single authoritative effective-approval evaluator; metadata is not proof."""
+    try:
+        entry = _bound_review(record, authorization)
+        if scheme_revision != record.get("scheme_revision"):
+            return "stale_revision", "scheme_revision_changed"
+        decision = entry["decision"]
+        if decision is None or decision["status"] != STATUS_APPROVED:
+            return "absent", None
+        assisted = record.get("assisted") or {}
+        if unresolved_findings(record) or assisted.get("findings") or assisted.get("failure_note"):
+            return "stale_revision", "unresolved_review"
+        return "approved", None
+    except SchemeReviewApprovalError as exc:
+        return "invalid", str(exc)
 
 
 # ---------------------------------------------------------------------------
