@@ -10,7 +10,7 @@
 # below is only installable with streamlit>=1.66.1 (1.66.0 and earlier cap
 # pillow<13), and pip resolves the newest in-range release, so the effective
 # floor for the pinned PDF stack is 1.66.1.
-streamlit>=1.64.0,<1.67
+streamlit>=1.66.0,<1.67
 # REQUIRED for Google sign-in: the app calls st.login("google"), and
 # Streamlit's native OIDC auth (its "auth" extra) imports authlib.jose from
 # streamlit/auth_util.py. No direct Authlib imports exist in this codebase,
