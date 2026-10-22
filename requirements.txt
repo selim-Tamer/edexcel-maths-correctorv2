@@ -12,10 +12,13 @@
 # and pip resolves the newest in-range release.
 streamlit>=1.66.1,<1.67
 # REQUIRED for Google sign-in: the app calls st.login("google"), and
-# Streamlit's native OIDC auth (its "auth" extra) imports authlib.jose from
-# streamlit/auth_util.py. No direct Authlib imports exist in this codebase,
+# Streamlit's native OIDC auth uses Authlib's OAuth client. Token helpers
+# prefer joserfc, with a legacy authlib.jose fallback. No direct production
+# Authlib imports exist in this application,
 # but removing this line breaks st.login on Streamlit Cloud
 # (S5 finding F-12: retained, not unused).
+# 1.9.1 rejects empty HMAC keys and includes the 1.9.0 OIDC nonce fixes.
+# See DEPENDENCY_AUTHLIB_REVIEW.md; CI tests this floor and latest <2.
 Authlib>=1.9.1,<2
 google-genai>=1.40,<3
 pandas>=2.0,<4

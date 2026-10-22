@@ -76,12 +76,15 @@ jobs:
           - python: '3.11'
             sdk: '1.40.0'
             streamlit: '1.66.1'
+            authlib: '==1.9.1'
           - python: '3.14'
             sdk: '2.30.1'
             streamlit: '1.66.1'
+            authlib: '==1.9.1'
           - python: '3.14'
             sdk: '2.31.0'
             streamlit: '1.66.1'
+            authlib: '>=1.9.1,<2'
     steps:
       - name: Check out repository
         # v4.3.1 (full commit SHA; supply-chain pin, S5 F-11)
@@ -97,7 +100,8 @@ jobs:
         # Match Community Cloud's replacement of affected PyArrow 25/26 builds.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install streamlit==${{ matrix.streamlit }} google-genai==${{ matrix.sdk }} pyarrow==24.0.0 -r tests/pdf-requirements.txt
+          python -m pip install streamlit==${{ matrix.streamlit }} google-genai==${{ matrix.sdk }} "Authlib${{ matrix.authlib }}" pyarrow==24.0.0 -r tests/pdf-requirements.txt
+          python -m pip check
       - name: Run real Streamlit interaction tests
         run: python -m unittest discover -s tests/ui -p 'test_*.py' -v
       - name: Validate minimum Gemini SDK with intercepted HTTP
