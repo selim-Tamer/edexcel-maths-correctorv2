@@ -12,7 +12,7 @@ Base commit: `da2521809e3e23d664a6920cfca5b0f3a52f0f08` (merge of PR #29).
 | Authlib | `>=1.3.2,<2` | OIDC session tokens (S2 auth) | **no** — needed by Streamlit `st.login()` | Streamlit `auth` extra (`authlib.jose` in `streamlit/auth_util.py`) |
 | google-genai | `>=1.40,<3` | Gemini SDK | yes | — |
 | pandas | `>=2.0,<4` | report tables | yes | Streamlit (floor `>=1.4.0`) |
-| requests | `>=2.31,<3` | Classroom/Drive REST transport, bounded downloads | yes | google-genai, streamlit |
+| requests | `>=2.34.2,<3` | Classroom/Drive REST transport, bounded downloads | yes | google-genai, streamlit; see [current floor review](DEPENDENCY_REQUESTS_REVIEW.md) |
 | pypdf | `==6.21.2` | untrusted-PDF metadata/limits (S3) | yes (lazy import in `document_limits.py`) | — |
 | pypdfium2 | `==5.14.0` | PDF rendering (PDFium) | yes (`local_pdf.py`) | — |
 | Pillow | `==13.0.0` | image decoding surface | no direct import | Streamlit (floor `>=7.1.0`), pypdfium2 image export |
