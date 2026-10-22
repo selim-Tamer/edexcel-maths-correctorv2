@@ -12,6 +12,7 @@ import time
 import document_pipeline as documents
 import scheme_review
 import teacher_authorization
+import question_review
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -935,8 +936,14 @@ def classroom_grade_details(row, rounding_places=2):
     }
 
 
-def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None):
-    """Render the full single-student report (metrics, notes, groups, per-question detail)."""
+def render_student_report(student_name, result, totals, groups, marking_model, audit_model, student_key=None, review_row=None):
+    """Render the full single-student report (metrics, notes, groups, per-question detail).
+
+    ``review_row`` is the stored, owner-verified row this report was rendered
+    from; when present the secure question-level review controls are shown.
+    Without it (downloads, exports, older call sites) no review widget is
+    rendered and no privileged path is reachable.
+    """
     if student_key:
         apply_teacher_overrides(student_key, result)
         earned, available, percentage = calculate_totals(result)
@@ -1033,6 +1040,12 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
     st.subheader("📝 Question-by-question correction")
 
+    review_row_ok = bool(student_key and isinstance(review_row, dict)
+                         and review_row.get("review_key") == student_key
+                         and row_owner_allowed(review_row))
+    if review_row_ok:
+        render_question_review_summary(review_row, student_key, result)
+
     for q in result["questions"]:
         with st.expander(
             f"Question {q['question_number']} — {q['awarded_marks']} / {q['max_marks']} — {q['topic']}"
@@ -1076,6 +1089,9 @@ def render_student_report(student_name, result, totals, groups, marking_model, a
 
             st.markdown("**Full-mark model solution**")
             st.write(q["full_mark_solution"] or "Not provided.")
+
+            if review_row_ok:
+                render_question_review_block(review_row, student_key, q)
 
     with st.expander("🔧 View machine-readable JSON"):
         st.code(json.dumps(result, indent=2, ensure_ascii=False), language="json")
@@ -2335,6 +2351,8 @@ SENSITIVE_STATE_KEYS = (
     "classroom_jobs",
     "scheme_review_approvals",
     "teacher_authorization_state",
+    "question_review_decisions",
+    "question_review_events",
 )
 SENSITIVE_WIDGET_PREFIXES = (
     "override_q_",
@@ -2344,6 +2362,10 @@ SENSITIVE_WIDGET_PREFIXES = (
     "classroom_approval_checkbox_",
     "classroom_remark_",
     "scheme_review_ack_",
+    "qreview_status_",
+    "qreview_reason_",
+    "qreview_mark_",
+    "qreview_submit_",
 )
 
 
@@ -2459,6 +2481,393 @@ def remember_manual_upload(pdf_bytes):
     owner = sensitive_state_owner()
     if owner is not None and st.session_state.get("sensitive_state_owner") is None:
         st.session_state["sensitive_state_owner"] = owner
+
+
+def row_review_scope(row):
+    """Classroom rows carry server-bound assignment ids; everything else is manual.
+
+    A row without a trustworthy course/coursework binding is never treated as
+    classroom-authorized: it falls back to the manual document-provenance gate
+    and fails closed when no owned document matches (fail-closed direction).
+    """
+    if not isinstance(row, dict):
+        return None
+    if (isinstance(row.get("classroom_course_id"), str)
+            and row.get("classroom_course_id")
+            and isinstance(row.get("classroom_assignment_id"), str)
+            and row.get("classroom_assignment_id")):
+        return "classroom"
+    return "manual"
+
+
+def manual_document_provenance_verified(row):
+    """C6-B2 F-2 display gate: is this row's mark-scheme document owned here?
+
+    Read-only and offline: it proves that the exact document digest this row
+    was marked against (snapshot_context / last_manual_context, both derived
+    server-side from the real uploaded bytes) is still a manual grant of the
+    CURRENT authenticated teacher. It never mints or refreshes authorization
+    state, and a missing/foreign/evicted grant simply returns False so the
+    review controls stay disabled.
+    """
+    subject = authenticated_google_identity()
+    if subject is None or not isinstance(row, dict):
+        return False
+    digest = row.get("snapshot_context") or st.session_state.get(
+        "last_manual_context")
+    return teacher_authorization.manual_document_owned(
+        st.session_state, subject, digest)
+
+
+def reverify_classroom_review_access(row):
+    """C6-B2 F-1: privileged-decision re-verification against live listings.
+
+    Returns ``(binding, None)`` on success or ``(None, code)`` on any failure.
+    Called ONLY inside a question-review mutation (a teacher clicking approve/
+    correct/flag) — never during ordinary marking, rendering or read-only
+    browsing — so no extra Classroom request is added to those paths.
+
+    The fresh ``list_teacher_courses`` / ``list_assignments`` calls use THIS
+    authenticated teacher's own access token on the server side (never
+    browser-supplied metadata), which is what detects provider-side
+    revocation or assignment edits inside the cached-grant window. Any API
+    failure, missing token, missing row metadata, cross-course mismatch,
+    cross-teacher session, stale grant or changed revision fails closed.
+    """
+    subject = authenticated_google_identity()
+    if subject is None:
+        return None, "authentication_required"
+    if not isinstance(row, dict):
+        return None, "review_context_unavailable"
+    course_id = row.get("classroom_course_id")
+    coursework_id = row.get("classroom_assignment_id")
+    if (not isinstance(course_id, str) or not course_id
+            or not isinstance(coursework_id, str) or not coursework_id):
+        return None, "assignment_context_unavailable"
+    token = get_google_access_token()
+    if not token:
+        return None, "classroom_verification_unavailable"
+    try:
+        courses = list_teacher_courses(token)
+        assignments = list_assignments(token, course_id)
+    except Exception:
+        # Provider call failed at the decision boundary: fail closed.
+        return None, "classroom_verification_unavailable"
+    try:
+        binding = teacher_authorization.reverify_assignment_access(
+            st.session_state, subject, course_id=course_id,
+            coursework_id=coursework_id, trusted_courses=courses,
+            trusted_assignments=assignments)
+    except teacher_authorization.TeacherAuthorizationError as error:
+        return None, str(error) or "classroom_verification_unavailable"
+    return binding, None
+
+
+def owned_review_row(student_key):
+    """Find the live stored row for a review key the current owner can see.
+
+    Same fail-closed search as owned_review_key; question-review mutations use
+    it to re-derive every binding input server-side at decision time instead
+    of trusting values snapshotted into widget callback arguments.
+    """
+    owner = result_owner()
+    if owner is None or not isinstance(student_key, str) or not student_key:
+        return None
+    candidates = list(st.session_state.get("last_batch_results", []) or [])
+    for job in (st.session_state.get("classroom_jobs", {}) or {}).values():
+        result = (job or {}).get("last_result") or {}
+        candidates.extend(result.get("processed", []) or [])
+    for history in (st.session_state.get("previous_result_snapshots", {}) or {}).values():
+        candidates.extend(history or [])
+    for row in candidates:
+        if (isinstance(row, dict) and row.get("review_key") == student_key
+                and row.get("report_owner") == owner):
+            return row
+    return None
+
+
+def question_review_evidence_digest(row):
+    """Digest of the marking evidence (mark scheme + assignment) behind a row.
+
+    Classroom rows carry the job context digest (assignment, scheme bytes and
+    marking settings); manual rows fall back to the server-derived document
+    digest recorded at upload time. No browser-supplied value is ever used.
+    """
+    if not isinstance(row, dict):
+        return ""
+    for value in (row.get("classroom_context"), row.get("snapshot_context"),
+                  st.session_state.get("last_manual_context")):
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def question_review_binding(student_key, row, question_number):
+    """Bind one question decision to the exact evidence it reviewed.
+
+    Covers the pristine AI marks (never the override-adjusted display), the
+    marking-evidence digest, the row revision (Classroom resubmissions) and
+    the selected-question set, so a decision recorded against other evidence
+    can never be replayed. Returns None when trustworthy inputs are missing.
+    """
+    if not isinstance(row, dict) or row.get("review_key") != student_key:
+        return None
+    pristine = row.get("ai_result") or row.get("result") or {}
+    question = None
+    for candidate in pristine.get("questions", []):
+        if str(candidate.get("question_number", "")) == str(question_number):
+            question = candidate
+            break
+    if question is None or question.get("awarded_marks") is None:
+        return None
+    digest = question_review_evidence_digest(row)
+    if not digest:
+        return None
+    selection = row.get("selected_questions")
+    scope = row_review_scope(row) or "manual"
+    assignment = (str(row.get("classroom_course_id")) + "/"
+                  + str(row.get("classroom_assignment_id"))
+                  if scope == "classroom" else "manual")
+    return question_review.question_review_binding(
+        assignment_id=assignment,
+        student_id=str(student_key),
+        question_number=str(question_number),
+        variant=json.dumps(selection, sort_keys=True) if selection else "",
+        row_revision=str(row.get("revision") or ""),
+        ai_marks=[question.get("awarded_marks")],
+        scheme_digest=digest,
+    )
+
+
+def question_review_store():
+    return st.session_state.setdefault("question_review_decisions", {})
+
+
+def question_review_decision_key(student_key, question_number):
+    return str(student_key) + "::q" + str(question_number)
+
+
+def stored_question_review(student_key, question_number, row):
+    """Stored decision only while it still matches the current evidence.
+
+    Returns ``(decision, invalidated)``; a decision whose binding no longer
+    matches (resubmission, new mark scheme, new AI marks, changed selection)
+    is dropped for display and treated as never recorded.
+    """
+    decision = question_review_store().get(
+        question_review_decision_key(student_key, question_number))
+    if not isinstance(decision, dict):
+        return None, False
+    binding = question_review_binding(student_key, row, question_number)
+    if not question_review.binding_matches(decision.get("binding"), binding):
+        return None, True
+    return decision, False
+
+
+def record_question_review_event(row, student_key, question_number, action, binding):
+    """Append one bounded, read-only audit event for this review decision."""
+    events = st.session_state.setdefault("question_review_events", [])
+    events.append(question_review.make_review_event(
+        assignment_id=(str(row.get("classroom_assignment_id"))
+                       if row_review_scope(row) == "classroom" else "manual"),
+        student_id=str(student_key),
+        question_number=str(question_number),
+        action=str(action),
+        actor=str(sensitive_state_owner() or "unauthenticated"),
+        binding=binding or "",
+        timestamp=f"{time.time():.0f}",
+    ))
+    st.session_state["question_review_events"] = question_review.bounded_events(events)
+
+
+def _question_review_fail(code, question_number, detail=""):
+    st.session_state["question_review_notice"] = (code, str(question_number), detail)
+
+
+def apply_question_review_decision(student_key, question_number, action, reason,
+                                   corrected_mark):
+    """Record one teacher's question-level review decision (fail closed).
+
+    Every gate runs server-side at the mutation boundary: authenticated
+    identity, owner-verified row, trusted document provenance for manual
+    rows, and — for Classroom rows only — a fresh re-verification against
+    live Classroom listings (F-1). Mark corrections are written through the
+    existing save_teacher_override mechanism, so the single override system
+    stays authoritative, original AI marks are preserved and totals
+    recalculate with the existing rules.
+    """
+    st.session_state.pop("question_review_notice", None)
+    subject = authenticated_google_identity()
+    if subject is None:
+        return _question_review_fail("authentication_required", question_number)
+    row = owned_review_row(student_key)
+    if row is None or not row_owner_allowed(row) or row.get("review_key") != student_key:
+        return _question_review_fail("review_context_unavailable", question_number)
+    scope = row_review_scope(row)
+    if scope == "classroom":
+        _, code = reverify_classroom_review_access(row)
+        if code:
+            return _question_review_fail(code, question_number)
+    elif not manual_document_provenance_verified(row):
+        return _question_review_fail("manual_document_provenance_required",
+                                     question_number)
+    status = {"approve": "approved", "correct": "corrected",
+              "flag": "flagged"}.get(action)
+    if status is None:
+        return _question_review_fail("review_action_invalid", question_number)
+    pristine = row.get("ai_result") or row.get("result") or {}
+    question = next(
+        (item for item in pristine.get("questions", [])
+         if str(item.get("question_number", "")) == str(question_number)), None)
+    if question is None:
+        return _question_review_fail("review_question_unavailable", question_number)
+    corrected = None
+    if status == "corrected":
+        ok, code = question_review.validate_mark_value(
+            corrected_mark, question.get("max_marks"))
+        if not ok:
+            return _question_review_fail(code, question_number)
+        corrected = int(corrected_mark)
+    binding = question_review_binding(student_key, row, question_number)
+    if binding is None:
+        return _question_review_fail("review_binding_unavailable", question_number)
+    key = question_review_decision_key(student_key, question_number)
+    current = question_review_store().get(key)
+    if not isinstance(current, dict):
+        current = None
+    code, new_status, state = question_review.evaluate_question_review(
+        status=status, binding=binding,
+        corrected_marks=[corrected] if corrected is not None else None,
+        reason=reason,
+        prior_status=(current or {}).get("status"),
+        prior_binding=(current or {}).get("binding"))
+    if code != "ok":
+        return _question_review_fail(code, question_number)
+    if status == "corrected":
+        # Single override system: recalculates totals with existing rules and
+        # keeps the original AI marks in the override record.
+        save_teacher_override(student_key, str(question_number), corrected,
+                              (reason or "").strip())
+        if st.session_state.get("teacher_overrides", {}).get(
+                student_key, {}).get(str(question_number)) != corrected:
+            return _question_review_fail("override_write_rejected", question_number)
+    record = dict(state)
+    record["actor"] = str(sensitive_state_owner() or "unauthenticated")
+    record["updated_at"] = f"{time.time():.0f}"
+    question_review_store()[key] = record
+    record_question_review_event(row, student_key, question_number, status, binding)
+    _question_review_fail("ok", question_number, status)
+
+
+def save_question_review_from_widgets(student_key, question_number):
+    """Read submitted widget state; callback args are scalar snapshots only."""
+    status_key = f"qreview_status_{student_key}_{question_number}"
+    reason_key = f"qreview_reason_{student_key}_{question_number}"
+    mark_key = f"qreview_mark_{student_key}_{question_number}"
+    apply_question_review_decision(
+        student_key, question_number,
+        st.session_state.get(status_key, "approve"),
+        st.session_state.get(reason_key, ""),
+        st.session_state.get(mark_key))
+
+
+def render_question_review_summary(row, student_key, result):
+    """Read-only per-question review status table for one student."""
+    rows = []
+    pristine = row.get("ai_result") or row.get("result") or {}
+    ai_marks_by_number = {
+        str(item.get("question_number", "")): item.get("awarded_marks")
+        for item in pristine.get("questions", [])
+    }
+    for question in result.get("questions", []):
+        number = str(question.get("question_number", ""))
+        decision, invalidated = stored_question_review(student_key, number, row)
+        if decision:
+            status = str(decision.get("status", "unreviewed")).capitalize()
+        elif invalidated:
+            status = "Invalidated (evidence changed)"
+        else:
+            status = "Unreviewed"
+        rows.append({
+            "Question": number,
+            "AI marks": ai_marks_by_number.get(
+                number, question.get("awarded_marks")),
+            "Displayed marks": question.get("awarded_marks"),
+            "Max": question.get("max_marks"),
+            "Review status": status,
+            "Reason": (decision or {}).get("reason", ""),
+        })
+    if any(item["Review status"] != "Unreviewed" for item in rows):
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def render_question_review_block(row, student_key, question):
+    """Teacher review controls for one question inside its expander.
+
+    Rendering is read-only: no Classroom request is made here. The live
+    Classroom re-verification happens only inside the mutation handler when
+    the teacher submits a decision.
+    """
+    if not student_key or not isinstance(row, dict):
+        return
+    number = str(question.get("question_number", ""))
+    decision, invalidated = stored_question_review(student_key, number, row)
+    st.markdown("**🧑‍🏫 Teacher question review**")
+    if invalidated:
+        st.warning(
+            "A previous review decision for this question was invalidated "
+            "because the marking evidence (marks, document or submission "
+            "revision) changed. Review it again before trusting the score.")
+    if decision:
+        st.caption(
+            f"Recorded decision: {decision.get('status')} by the signed-in "
+            f"teacher." + (f" Reason: {decision.get('reason')}"
+                           if decision.get("reason") else ""))
+    elif not invalidated:
+        st.caption("No teacher decision recorded for this question yet.")
+    status_key = f"qreview_status_{student_key}_{number}"
+    reason_key = f"qreview_reason_{student_key}_{number}"
+    mark_key = f"qreview_mark_{student_key}_{number}"
+    st.radio(
+        "Decision",
+        ["approve", "correct", "flag"],
+        key=status_key,
+        horizontal=True,
+        format_func=lambda value: {
+            "approve": "Approve AI marks",
+            "correct": "Correct marks",
+            "flag": "Flag for re-mark",
+        }[value],
+    )
+    st.text_input(
+        "Reason (required to correct marks or flag)",
+        key=reason_key,
+    )
+    if st.session_state.get(status_key, "approve") == "correct":
+        st.number_input(
+            "Corrected marks",
+            min_value=0,
+            max_value=int(question.get("max_marks") or 0),
+            value=int(question.get("awarded_marks") or 0),
+            step=1,
+            key=mark_key,
+        )
+    st.caption(
+        "Corrections are recorded as session-only teacher overrides with the "
+        "original AI marks preserved; they are never official Pearson marks.")
+    st.button(
+        "Submit question review",
+        key=f"qreview_submit_{student_key}_{number}",
+        on_click=save_question_review_from_widgets,
+        args=(student_key, number),
+    )
+    notice = st.session_state.get("question_review_notice")
+    if isinstance(notice, tuple) and len(notice) == 3 and notice[1] == number:
+        code, _, detail = notice
+        if code == "ok":
+            st.success(f"Review decision recorded: {detail}.")
+        else:
+            st.error("Review decision was rejected: " + code)
 
 
 def row_owner_allowed(row):
@@ -3313,6 +3722,12 @@ def run_classroom_marking_job(
                     reviewed = new_review_row(row, "classroom", owner=report_owner)
                     reviewed["revision"] = revisions[row["submission_id"]]
                     reviewed["is_current"] = True
+                    # C6-B2 F-1: server-derived assignment binding, recorded
+                    # once at marking time from the trusted listing that
+                    # selected this coursework (never browser-supplied).
+                    reviewed["classroom_course_id"] = str(course_id)
+                    reviewed["classroom_assignment_id"] = str(coursework.get("id", ""))
+                    reviewed["classroom_context"] = str(document_context or "")
                     processed.append(reviewed)
     
                     # Failed/skipped work remains retryable on the next check.
@@ -4397,6 +4812,7 @@ with st.expander("🎓 Google Classroom — automatic marking & grade return", e
                                                     row["student"], row["result"], row["totals"],
                                                     row["groups"], row["marking_model"], row["audit_model"],
                                                     student_key=student_key if details["is_current"] else None,
+                                                    review_row=row if details["is_current"] else None,
                                                 )
                             elif last_result:
                                 st.info(last_result["message"])
@@ -4849,6 +5265,7 @@ if "last_batch_results" in st.session_state:
                     r["marking_model"],
                     r["audit_model"],
                     student_key=r["review_key"],
+                    review_row=r,
                 )
 
                 st.download_button(

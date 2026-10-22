@@ -43,6 +43,17 @@ class ServerIdentity:
     owner: str
     session_nonce: str
     assignment_revision: str | None = None
+    # C6-B2 F-2: for a manual-review scope the verifier may additionally
+    # vouch for ONE exact document (SHA-256 of bytes it independently owns).
+    # A digest-bearing identity is only ever produced by the trusted verifier
+    # when it could prove session-owned document provenance.
+    document_digest: str | None = None
+
+
+def _sha256_hex(value):
+    """Strict lowercase SHA-256 hex check (no regex dependency)."""
+    return (type(value) is str and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -68,12 +79,28 @@ class ApprovalAuthority:
         self._reviews = {}
         self._revoked = False
 
-    def _identity_for(self, assignment_id):
+    def _identity_for(self, assignment_id, document_digest=None):
         if self._revoked or (assignment_id is not None
                              and not identifier(assignment_id)):
             raise AuthorizationError("authorization_unavailable")
+        if document_digest is not None:
+            # C6-B2 F-2: a document digest only makes sense for the manual
+            # (no fabricated assignment) scope, and only in strict form.
+            if assignment_id is not None:
+                raise AuthorizationError("document_provenance_scope_mismatch")
+            if not _sha256_hex(document_digest):
+                raise AuthorizationError("document_digest_required")
         try:
-            identity = self._verify(assignment_id)
+            if document_digest is None:
+                identity = self._verify(assignment_id)
+            else:
+                identity = self._verify(assignment_id,
+                                        document_digest=document_digest)
+        except AuthorizationError:
+            # C6-B1 F2: specific refusal codes from the trusted verifier
+            # survive the boundary; only unexpected failures collapse to the
+            # content-free generic code.
+            raise
         except Exception:
             raise AuthorizationError("authorization_unavailable") from None
         if (type(identity) is not ServerIdentity or not identifier(identity.owner)
@@ -83,14 +110,20 @@ class ApprovalAuthority:
             raise AuthorizationError("verified_assignment_revision_required")
         if assignment_id is None and identity.assignment_revision is not None:
             raise AuthorizationError("manual_scope_revision_mismatch")
+        if document_digest is not None and identity.document_digest != document_digest:
+            # C6-B2 F-2: the verifier must independently prove THAT digest;
+            # a caller-supplied digest alone proves nothing.
+            raise AuthorizationError("document_provenance_unverified")
         return identity
 
-    def _current_identity(self, assignment_id):
+    def _current_identity(self, assignment_id, document_digest=None):
         """Best-effort re-verification for pruning; None when unusable."""
         if self._revoked:
             return None
         try:
-            identity = self._verify(assignment_id)
+            identity = self._identity_for(assignment_id, document_digest)
+        except AuthorizationError:
+            return None
         except Exception:
             return None
         return identity if type(identity) is ServerIdentity else None
@@ -125,9 +158,23 @@ class ApprovalAuthority:
             binding = entry.get("binding") if type(entry) is dict else None
             assignment_id = (binding.get("assignment_id")
                              if type(binding) is dict else None)
-            if (type(entry) is not dict
-                    or self._current_identity(assignment_id) != entry.get("identity")):
+            if type(entry) is not dict:
                 superseded.append(review_id)
+                continue
+            if self._current_identity(assignment_id) != entry.get("identity"):
+                superseded.append(review_id)
+                continue
+            if assignment_id is None:
+                # C6-B2 F-2: a manual-scope binding additionally re-verifies
+                # the EXACT document digest it was registered with; a grant
+                # that was evicted (or a foreign/malformed digest) can no
+                # longer re-verify, so the review entry is dropped. Removal is
+                # permanent: a pruned entry can never be looked up again.
+                digest = binding.get("document_digest")
+                proven = (self._current_identity(None, document_digest=digest)
+                          if _sha256_hex(digest) else None)
+                if proven is None or proven.document_digest != digest:
+                    superseded.append(review_id)
         for review_id in superseded:
             del self._reviews[review_id]
 

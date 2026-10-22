@@ -1527,6 +1527,18 @@ def bind_scheme_review(record, authorization, *, review_id, document_digest):
         _approval_error("document_digest_required")
     if record.get("assignment_id") != authorization.assignment_id:
         _approval_error("assignment_mismatch")
+    if authorization.assignment_id is None:
+        # C6-B2 F-2: manual-scope bindings must prove server-side document
+        # provenance. The digest passed here is re-verified through the
+        # authority's trusted verifier, which only vouches for digests of
+        # documents this session owns (computed from the real uploaded bytes).
+        # Direct calls with an arbitrary/forged/foreign digest are refused,
+        # so public or UI-reachable code cannot mint privileged bindings.
+        try:
+            authorization._authority._identity_for(
+                None, document_digest=document_digest)
+        except AuthorizationError as exc:
+            raise SchemeReviewApprovalError(str(exc)) from None
     if "approval_binding" in record or record["teacher"] != {
             "status": determine_status(record), "approved_by": None,
             "approved_revision": None}:
@@ -1592,6 +1604,17 @@ def _bound_review(record, authorization):
             or record.get("assignment_id") != authorization.assignment_id
             or entry["identity"] != authorization._identity):
         _approval_error("review_authorization_mismatch")
+    if authorization.assignment_id is None:
+        # C6-B2 F-2: stored approval metadata is never proof of provenance.
+        # At EVERY approval use (approve/reject/resolve/display) the bound
+        # document digest must still be session-owned: manual-grant eviction,
+        # a foreign session or a mismatched digest invalidates the effective
+        # approval instead of silently degrading to "any owned document".
+        try:
+            authorization._authority._identity_for(
+                None, document_digest=binding.get("document_digest"))
+        except AuthorizationError as exc:
+            raise SchemeReviewApprovalError(str(exc)) from None
     if entry["snapshot"] != _snapshot(record):
         _approval_error("review_content_changed")
     if record["teacher"] != (entry["decision"] or entry["initial_teacher"]):

@@ -39,9 +39,14 @@ DOCUMENTED LIMITATIONS (not silently claimed away)
   malformed-state recovery — not at cookie-refresh boundaries.
 - Grants are session-cached with a bounded trust window (GRANT_MAX_AGE_*
   seconds). Provider-side revocation (e.g. a teacher removed from a course
-  between listing refreshes) cannot be detected offline; privileged scheme
-  approval has NO user interface in C6-B1, and C6-B2 must decide whether the
-  trust window is acceptable or re-verification per approval is required.
+  between listing refreshes) cannot be detected offline. C6-B2 resolved this
+  for privileged decisions: every newly exposed privileged action (question-
+  level review mutations on Classroom results) must call
+  ``reverify_assignment_access`` with FRESH server-fetched listings at the
+  decision boundary, which fails closed on revocation, missing metadata or a
+  changed assignment revision. Cached grants alone never authorize a
+  privileged decision, and no extra provider request is made during ordinary
+  marking or read-only browsing.
 """
 import hashlib
 import json
@@ -328,6 +333,100 @@ def remember_classroom_grants(state, current_subject, courses, course_id,
     return session
 
 
+def manual_document_owned(state, current_subject, document_digest):
+    """Read-only C6-B2 F-2 provenance check for one exact document digest.
+
+    Returns True only when the stored, well-formed authorization state is for
+    THIS authenticated subject and ``document_digest`` is a manual grant owned
+    by that subject. Never mints, refreshes, evicts or revokes any state, so
+    it is safe to call from display paths; the authoritative enforcement
+    remains the verifier inside every privileged approval call.
+    """
+    if not identifier(current_subject):
+        return False
+    if (type(document_digest) is not str or len(document_digest) != 64
+            or any(char not in "0123456789abcdef" for char in document_digest)):
+        return False
+    stored = _stored(state)
+    if type(stored) is not dict or not _state_shape_valid(stored):
+        return False
+    if stored["subject"] != current_subject:
+        return False
+    grant = stored.get("manual_grants", {}).get(document_digest)
+    return type(grant) is dict and grant.get("owner") == _owner(current_subject)
+
+
+def reverify_assignment_access(state, current_subject, *, course_id,
+                               coursework_id, trusted_courses,
+                               trusted_assignments):
+    """C6-B2 F-1: privileged-decision re-verification with FRESH listings.
+
+    Call this ONLY at a privileged decision boundary (never during ordinary
+    marking or read-only browsing). ``trusted_courses`` and
+    ``trusted_assignments`` must be the raw responses of server-side calls
+    made with THIS authenticated teacher's own token just now —
+    ``list_teacher_courses(token)`` (teacherId=me) and
+    ``list_assignments(token, course_id)`` — not a cache and never a
+    browser-supplied value. The provider call itself is the caller's
+    responsibility; this function performs no network I/O.
+
+    Verified and bound to the exact teacher, course and coursework:
+    - the course still appears in the fresh teacher listing (revocation of
+      teacher access is detected even inside a cached-grant window),
+    - the coursework still appears in the fresh published listing as an
+      ASSIGNMENT and its metadata still yields a revision,
+    - an owned grant exists for exactly this course/coursework pair,
+    - the grant's revision equals the freshly computed revision (any
+      assignment edit since the grant is rejected, not silently accepted),
+    - the grant is inside its trust window.
+
+    Returns the decision binding
+    ``{owner, course_id, coursework_id, assignment_key, revision, verified_at}``.
+    Every failure raises a content-free ``TeacherAuthorizationError`` (fail
+    closed) so callers must refuse the privileged action.
+    """
+    session = _require_session(state, current_subject)
+    if not identifier(course_id) or not identifier(coursework_id):
+        raise TeacherAuthorizationError("assignment_access_unverified")
+    if not isinstance(trusted_courses, (list, tuple)) \
+            or not isinstance(trusted_assignments, (list, tuple)):
+        # Listings missing/failed at the decision boundary: fail closed.
+        raise TeacherAuthorizationError("classroom_verification_unavailable")
+    trusted = {course.get("id") for course in trusted_courses
+               if type(course) is dict and identifier(course.get("id"))}
+    if course_id not in trusted:
+        # Teacher no longer listed for this course (revoked or foreign).
+        raise TeacherAuthorizationError("course_access_unverified")
+    coursework = None
+    for item in trusted_assignments:
+        if (type(item) is dict and item.get("id") == coursework_id
+                and item.get("workType") == "ASSIGNMENT"):
+            coursework = item
+            break
+    if coursework is None:
+        raise TeacherAuthorizationError("assignment_access_unverified")
+    # Raises "assignment_metadata_required" when provider metadata is
+    # unusable — never fabricates a revision.
+    revision = assignment_revision(course_id, coursework)
+    assignment_key = course_id + "/" + coursework_id
+    grant = session["assignment_grants"].get(assignment_key)
+    if (type(grant) is not dict or grant.get("owner") != _owner(current_subject)
+            or grant.get("course_id") != course_id
+            or grant.get("work_id") != coursework_id):
+        raise TeacherAuthorizationError("assignment_access_unverified")
+    if grant.get("revision") != revision:
+        # The assignment changed after it was verified (stale binding).
+        raise TeacherAuthorizationError("assignment_revision_changed")
+    verified_at = grant.get("verified_at")
+    if (not _finite_number(verified_at)
+            or session["_clock"]() - verified_at
+            > ASSIGNMENT_GRANT_MAX_AGE_SECONDS):
+        raise TeacherAuthorizationError("assignment_grant_expired")
+    return {"owner": _owner(current_subject), "course_id": course_id,
+            "coursework_id": coursework_id, "assignment_key": assignment_key,
+            "revision": revision, "verified_at": session["_clock"]()}
+
+
 def record_manual_pdf_grant(state, current_subject, pdf_bytes):
     """Register the actual uploaded PDF bytes as this session's manual document.
 
@@ -389,15 +488,34 @@ def _verifier(state, subject, nonce, clock):
     grant for the requested assignment/manual document still exists, is owned
     by this subject and is fresh. Any failure raises, which the C6-A boundary
     converts into a fail-closed refusal.
+
+    C6-B2 F-2: when the caller requests document provenance
+    (``document_digest``), the verifier vouches only for THAT exact digest,
+    and only when it is a session-owned manual grant. The digest is always
+    derived server-side from real bytes by ``record_manual_pdf_grant``; a
+    caller-supplied string without a matching grant is refused.
     """
-    def verify(assignment_id):
+    def verify(assignment_id, *, document_digest=None):
         if state.get("subject") != subject or state.get("nonce") != nonce:
             raise TeacherAuthorizationError("session_identity_changed")
         created = state.get("created_at")
         if not _finite_number(created) or clock() - created > SESSION_MAX_AGE_SECONDS:
             raise TeacherAuthorizationError("session_expired")
+        if document_digest is not None and assignment_id is not None:
+            # Document provenance exists only for manual review scope.
+            raise TeacherAuthorizationError("document_provenance_scope_mismatch")
         if assignment_id is None:
-            return _manual_identity(state, subject, nonce)
+            identity = _manual_identity(state, subject, nonce)
+            if document_digest is None:
+                return identity
+            grant = state.get("manual_grants", {}).get(document_digest)
+            if type(grant) is not dict or grant.get("owner") != _owner(subject):
+                # C6-B2 F-2: "some owned document" is no longer enough —
+                # the EXACT bound digest must still be owned by this session
+                # (eviction, foreign session or forged digest fails here).
+                raise TeacherAuthorizationError(
+                    "manual_document_provenance_required")
+            return ServerIdentity(_owner(subject), nonce, None, document_digest)
         return _assignment_identity(state, subject, nonce, assignment_id)
     return verify
 
