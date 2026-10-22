@@ -363,8 +363,21 @@ class EvidenceMappingTests(unittest.TestCase):
 
 class ApprovalStateTests(unittest.TestCase):
     def setUp(self):
-        from scheme_authorization import ApprovalAuthority, ServerIdentity
-        self.authority = ApprovalAuthority(lambda assignment: ServerIdentity("teacher-a", "login-a"))
+        from scheme_authorization import (
+            ApprovalAuthority, AuthorizationError, ServerIdentity)
+
+        # C6-B2 F-2: manual-scope provenance contract — the trusted verifier
+        # vouches only for the exact session-owned synthetic document digest
+        # ("a" * 64) and refuses anything else through the real authority.
+        def verify(assignment, document_digest=None):
+            if document_digest is not None:
+                if document_digest != "a" * 64:
+                    raise AuthorizationError("document_provenance_unverified")
+                return ServerIdentity("teacher-a", "login-a", None,
+                                      document_digest)
+            return ServerIdentity("teacher-a", "login-a")
+
+        self.authority = ApprovalAuthority(verify)
         self.authorization = self.authority.authorize(None)
 
     def context(self, record):

@@ -23,6 +23,7 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import document_pipeline as documents
+import question_review
 import scheme_review
 import teacher_authorization
 
@@ -33,6 +34,7 @@ def load_app():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     scope = dict(documents=documents, scheme_review=scheme_review,
                  teacher_authorization=teacher_authorization,
+                 question_review=question_review,
                  ast=ast, io=io, json=json, os=os, re=re,
                  tempfile=tempfile, time=time, copy=copy, hashlib=hashlib, uuid=uuid,
                  ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed,

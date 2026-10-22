@@ -25,9 +25,19 @@ def review(*, assignment="assignment-a", certainty="explicit", maximum=1):
 class AuthorizationTests(unittest.TestCase):
     def setUp(self):
         self.identity = ServerIdentity("teacher-a", "session-a", "assignment-v1")
-        self.authority = ApprovalAuthority(lambda assignment: (
-            self.identity if assignment is not None or self.identity is None
-            else replace(self.identity, assignment_revision=None)))
+        # C6-B2 F-2: the synthetic verifier also vouches for manual-scope
+        # document provenance, but only for the exact digest used below.
+        def verify(assignment, document_digest=None):
+            if document_digest is not None:
+                if document_digest != "a" * 64:
+                    raise AuthorizationError(
+                        "document_provenance_unverified")
+                return replace(self.identity, assignment_revision=None,
+                               document_digest=document_digest)
+            if assignment is not None or self.identity is None:
+                return self.identity
+            return replace(self.identity, assignment_revision=None)
+        self.authority = ApprovalAuthority(verify)
         self.context = self.authority.authorize("assignment-a")
         self.record = review()
         self.bind(self.record)
