@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Syntax validation
-        run: python -m py_compile app5_1_automated.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py
+        run: python -m py_compile app5_1_automated.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py scheme_review.py
       - name: Install offline PDF and symbolic benchmark dependencies
         # Patch pip first (pip itself carries advisories between releases),
         # then install the single complete test manifest from tests/.
@@ -53,10 +53,16 @@ jobs:
         run: python tests/benchmark_deadline_recovery.py
       - name: Offline gemini rate-limit gate benchmark
         run: python tests/benchmark_gemini_limits.py
+      - name: Offline scheme review benchmark
+        run: python tests/benchmark_scheme_review.py
       - name: Run marking regression tests
         run: python -m unittest discover -s tests -p 'test_*.py' -v
       - name: Run offline accuracy evaluator regression tests
         run: python -m unittest investigation.test_accuracy_regression -v
+      - name: Run offline scheme-review eval regression tests
+        run: python -m unittest investigation.test_scheme_review_eval -v
+      - name: Run C5 consolidation differential gate
+        run: python -m unittest investigation.test_c5_consolidation_differential -v
 
   streamlit-ui-tests:
     runs-on: ubuntu-latest
@@ -64,15 +70,18 @@ jobs:
     strategy:
       matrix:
         include:
+          # Pillow 13.0.0 (dependency-audit CVE fix) is unresolvable with
+          # streamlit <=1.66.0, which caps pillow<13; 1.66.1 (pillow<14) is
+          # the first release inside the requirements window that admits it.
           - python: '3.11'
             sdk: '1.40.0'
-            streamlit: '1.65.0'
+            streamlit: '1.66.1'
           - python: '3.14'
             sdk: '2.30.1'
-            streamlit: '1.65.0'
+            streamlit: '1.66.1'
           - python: '3.14'
             sdk: '2.31.0'
-            streamlit: '1.66.0'
+            streamlit: '1.66.1'
     steps:
       - name: Check out repository
         # v4.3.1 (full commit SHA; supply-chain pin, S5 F-11)

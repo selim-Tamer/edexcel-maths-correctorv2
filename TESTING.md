@@ -119,10 +119,13 @@ out of browser inputs. Result reconciliation uses the complete successful
 turned-in listing, including when there are no new submissions to mark. A failed
 listing does not remove or relabel history.
 
-A separate CI job installs Streamlit 1.65.0 and runs real widget lifecycle tests:
+A separate CI job installs Streamlit 1.66.1 and runs real widget lifecycle tests:
 
-    python -m pip install streamlit==1.65.0
+    python -m pip install streamlit==1.66.1
     python -m unittest discover -s tests/ui -p 'test_*.py' -v
+
+(1.66.1 is the first release in the requirements window that admits the
+CVE-fixed Pillow 13.0.0 pin: streamlit <=1.66.0 caps `pillow<13`.)
 
 These tests use AppTest, the production report block and synthetic session data.
 They submit edited marks/reasons together with the Apply button, check approval

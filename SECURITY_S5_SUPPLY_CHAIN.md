@@ -13,9 +13,9 @@ Base commit: `da2521809e3e23d664a6920cfca5b0f3a52f0f08` (merge of PR #29).
 | google-genai | `>=1.40,<3` | Gemini SDK | yes | — |
 | pandas | `>=2.0,<4` | report tables | yes | Streamlit (floor `>=1.4.0`) |
 | requests | `>=2.31,<3` | Classroom/Drive REST transport, bounded downloads | yes | google-genai, streamlit |
-| pypdf | `==6.20.1` | untrusted-PDF metadata/limits (S3) | yes (lazy import in `document_limits.py`) | — |
+| pypdf | `==6.21.1` | untrusted-PDF metadata/limits (S3) | yes (lazy import in `document_limits.py`) | — |
 | pypdfium2 | `==5.14.0` | PDF rendering (PDFium) | yes (`local_pdf.py`) | — |
-| Pillow | `==12.3.0` | image decoding surface | no direct import | Streamlit (floor `>=7.1.0`), pypdfium2 image export |
+| Pillow | `==13.0.0` | image decoding surface | no direct import | Streamlit (floor `>=7.1.0`), pypdfium2 image export |
 
 Development-only: `reportlab==5.0.1` (synthetic fixtures) and `sympy==1.14.0`
 (offline verification research/benchmarks) in `tests/pdf-requirements.txt`.
@@ -42,6 +42,11 @@ Audited 2026-10-20 from this repo, `--strict`:
 
 No finding required a package upgrade; the PDF stack pins remain unchanged
 and no S3/S4 limits or Gemini policy are altered.
+(2026-10-22, PR #42: superseded — the dependency-audit job reported
+CVE-2026-113786 in pypdf 6.20.1 and 24 advisories in Pillow 12.3.0, so both
+pins were bumped to the fixed versions in the inventory above; streamlit
+1.66.1 replaced 1.65.0/1.66.0 in the CI matrix because only 1.66.1 caps
+`pillow<14`.)
 
 ## GitHub Actions hardening (F-11)
 
