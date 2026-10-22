@@ -77,6 +77,28 @@ class SchemeReviewPanelTests(unittest.TestCase):
         self.assertEqual(published["ack_state"], "recorded")
         self.assertFalse(app.checkbox[0].value)
 
+    def test_checkbox_does_not_clear_blockers_approve_scheme_or_publish_grades(self):
+        script = bootstrap("teacher-a-subject") + """
+review = f["scheme_review_for_info"](({'1a!': 2}, {}, None))
+st.caption(json.dumps({
+    "approval_boundary": True,
+    "status": f["scheme_review"].review_summary(review)["status"],
+    "unresolved": len(f["scheme_review"].unresolved_findings(review)),
+    "result_approvals": bool(st.session_state.get("classroom_grade_approvals")),
+    "overrides": bool(st.session_state.get("teacher_overrides")),
+}))
+"""
+        app = AppTest.from_string(script, default_timeout=20).run()
+        app.checkbox[0].check().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(app.checkbox[0].value)
+        published = self.publish(app, needle="approval_boundary")
+        self.assertEqual(published["status"], "NEEDS_TEACHER_REVIEW")
+        self.assertGreater(published["unresolved"], 0)
+        self.assertFalse(published["result_approvals"])
+        self.assertFalse(published["overrides"])
+        self.assertTrue(app.warning)
+
     def test_logout_clears_scheme_review_acknowledgements(self):
         script = bootstrap("teacher-a-subject") + """
 f["invalidate_sensitive_state"]()
