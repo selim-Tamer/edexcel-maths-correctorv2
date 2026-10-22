@@ -1500,7 +1500,15 @@ def _snapshot(record):
         if len(encoded) > MAX_SERIALIZED_CHARS * 3:
             _approval_error("review_snapshot_too_large")
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except SchemeReviewApprovalError:
+        # F2: SchemeReviewApprovalError subclasses ValueError; without this
+        # clause every intentional refusal raised inside the try would be
+        # swallowed by the broad handler below and re-raised under the wrong
+        # diagnostic code (e.g. review_snapshot_too_large -> invalid_review_record).
+        raise
     except (TypeError, ValueError, RecursionError):
+        # Serialization failures on corrupted/non-finite records still fail
+        # closed under the generic code.
         _approval_error("invalid_review_record")
 
 
@@ -1543,9 +1551,20 @@ def bind_scheme_review(record, authorization, *, review_id, document_digest):
         questions = record["extracted"]["questions"]
         if not questions or any(not q["criteria"] for q in questions):
             _approval_error("full_review_required")
-    except (KeyError, TypeError, ValueError, RecursionError):
+    except SchemeReviewApprovalError:
+        # F2: keep the specific refusal code (exact_mark_allocations_required,
+        # full_review_required, ...) instead of relabelling it as a generic
+        # revalidation failure; SchemeReviewApprovalError IS a ValueError.
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+        # Genuinely corrupted records still fail closed under the generic code.
         _approval_error("review_revalidation_failed")
     registry = authorization._authority._reviews
+    if review_id in registry or len(registry) >= 100:
+        # F3: superseded review entries (identity no longer re-verifies) must
+        # not permanently consume the registry capacity; pruning can never
+        # revive them because a removed entry can no longer be looked up.
+        authorization._authority.prune_superseded()
     if review_id in registry or len(registry) >= 100:
         _approval_error("fresh_review_identity_required")
     binding = {"owner": owner, "assignment_id": authorization.assignment_id,
