@@ -362,6 +362,18 @@ class EvidenceMappingTests(unittest.TestCase):
 
 
 class ApprovalStateTests(unittest.TestCase):
+    def setUp(self):
+        from scheme_authorization import ApprovalAuthority, ServerIdentity
+        self.authority = ApprovalAuthority(lambda assignment: ServerIdentity("teacher-a", "login-a"))
+        self.authorization = self.authority.authorize(None)
+
+    def context(self, record):
+        if "approval_binding" not in record:
+            sr.bind_scheme_review(record, self.authorization,
+                                  review_id="review-" + str(len(self.authority._reviews)),
+                                  document_digest="a" * 64)
+        return self.authorization
+
     def clean_record(self):
         payload = {"questions": [{"question_number": "1", "max_marks": 1,
                                   "criteria": [
@@ -378,36 +390,37 @@ class ApprovalStateTests(unittest.TestCase):
 
     def test_clean_scheme_can_be_teacher_approved_once(self):
         record = self.clean_record()
-        sr.approve_scheme_review(record, "teacher-a", record["scheme_revision"])
+        sr.approve_scheme_review(record, self.context(record), record["scheme_revision"])
         self.assertEqual(record["teacher"]["status"], "TEACHER_APPROVED")
-        state, reason = sr.approval_state(record, "teacher-a",
+        state, reason = sr.approval_state(record, self.authorization,
                                           record["scheme_revision"])
         self.assertEqual(state, "approved")
         self.assertEqual(record["teacher"]["approved_by"], "teacher-a")
 
     def test_different_teacher_cannot_inherit_approval(self):
         record = self.clean_record()
-        sr.approve_scheme_review(record, "teacher-a", record["scheme_revision"])
+        sr.approve_scheme_review(record, self.context(record), record["scheme_revision"])
         state, reason = sr.approval_state(record, "teacher-b",
                                           record["scheme_revision"])
-        self.assertEqual(state, "different_teacher")
+        self.assertEqual(state, "invalid")
 
     def test_stale_revision_invalidates_approval(self):
         record = self.clean_record()
         revision = record["scheme_revision"]
-        sr.approve_scheme_review(record, "teacher-a", revision)
+        sr.approve_scheme_review(record, self.context(record), revision)
         changed = json.loads(json.dumps(record))
         changed["scheme_revision"] = "new-revision"
-        state, reason = sr.approval_state(changed, "teacher-a", revision)
-        self.assertEqual(state, "stale_revision")
-        self.assertEqual(reason, "scheme_revision_changed")
+        state, reason = sr.approval_state(changed, self.authorization, revision)
+        self.assertEqual(state, "invalid")
+        self.assertEqual(reason, "review_content_changed")
 
     def test_approval_blocked_on_unresolved_findings(self):
-        payload = {"questions": [{"question_number": "1", "max_marks": 5,
-                                  "criteria": [criterion("a", "M1", 1)]}]}
-        record = sr.build_review(payload)
+        inputs = self.clean_record()["approval_inputs"]
+        inputs["interpretation"]["questions"][0]["max_marks"] = 5
+        record = sr.build_review(**inputs)
+        context = self.context(record)
         with self.assertRaises(sr.SchemeReviewApprovalError) as error:
-            sr.approve_scheme_review(record, "teacher-a",
+            sr.approve_scheme_review(record, context,
                                      record["scheme_revision"])
         self.assertIn("unresolved_finding", str(error.exception))
 
@@ -421,25 +434,25 @@ class ApprovalStateTests(unittest.TestCase):
         record = sr.build_review(payload, evidence_document=document,
                                  question_mapping=mapping)
         with self.assertRaises(sr.SchemeReviewApprovalError):
-            sr.approve_scheme_review(record, "teacher-a",
+            sr.approve_scheme_review(record, self.context(record),
                                      record["scheme_revision"])
-        # Teacher explicitly resolves, after which approval is possible.
-        sr.resolve_findings(record, [f["finding_id"] for f in
-                                     sr.unresolved_findings(record)],
-                            "teacher-a")
-        sr.approve_scheme_review(record, "teacher-a", record["scheme_revision"])
-        self.assertEqual(record["teacher"]["status"], "TEACHER_APPROVED")
+        # Source faults require correction and revalidation, never a waiver.
+        context = self.context(record)
+        with self.assertRaises(sr.SchemeReviewApprovalError):
+            sr.resolve_findings(record, [f["finding_id"] for f in
+                                         sr.unresolved_findings(record)], context)
+        self.assertNotEqual(record["teacher"]["status"], "TEACHER_APPROVED")
 
     def test_new_findings_after_approval_reopen_review(self):
         record = self.clean_record()
-        sr.approve_scheme_review(record, "teacher-a", record["scheme_revision"])
+        sr.approve_scheme_review(record, self.context(record), record["scheme_revision"])
         extra = sr._finding("TOTAL_MISMATCH", "C5-total", question_number="9",
                             severity="high", state=sr.C2_VERIFIED)
         record["verified"]["findings"].append(extra)
-        state, reason = sr.approval_state(record, "teacher-a",
+        state, reason = sr.approval_state(record, self.authorization,
                                           record["scheme_revision"])
-        self.assertEqual(state, "stale_revision")
-        self.assertEqual(reason, "new_findings_after_approval")
+        self.assertEqual(state, "invalid")
+        self.assertEqual(reason, "review_content_changed")
 
     def test_anonymous_identifiers_cannot_approve(self):
         record = self.clean_record()
@@ -450,12 +463,17 @@ class ApprovalStateTests(unittest.TestCase):
     def test_genuine_confinders_cannot_be_waived_without_teacher(self):
         payload = {"questions": [{"question_number": "1", "max_marks": 2,
                                   "criteria": [
-                                      criterion("a", "M1", 1),
+                                      criterion("a", "M1", 1, source_page=2,
+                                                source_evidence="B1 shown"),
                                       criterion("b", "A1", 1,
-                                                dependencies=["nothere"])]}]}
-        record = sr.build_review(payload)
-        with self.assertRaises(sr.SchemeReviewApprovalError):
-            sr.approve_scheme_review(record, "teacher-a",
+                                                dependencies=["nothere"], source_page=2,
+                                                source_evidence="B1 shown")]}]}
+        inputs = self.clean_record()["approval_inputs"]
+        inputs["interpretation"] = payload
+        record = sr.build_review(**inputs)
+        context = self.context(record)
+        with self.assertRaisesRegex(sr.SchemeReviewApprovalError, "unresolved_finding"):
+            sr.approve_scheme_review(record, context,
                                      record["scheme_revision"])
 
     def test_assisted_findings_block_certification(self):
@@ -468,7 +486,7 @@ class ApprovalStateTests(unittest.TestCase):
         self.assertEqual(outcome, "completed")
         sr.apply_assisted_findings(record, findings, outcome)
         with self.assertRaises(sr.SchemeReviewApprovalError) as error:
-            sr.approve_scheme_review(record, "teacher-a",
+            sr.approve_scheme_review(record, self.context(record),
                                      record["scheme_revision"])
         self.assertIn("assisted_review_unresolved", str(error.exception))
 
@@ -476,7 +494,7 @@ class ApprovalStateTests(unittest.TestCase):
         record = self.clean_record()
         sr.apply_assisted_outcome(record, "timeout")
         with self.assertRaises(sr.SchemeReviewApprovalError):
-            sr.approve_scheme_review(record, "teacher-a",
+            sr.approve_scheme_review(record, self.context(record),
                                      record["scheme_revision"])
         # A clean completed no-findings assisted pass never blocks.
         other = self.clean_record()
@@ -485,7 +503,7 @@ class ApprovalStateTests(unittest.TestCase):
                 json.dumps({"findings": []})))
         self.assertEqual(outcome, "completed_no_findings")
         sr.apply_assisted_findings(other, findings, outcome)
-        sr.approve_scheme_review(other, "teacher-a", other["scheme_revision"])
+        sr.approve_scheme_review(other, self.context(other), other["scheme_revision"])
         self.assertEqual(other["teacher"]["status"], "TEACHER_APPROVED")
 
 
