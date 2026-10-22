@@ -24,13 +24,16 @@ from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import document_pipeline as documents
 import scheme_review
+import teacher_authorization
 
 SOURCE = Path(__file__).resolve().parents[1] / "app5_1_automated.py"
 
 
 def load_app():
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
-    scope = dict(documents=documents, scheme_review=scheme_review, ast=ast, io=io, json=json, os=os, re=re,
+    scope = dict(documents=documents, scheme_review=scheme_review,
+                 teacher_authorization=teacher_authorization,
+                 ast=ast, io=io, json=json, os=os, re=re,
                  tempfile=tempfile, time=time, copy=copy, hashlib=hashlib, uuid=uuid,
                  ThreadPoolExecutor=ThreadPoolExecutor, as_completed=as_completed,
                  wait=wait, FIRST_COMPLETED=FIRST_COMPLETED, Queue=Queue, Empty=Empty)
