@@ -1,7 +1,9 @@
 # Runtime PDF stack plus synthetic fixture creation only (ReportLab is not deployed).
-pypdf==6.20.1
+# pypdf 6.21.1 fixes CVE-2026-113786; Pillow 13.0.0 fixes the 12.3.0
+# advisory set. Kept identical to requirements.txt pins.
+pypdf==6.21.1
 pypdfium2==5.14.0
-Pillow==12.3.0
+Pillow==13.0.0
 reportlab==5.0.1
 # Offline deterministic maths verification for investigation/ tests and
 # benchmarks. Not imported by the deployed Streamlit app, which uses plain
