@@ -8,12 +8,12 @@ Base commit: `da2521809e3e23d664a6920cfca5b0f3a52f0f08` (merge of PR #29).
 
 | Package | Proposed constraint | Purpose | Directly imported | Also required transitively by |
 |---|---|---|---|---|
-| streamlit | `>=1.64.0,<1.67` | UI framework | yes (production app) | — |
+| streamlit | `>=1.66.1,<1.67` | UI framework | yes (production app) | — |
 | Authlib | `>=1.3.2,<2` | OIDC session tokens (S2 auth) | **no** — needed by Streamlit `st.login()` | Streamlit `auth` extra (`authlib.jose` in `streamlit/auth_util.py`) |
 | google-genai | `>=1.40,<3` | Gemini SDK | yes | — |
 | pandas | `>=2.0,<4` | report tables | yes | Streamlit (floor `>=1.4.0`) |
 | requests | `>=2.31,<3` | Classroom/Drive REST transport, bounded downloads | yes | google-genai, streamlit |
-| pypdf | `==6.21.1` | untrusted-PDF metadata/limits (S3) | yes (lazy import in `document_limits.py`) | — |
+| pypdf | `==6.21.2` | untrusted-PDF metadata/limits (S3) | yes (lazy import in `document_limits.py`) | — |
 | pypdfium2 | `==5.14.0` | PDF rendering (PDFium) | yes (`local_pdf.py`) | — |
 | Pillow | `==13.0.0` | image decoding surface | no direct import | Streamlit (floor `>=7.1.0`), pypdfium2 image export |
 
@@ -47,6 +47,14 @@ CVE-2026-113786 in pypdf 6.20.1 and 24 advisories in Pillow 12.3.0, so both
 pins were bumped to the fixed versions in the inventory above; streamlit
 1.66.1 replaced 1.65.0/1.66.0 in the CI matrix because only 1.66.1 caps
 `pillow<14`.)
+(2026-10-22, post-C5 dependency review: pypdf 6.21.1 → 6.21.2 for three
+crafted-PDF long-runtime advisories on the xref/object-loading path, all
+patched in 6.21.2: GHSA-gmh7-3g9r-mjh5 (large xref header limits),
+GHSA-jr96-gvgh-j3r4 (repeated malformed xref entries), GHSA-6c7f-9265-g8fw
+(repeated references to a missing object). The streamlit floor was corrected
+to `>=1.66.1` to match the verified minimum: streamlit 1.66.0 and earlier
+cap `pillow<13`, so `1.64.0` could never resolve against the
+`Pillow==13.0.0` pin; the CI matrix already tests 1.66.1.)
 
 ## GitHub Actions hardening (F-11)
 
