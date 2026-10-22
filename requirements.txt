@@ -6,6 +6,10 @@
 # ranges that the CI matrix validates, or exact pins for the untrusted-input
 # PDF stack. Dependabot proposes reviewable updates and a pip-audit CI job
 # scans the resolved set (see TESTING.md "Dependency policy and supply chain").
+# Bounded range; the CI matrix tests the resolved version. Pillow==13.0.0
+# below is only installable with streamlit>=1.66.1 (1.66.0 and earlier cap
+# pillow<13), and pip resolves the newest in-range release, so the effective
+# floor for the pinned PDF stack is 1.66.1.
 streamlit>=1.64.0,<1.67
 # REQUIRED for Google sign-in: the app calls st.login("google"), and
 # Streamlit's native OIDC auth (its "auth" extra) imports authlib.jose from
