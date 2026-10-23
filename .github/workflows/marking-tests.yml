@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, codex/review-state-and-marking-safety]
+    # 'feature/m5-*' so the stacked M5 slices (core → API) get CI on their
+    # own base branch; merge order stays review-driven.
+    branches: [main, 'feature/m5-*', codex/review-state-and-marking-safety]
   schedule:
     - cron: '15 6 * * *'
   workflow_dispatch:
