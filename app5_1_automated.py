@@ -13,6 +13,7 @@ import document_pipeline as documents
 import scheme_review
 import teacher_authorization
 import question_review
+import audit_store
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -717,8 +718,11 @@ def unambiguous_overrides(questions, overrides):
     ambiguous = set(question_review.ambiguous_question_numbers(questions))
     if not ambiguous:
         return overrides
+    # C6-B3 M2 (IR finding L-1): compare with the same strip-normalised key
+    # the ambiguity detection uses, so an override stored as " 1" for a
+    # question numbered "1" is dropped exactly when the collision is dropped.
     return {key: value for key, value in overrides.items()
-            if str(key) not in ambiguous}
+            if question_review.question_number_key(key) not in ambiguous}
 
 
 def apply_teacher_overrides(student_key: str, result: dict) -> bool:
@@ -962,6 +966,12 @@ def classroom_grade_details(row, rounding_places=2):
         clamp_mark(overrides.get(str(q["question_number"]), q["awarded_marks"]), q["max_marks"])
         for q in questions
     )
+    # C6-B3 M2 (IR finding L-2): report overrides only when one actually
+    # applies to a question in this result — a stored key that matches no
+    # question number (or was dropped as ambiguous) is not an applied
+    # override and must not claim one.
+    applied_override_numbers = (
+        {str(q["question_number"]) for q in questions} & set(overrides))
     possible = sum(q["max_marks"] for q in questions)
     percentage = 100.0 * earned / possible if possible else 0.0
     points = row.get("classroom_max_points")
@@ -995,7 +1005,7 @@ def classroom_grade_details(row, rounding_places=2):
         "medium": medium,
         "audit_failure": audit_failure,
         "incomplete": incomplete,
-        "has_overrides": bool(overrides),
+        "has_overrides": bool(applied_override_numbers),
     }
 
 
@@ -2731,11 +2741,12 @@ def question_review_binding(student_key, row, question_number):
 
 
 def question_review_store():
-    """Session-state decision store (C6-B3: session-only, non-durable).
+    """Session-state decision store (C6-B3: session-only by default).
 
     Decisions live here for the lifetime of one Streamlit session and are lost
-    when it ends; persistence is a separate, undecided scope and no durable
-    store is claimed by this path.
+    when it ends. Durable storage exists only through the separate,
+    development-only opt-in described in ``dev_audit_store`` / ``audit_store``;
+    no production durability is claimed by this path.
     """
     return st.session_state.setdefault("question_review_decisions", {})
 
@@ -2789,6 +2800,250 @@ def _question_review_fail(code, question_number, detail=""):
     st.session_state["question_review_notice"] = (code, str(question_number), detail)
 
 
+# C6-B3 M2: development-only durable audit persistence.
+#
+# Explicitly opt-in and OFF by default: with neither variable set (the
+# default, and the only supported production posture of this milestone) every
+# decision behaves exactly as before and lives in session state alone. Setting
+# AI_MARKER_AUDIT_DEV_STORE=<path> together with AI_MARKER_AUDIT_DEV_ONLY=1
+# additionally commits each ACCEPTED decision and its audit event into one
+# transactional local store (see audit_store.py / AUDIT_STORAGE_CONTRACT.md).
+# A correction is never kept when its audit write fails, no original AI output
+# is ever replaced, and every commit is owner-scoped and revision-checked.
+# Unsetting both variables reverts to session-only behaviour with no code
+# change and no store file access. This is NOT school-ready durability: no
+# tenant model, no retention policy, no backups beyond explicit snapshots.
+AUDIT_DEV_STORE_ENV = "AI_MARKER_AUDIT_DEV_STORE"
+AUDIT_DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
+
+_audit_store_cache = {}
+
+
+def reset_dev_audit_store():
+    """Close and forget the cached dev-only store (opt-out / test isolation)."""
+
+    entry = _audit_store_cache.pop("entry", None)
+    if entry is not None:
+        try:
+            entry.close()
+        except Exception:
+            pass
+    _audit_store_cache.pop("key", None)
+    _audit_store_cache.pop("code", None)
+
+
+def dev_audit_store():
+    """Return ``(store, code)`` for the opt-in dev-only durable audit store.
+
+    ``(None, None)`` means persistence is disabled — the default. When the
+    store is requested but cannot be opened (missing opt-in acknowledgement,
+    unusable file, unsupported schema), the store is None and ``code`` names
+    the refusal so every privileged mutation fails closed instead of writing
+    a correction that no audit trail holds.
+    """
+
+    path = (os.environ.get(AUDIT_DEV_STORE_ENV) or "").strip()
+    if not path:
+        return None, None
+    acknowledged = (os.environ.get(AUDIT_DEV_ONLY_ENV) or "").strip() == "1"
+    cache_key = (path, acknowledged)
+    if _audit_store_cache.get("key") == cache_key:
+        return _audit_store_cache.get("entry"), None
+    reset_dev_audit_store()
+    try:
+        store = audit_store.open_store(path, dev_only_ack=acknowledged)
+    except Exception:
+        # Any storage problem refuses THIS mutation (fail closed). A failure
+        # is deliberately not cached: the next decision retries, so a
+        # transient fault recovers without a process restart while every
+        # attempt in between still fails closed.
+        return None, "audit_store_unavailable"
+    _audit_store_cache["key"] = cache_key
+    _audit_store_cache["entry"] = store
+    return store, None
+
+
+def durable_result_identity(row):
+    """Owner-scoped storage identity for one reviewed result (fail closed).
+
+    Classroom rows use the provider-stable course/assignment/submission triple
+    plus the submission revision, so one submission keeps one durable stream
+    across sessions and a resubmission (new provider revision) starts a NEW
+    stream, because the revision is part of ``result_id`` itself.
+    Manual rows have no provider identity today: they are keyed by the
+    server-derived document digest plus the per-run review key, which is
+    session-scoped — an explicitly documented open decision, never invented
+    here. Returns None when no trustworthy identity can be derived.
+    """
+
+    if not isinstance(row, dict):
+        return None
+    if row_review_scope(row) == "classroom":
+        course = row.get("classroom_course_id")
+        assignment = row.get("classroom_assignment_id")
+        submission = row.get("submission_id")
+        if not (isinstance(course, str) and course
+                and isinstance(assignment, str) and assignment
+                and isinstance(submission, str) and submission):
+            return None
+        revision = row.get("revision")
+        revision = (str(revision) if isinstance(revision, str) and revision
+                    else "unversioned")
+        return ("classroom:" + course + ":" + assignment + ":"
+                + submission + ":" + revision)
+    digest = question_review_evidence_digest(row)
+    key = row.get("review_key")
+    if not (isinstance(digest, str) and digest
+            and isinstance(key, str) and key):
+        return None
+    return "manual:" + digest[:16] + ":" + key
+
+
+def decision_session_snapshot(student_key, question_number):
+    """Remember the session state one correction is about to change.
+
+    Only taken when durable persistence is enabled: it is what makes a FAILED
+    audit commit leave no partial session state behind — the override value and
+    reason, plus any Classroom approval the override write invalidates.
+    """
+
+    overrides = st.session_state.get("teacher_overrides", {})
+    reasons = st.session_state.get("teacher_override_reasons", {})
+    approvals = st.session_state.get("classroom_grade_approvals", {})
+    target = str(question_number)
+    entry = overrides.get(student_key, {}) if isinstance(overrides, dict) else {}
+    reasons_entry = (reasons.get(student_key, {})
+                     if isinstance(reasons, dict) else {})
+    return {
+        "override_present": isinstance(entry, dict) and target in entry,
+        "override_value": entry.get(target) if isinstance(entry, dict) else None,
+        "override_reason": (reasons_entry.get(target)
+                            if isinstance(reasons_entry, dict) else None),
+        "approval_present": (student_key in approvals
+                             if isinstance(approvals, dict) else False),
+        "approval_value": (approvals.get(student_key)
+                           if isinstance(approvals, dict) else None),
+        "approval_checkbox": st.session_state.get(
+            f"classroom_approval_checkbox_{student_key}"),
+    }
+
+
+def restore_decision_session_snapshot(student_key, question_number, snapshot):
+    """Undo a correction's session writes when its durable commit failed.
+
+    Guarantees the single-override system never keeps a correction whose audit
+    event could not be committed, and that a failed decision does not silently
+    cost the teacher an approval that was never withdrawn by a real change.
+    """
+
+    overrides = st.session_state.get("teacher_overrides")
+    reasons = st.session_state.get("teacher_override_reasons")
+    approvals = st.session_state.get("classroom_grade_approvals")
+    target = str(question_number)
+    if (snapshot or {}).get("override_present"):
+        if isinstance(overrides, dict):
+            overrides.setdefault(student_key, {})[target] = snapshot.get(
+                "override_value")
+        if isinstance(reasons, dict):
+            reasons.setdefault(student_key, {})[target] = snapshot.get(
+                "override_reason")
+    else:
+        for store_map in (overrides, reasons):
+            bucket = (store_map.get(student_key)
+                      if isinstance(store_map, dict) else None)
+            if isinstance(bucket, dict):
+                bucket.pop(target, None)
+                if not bucket:
+                    store_map.pop(student_key, None)
+    if isinstance(approvals, dict):
+        if snapshot.get("approval_present"):
+            approvals[student_key] = snapshot.get("approval_value")
+        else:
+            approvals.pop(student_key, None)
+    checkbox_key = f"classroom_approval_checkbox_{student_key}"
+    if (snapshot or {}).get("approval_checkbox") is None:
+        st.session_state.pop(checkbox_key, None)
+    else:
+        st.session_state[checkbox_key] = snapshot["approval_checkbox"]
+
+
+def audit_persistence_plan(row, actor):
+    """Resolve the dev-only persistence plan for one decision (fail closed).
+
+    Returns ``(store, plan, None)`` on success (store None when persistence is
+    disabled), or ``(None, None, code)`` when persistence is switched on but
+    cannot be used. The revision is read BEFORE any write, so a decision based
+    on a superseded revision is rejected as stale instead of overwriting a
+    concurrent one.
+    """
+
+    store, error = dev_audit_store()
+    if error is not None:
+        return None, None, error
+    if store is None:
+        return None, None, None
+    result_id = durable_result_identity(row)
+    if result_id is None:
+        return None, None, "audit_result_identity_unavailable"
+    try:
+        revision = store.current_revision(owner=actor, result_id=result_id)
+    except audit_store.AuditStoreError as failure:
+        return None, None, failure.code
+    except Exception:
+        return None, None, "audit_store_unavailable"
+    return store, {"result_id": result_id,
+                   "expected_revision": int(revision or 0)}, None
+
+
+def commit_audit_decision(*, store, plan, actor, row, question_number, action,
+                          review_status, old_score, corrected, reason, binding,
+                          evidence):
+    """Atomically commit one accepted decision together with its audit event.
+
+    The semantic payload is what retries are idempotent against (the audit-only
+    authorization evidence of THIS attempt is recorded with the event but never
+    part of the payload, so a legitimate retry is not mistaken for a different
+    operation; the optimistic revision is enforced by the commit itself, not
+    part of the operation's identity). The idempotency key is derived from
+    owner + result stream + payload, so retrying the same decision returns the
+    prior result instead of appending a second event, while a genuinely
+    different correction is a different operation with a different key.
+    """
+
+    payload = {
+        "question_number": str(question_number),
+        "action": str(action),
+        "review_status": str(review_status),
+        "old_score": "" if old_score is None else str(old_score),
+        "new_score": "" if corrected is None else str(corrected),
+        "reason": (reason or "").strip(),
+        "binding": binding or "",
+    }
+    event = {
+        "event_type": "question_review_decision",
+        "question_number": payload["question_number"],
+        "action": payload["action"],
+        "review_status": payload["review_status"],
+        "old_score": payload["old_score"],
+        "new_score": payload["new_score"],
+        "reason": payload["reason"],
+        "actor": actor,
+        "binding": payload["binding"],
+        "authorization_evidence": evidence,
+    }
+    # Register (or verify) the immutable original AI output reference first:
+    # a stored decision always has an original it was reviewed against.
+    store.register_result(owner=actor, result_id=plan["result_id"],
+                          original_output=(row.get("ai_result")
+                                           or row.get("result") or {}))
+    return store.commit_correction(
+        owner=actor, result_id=plan["result_id"],
+        expected_revision=plan["expected_revision"],
+        idempotency_key=audit_store.make_idempotency_key(
+            owner=actor, result_id=plan["result_id"], payload=payload),
+        payload=payload, event=event)
+
+
 def apply_question_review_decision(student_key, question_number, action, reason,
                                    corrected_mark):
     """Record one teacher's question-level review decision (fail closed).
@@ -2808,6 +3063,13 @@ def apply_question_review_decision(student_key, question_number, action, reason,
     evidence is never read back as authorization: the next decision
     re-verifies from scratch, so historical evidence can never become
     reusable authorization.
+
+    C6-B3 M2: when the development-only durable store is explicitly opted in
+    (see ``dev_audit_store``), the accepted decision and its audit event are
+    committed in ONE transaction before the decision is recorded, so a
+    correction is never kept when its audit write fails, and the session
+    override is rolled back if that commit fails. With the opt-in absent — the
+    default — behaviour is exactly the session-only behaviour of C6-B3 M1.
     """
     st.session_state.pop("question_review_notice", None)
     subject = authenticated_google_identity()
@@ -2868,20 +3130,62 @@ def apply_question_review_decision(student_key, question_number, action, reason,
         prior_binding=(current or {}).get("binding"))
     if code != "ok":
         return _question_review_fail(code, question_number)
+    # C6-B3 M2: durable persistence is dev-only and opt-in (both off by
+    # default). The plan is resolved and the stream revision is read BEFORE
+    # any write, so a decision based on a superseded revision is refused as
+    # stale rather than overwriting a concurrent decision.
+    store, plan, plan_error = audit_persistence_plan(row, actor)
+    if plan_error is not None:
+        return _question_review_fail(plan_error, question_number)
+    session_snapshot = None
     if status == "corrected":
         # Single override system: recalculates totals with existing rules and
         # keeps the original AI marks in the override record.
+        if store is not None:
+            session_snapshot = decision_session_snapshot(student_key,
+                                                         question_number)
         save_teacher_override(student_key, str(question_number), corrected,
                               (reason or "").strip())
         if st.session_state.get("teacher_overrides", {}).get(
                 student_key, {}).get(str(question_number)) != corrected:
             return _question_review_fail("override_write_rejected", question_number)
+    committed = None
+    if store is not None:
+        # Commit the decision AND its audit event in ONE transaction before
+        # the decision is accepted: a correction never survives a failed audit
+        # write, and a failed commit rolls the session side effects back too.
+        try:
+            committed = commit_audit_decision(
+                store=store, plan=plan, actor=actor, row=row,
+                question_number=question_number, action=action,
+                review_status=new_status,
+                old_score=question.get("awarded_marks"),
+                corrected=corrected, reason=reason, binding=binding,
+                evidence=evidence)
+        except audit_store.AuditStoreError as failure:
+            if session_snapshot is not None:
+                restore_decision_session_snapshot(student_key, question_number,
+                                                  session_snapshot)
+            return _question_review_fail(failure.code, question_number)
+        except Exception:
+            if session_snapshot is not None:
+                restore_decision_session_snapshot(student_key, question_number,
+                                                  session_snapshot)
+            return _question_review_fail("audit_persist_failed", question_number)
     record = dict(state)
     record["actor"] = actor
     record["updated_at"] = f"{time.time():.0f}"
     # Audit-only record of the gate that authorized THIS decision; no gate
     # reads it back, so it can never be replayed as authorization.
     record["authorization_evidence"] = evidence
+    if committed is not None:
+        # Dev-only durable audit reference: WHICH stream event this decision
+        # is, so it can be replayed/verified independently of session state.
+        record["audit_reference"] = {
+            "result_id": plan["result_id"],
+            "sequence": committed["sequence"],
+            "event_id": committed["event_id"],
+        }
     question_review_store()[key] = record
     record_question_review_event(row, student_key, question_number, status,
                                  binding, evidence)
