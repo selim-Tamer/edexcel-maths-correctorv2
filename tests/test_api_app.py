@@ -345,5 +345,26 @@ class OwnerScopeTests(ApiTestCase):
                          "result_not_registered")
 
 
+class RequestBodyLimitTests(ApiTestCase):
+
+    def test_oversized_write_body_is_refused_before_parsing(self):
+        response = self.client.post(
+            f"/v1/results/{result_id_of(manual_row())}/decisions",
+            headers=self.auth(),
+            json={"question_number": "1", "action": "approve",
+                  "expected_revision": 0, "idempotency_key": "k",
+                  "reason": "x" * 40000})
+        self.assertEqual(response.status_code, 413, response.text)
+        self.assertEqual(response.json()["error"]["code"], "payload_invalid")
+        self.assertIsNone(self.store.current_revision(
+            owner=OWNER, result_id=result_id_of(manual_row())))
+
+    def test_reads_are_not_affected_by_the_body_guard(self):
+        self.assertEqual(self.client.get("/v1/healthz").status_code, 200)
+        self.assertEqual(
+            self.client.get(f"/v1/results/{result_id_of(manual_row())}/events",
+                            headers=self.auth()).status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

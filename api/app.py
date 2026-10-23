@@ -10,9 +10,13 @@ source of truth for what is *promised*; this module records what *runs*):
 * **Authentication** is a caller-injected bearer-token verifier. The default
   verifier rejects every token: with no verifier configured, all authenticated
   endpoints return 401. Google OIDC verification, session cookies and refresh
-  flows do **not** exist here; wiring a real verifier is a separate slice.
-  The owner token is derived server-side as ``google:`` + subject, the same
-  convention ``app5_1_automated.sensitive_state_owner`` uses.
+  flows do **not** exist here; wiring a real verifier is a separate slice, and
+  it must compare tokens in constant time, never log or echo a token, and
+  derive the subject server-side. The owner token is derived as ``google:`` +
+  subject, the same convention ``app5_1_automated.sensitive_state_owner`` uses.
+* **Bodies are bounded** before parsing (``MAX_BODY_BYTES``, write requests
+  only), so an oversized or length-less body is refused with the same error
+  envelope instead of being read into memory.
 * **Rows** come from a caller-injected owner-scoped provider. There is no
   ingestion endpoint yet (``POST /v1/results`` remains SPEC_NOT_IMPLEMENTED);
   rows that only exist inside a Streamlit session are invisible here, and a
@@ -58,6 +62,13 @@ import question_review
 
 DEV_STORE_ENV = "AI_MARKER_AUDIT_DEV_STORE"
 DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
+
+# Untrusted-input guard: every contract body is a few hundred bytes at most
+# (reason is capped at 2000 characters), so anything near this size is not a
+# legitimate request. Declared Content-Length is checked before the body is
+# read; chunked bodies without a length are rejected too, because this API
+# never accepts streaming uploads.
+MAX_BODY_BYTES = 32_768
 
 # Provisional HTTP mapping for the contract's error codes (the contract names
 # codes, not statuses). Anything unmapped is a 400: it came from the source
@@ -172,6 +183,24 @@ def create_app(*, verify_token: Callable[[str], Optional[str]],
         if detail:
             error["detail"] = detail
         return JSONResponse(status_code=status, content={"error": error})
+
+    @app.middleware("http")
+    async def _limit_body_size(request, call_next):
+        """Bound the body of write requests before any parsing."""
+        if request.method not in ("POST", "PUT", "PATCH"):
+            return await call_next(request)
+        declared = request.headers.get("content-length")
+        if declared is None:
+            return envelope(413, "payload_invalid",
+                            "content-length header is required")
+        try:
+            size = int(declared)
+        except ValueError:
+            return envelope(413, "payload_invalid",
+                            "content-length header is not a number")
+        if size < 0 or size > MAX_BODY_BYTES:
+            return envelope(413, "payload_invalid", "request body too large")
+        return await call_next(request)
 
     @app.exception_handler(ApiError)
     async def _api_error(request, exc: ApiError):
