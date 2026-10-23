@@ -10,3 +10,9 @@ reportlab==5.0.1
 # benchmarks. Not imported by the deployed Streamlit app, which uses plain
 # Python arithmetic only; must match the sympy pin used by CI.
 sympy==1.14.0
+# API slice A (tests/test_api_app.py): the in-process HTTP surface over the
+# session-free decision core. The API is NOT deployed -- no API deployment is
+# authorized -- so fastapi stays out of requirements.txt until one is. httpx
+# is what fastapi.testclient drives. Both are scanned by dependency-audit.
+fastapi==0.162.0
+httpx==0.28.1
