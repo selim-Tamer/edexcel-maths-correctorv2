@@ -12,6 +12,17 @@ performed by the app-layer handlers (``app5_1_automated.py``) and by
 Corrections produced by a review decision are routed through the existing
 ``save_teacher_override`` / ``teacher_overrides`` mechanism so that there
 remains exactly one override system in the product.
+
+Question identity is resolved fail-closed: a question number that matches
+more than one question (a duplicate/colliding id) never resolves, so no
+decision, binding or override can silently target a different question.
+
+AUDIT LIMITATION (documented, not claimed away): decisions and the bounded
+audit trail live in Streamlit session state only (``MAX_AUDIT_EVENTS``
+newest events). They are lost when the session ends and are not a durable
+audit store; persistence is a separate, undecided scope. Retained
+authorization evidence is audit-only provenance of a past check and is
+never read back as authorization.
 """
 
 from __future__ import annotations
@@ -32,6 +43,17 @@ __all__ = [
     "validate_reason",
     "question_review_binding",
     "binding_matches",
+    "QUESTION_IDENTITY_OK",
+    "AMBIGUOUS_QUESTION_CODE",
+    "UNAVAILABLE_QUESTION_CODE",
+    "question_number_key",
+    "resolve_question",
+    "ambiguous_question_numbers",
+    "question_is_ambiguous",
+    "AUTHORIZATION_SCOPES",
+    "AUTHORIZATION_EVIDENCE_FIELDS",
+    "EVIDENCE_FIELD_LIMIT",
+    "authorization_evidence",
     "evaluate_question_review",
     "make_review_event",
     "bounded_events",
@@ -53,6 +75,20 @@ MAX_REASON_LENGTH = 2000
 
 # Bounded audit trail kept in session state (read-only display use).
 MAX_AUDIT_EVENTS = 500
+
+# Fail-closed question-identity codes returned by ``resolve_question``.
+QUESTION_IDENTITY_OK = "ok"
+AMBIGUOUS_QUESTION_CODE = "review_question_ambiguous"
+UNAVAILABLE_QUESTION_CODE = "review_question_unavailable"
+
+# Audit-only authorization evidence: a fixed whitelist of short string
+# fields. Nothing else can be stored there: no tokens, credentials or
+# browser-supplied values.
+AUTHORIZATION_SCOPES: tuple[str, ...] = ("classroom", "manual", "unscoped")
+AUTHORIZATION_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "scope", "actor", "authorization_revision", "row_revision", "verified_at",
+)
+EVIDENCE_FIELD_LIMIT = 200
 
 _BINDING_FIELDS = (
     "assignment_id",
@@ -192,6 +228,121 @@ def binding_matches(expected: Any, actual: Any) -> bool:
     return expected == actual
 
 
+def question_number_key(value: Any) -> str:
+    """Normalised identity key for one question number (comparison only).
+
+    The application compares question numbers as strings, so normalising to a
+    stripped string keeps collision detection at least as strict as the lookup
+    it protects: ``1``, ``"1"`` and ``" 1 "`` are the same question id, and a
+    paper whose numbers collide only after normalisation is still ambiguous.
+    """
+
+    return str(value).strip()
+
+
+def resolve_question(questions: Any, question_number: Any) -> tuple[Any, str]:
+    """Resolve one question id to exactly one question, failing closed.
+
+    Returns ``(question, code)``. ``code`` is ``QUESTION_IDENTITY_OK`` only
+    when exactly one question carries this id. Two or more matching questions
+    return ``(None, AMBIGUOUS_QUESTION_CODE)`` instead of the first match:
+    binding a decision or an override to a colliding id could silently target
+    a different question. An id that matches nothing (or an unusable question
+    list) returns ``(None, UNAVAILABLE_QUESTION_CODE)``.
+    """
+
+    if not isinstance(questions, (list, tuple)):
+        return None, UNAVAILABLE_QUESTION_CODE
+    target = question_number_key(question_number)
+    matches = [item for item in questions
+               if isinstance(item, dict)
+               and question_number_key(item.get("question_number", "")) == target]
+    if not matches:
+        return None, UNAVAILABLE_QUESTION_CODE
+    if len(matches) > 1:
+        return None, AMBIGUOUS_QUESTION_CODE
+    return matches[0], QUESTION_IDENTITY_OK
+
+
+def ambiguous_question_numbers(questions: Any) -> list[str]:
+    """Every question id in ``questions`` that resolves to more than one row."""
+
+    if not isinstance(questions, (list, tuple)):
+        return []
+    counts: dict[str, int] = {}
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        key = question_number_key(item.get("question_number", ""))
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(key for key, count in counts.items() if count > 1)
+
+
+def question_is_ambiguous(questions: Any, question_number: Any) -> bool:
+    """True only when ``question_number`` collides with another question id."""
+
+    return resolve_question(questions, question_number)[1] == AMBIGUOUS_QUESTION_CODE
+
+
+def _evidence_field(value: Any) -> str:
+    """One bounded string field for audit-only evidence (never a credential)."""
+
+    if value is None:
+        return ""
+    return str(value)[:EVIDENCE_FIELD_LIMIT]
+
+
+def authorization_evidence(
+    *,
+    scope: Any,
+    actor: Any,
+    authorization_revision: Any = "",
+    row_revision: Any = "",
+    verified_at: Any = "",
+) -> dict[str, str]:
+    """Minimal, audit-ONLY record of the gate that authorized one decision.
+
+    Kept with the decision record and its audit event so a reviewer can see
+    which server-side check actually ran: the actor, the gate scope, the fresh
+    server-derived revision that authorized THIS decision (classroom: the
+    assignment revision recomputed from live listings just then; manual: the
+    digest of the owned uploaded document), the row revision, and the
+    verification time. Only these five short string fields exist.
+
+    This is evidence of a past decision and NEVER authorization itself: no
+    gate reads it back, every mutation re-verifies from scratch, and no token,
+    credential or unnecessary personal data is included. Stored or forged
+    evidence therefore never becomes reusable authorization.
+    """
+
+    return {
+        "scope": (scope if isinstance(scope, str) and scope in AUTHORIZATION_SCOPES
+                  else "unscoped"),
+        "actor": _evidence_field(actor),
+        "authorization_revision": _evidence_field(authorization_revision),
+        "row_revision": _evidence_field(row_revision),
+        "verified_at": _evidence_field(verified_at),
+    }
+
+
+def _clean_evidence(evidence: Any) -> dict[str, str] | None:
+    """Whitelist one supplied evidence record down to the five known fields.
+
+    Anything that is not a mapping is dropped, and unknown keys (a token, a
+    browser-supplied value, an oversized blob) never reach the audit trail.
+    """
+
+    if not isinstance(evidence, Mapping):
+        return None
+    return authorization_evidence(
+        scope=evidence.get("scope"),
+        actor=evidence.get("actor"),
+        authorization_revision=evidence.get("authorization_revision"),
+        row_revision=evidence.get("row_revision"),
+        verified_at=evidence.get("verified_at"),
+    )
+
+
 def evaluate_question_review(
     *,
     status: Any,
@@ -255,8 +406,14 @@ def make_review_event(
     actor: Any,
     binding: Any,
     timestamp: Any,
+    evidence: Any = None,
 ) -> dict[str, Any]:
-    """Create one audit event for the bounded in-memory trail."""
+    """Create one audit event for the bounded in-memory trail.
+
+    ``evidence`` is the audit-only authorization evidence retained with the
+    decision; it is whitelisted to the five known fields here, so an unexpected
+    value can never widen what the trail stores.
+    """
 
     if not isinstance(action, str) or not action:
         action = "unknown"
@@ -271,12 +428,17 @@ def make_review_event(
         "action": action,
         "actor": actor,
         "binding": binding if isinstance(binding, str) else "",
+        "authorization_evidence": _clean_evidence(evidence),
         "timestamp": timestamp,
     }
 
 
 def bounded_events(events: Any, maximum: int = MAX_AUDIT_EVENTS) -> list[dict[str, Any]]:
-    """Trim an audit event list to ``maximum`` newest entries, oldest dropped."""
+    """Trim an audit event list to ``maximum`` newest entries, oldest dropped.
+
+    The trail itself lives only in session state (see the module docstring):
+    it is bounded and non-durable, not a persistent audit store.
+    """
 
     if not isinstance(events, list):
         return []

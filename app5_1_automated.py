@@ -700,11 +700,39 @@ def prepare_review_row(row):
     return row
 
 
+def unambiguous_overrides(questions, overrides):
+    """Stored overrides whose question id still resolves to exactly one question.
+
+    C6-B3: several questions can share one question number (duplicate ids in
+    one result), while there is exactly one override key per number. An
+    override stored against a colliding id is dropped instead of applied, so
+    one key can never silently change the marks of every question that happens
+    to share the number. Nothing is repaired: the affected questions keep the
+    pristine AI marks and the totals stay honest.
+    """
+    if not isinstance(overrides, dict):
+        return {}
+    if not isinstance(questions, list):
+        return {}
+    ambiguous = set(question_review.ambiguous_question_numbers(questions))
+    if not ambiguous:
+        return overrides
+    return {key: value for key, value in overrides.items()
+            if str(key) not in ambiguous}
+
+
 def apply_teacher_overrides(student_key: str, result: dict) -> bool:
-    """Apply session-only teacher mark overrides to a result."""
-    overrides = st.session_state.get("teacher_overrides", {}).get(student_key, {})
+    """Apply session-only teacher mark overrides to a result.
+
+    C6-B3: overrides that collide with a duplicate question id are never
+    applied (see ``unambiguous_overrides``).
+    """
+    questions = result.get("questions", [])
+    overrides = unambiguous_overrides(
+        questions,
+        st.session_state.get("teacher_overrides", {}).get(student_key, {}))
     changed = False
-    for q in result.get("questions", []):
+    for q in questions:
         key = str(q.get("question_number", ""))
         if key in overrides:
             new_mark = clamp_mark(overrides[key], q["max_marks"])
@@ -727,13 +755,25 @@ def render_teacher_override_controls(student_key: str, result: dict):
     if not questions:
         return
 
-    labels = {
-        str(q["question_number"]): (
+    ambiguous = set(question_review.ambiguous_question_numbers(questions))
+    labels = {}
+    for q in questions:
+        number = str(q["question_number"])
+        if number in labels:
+            # A colliding id is offered once, marked as blocked below, and
+            # never labelled with a different question's marks.
+            continue
+        labels[number] = (
             f"Question {q['question_number']} — "
             f"{q['awarded_marks']} / {q['max_marks']}"
+            + (" — blocked: duplicate question number"
+               if number in ambiguous else "")
         )
-        for q in questions
-    }
+    if ambiguous:
+        st.caption(
+            "Overrides are blocked for question numbers that appear more than "
+            "once in this result, because one override could not target a "
+            "single question safely.")
     selected = st.selectbox(
         "Question to override",
         list(labels.keys()),
@@ -760,6 +800,16 @@ def render_teacher_override_controls(student_key: str, result: dict):
         on_click=save_teacher_override_from_widgets,
         args=(student_key, selected),
     )
+    notice = st.session_state.pop("teacher_override_notice", None)
+    if isinstance(notice, tuple) and len(notice) == 2:
+        code, number = notice
+        if code == question_review.AMBIGUOUS_QUESTION_CODE:
+            st.error(
+                f"Override refused: question {number} appears more than once "
+                "in this result, so it cannot be targeted safely. No marks "
+                "and no totals were changed.")
+        else:
+            st.error(f"Override refused: {code}.")
 
 
 def save_teacher_override_from_widgets(student_key, selected):
@@ -777,10 +827,21 @@ def invalidate_classroom_approval(student_key):
 
 
 def save_teacher_override(student_key, selected, new_mark, reason):
-    """Streamlit callbacks run before rendering, so approval widgets can reset safely."""
+    """Streamlit callbacks run before rendering, so approval widgets can reset safely.
+
+    C6-B3 guard: when the owned row carries more than one question with this
+    number, the write is refused (fail closed). There is exactly one override
+    key per question number, so writing it for a colliding id would silently
+    change every question that shares the number.
+    """
     if not owned_review_key(student_key):
         # Fail closed: never write an override against another teacher's
         # result, a stale review key, or an unauthenticated session.
+        return
+    _, identity = question_identity_status(
+        owned_review_row(student_key), selected)
+    if identity == question_review.AMBIGUOUS_QUESTION_CODE:
+        st.session_state["teacher_override_notice"] = (identity, str(selected))
         return
     st.session_state.setdefault("teacher_overrides", {}).setdefault(student_key, {})[selected] = int(new_mark)
     st.session_state.setdefault("teacher_override_reasons", {}).setdefault(student_key, {})[selected] = reason
@@ -893,8 +954,10 @@ def render_scheme_review_panel(info):
 def classroom_grade_details(row, rounding_places=2):
     """Current suggested grade and review flags; no extra AI API calls."""
     student_key = row["review_key"]
-    overrides = st.session_state.get("teacher_overrides", {}).get(student_key, {})
     questions = row["result"]["questions"]
+    overrides = unambiguous_overrides(
+        questions,
+        st.session_state.get("teacher_overrides", {}).get(student_key, {}))
     earned = sum(
         clamp_mark(overrides.get(str(q["question_number"]), q["awarded_marks"]), q["max_marks"])
         for q in questions
@@ -2602,22 +2665,50 @@ def question_review_evidence_digest(row):
     return ""
 
 
+def pristine_question_list(row):
+    """The row's pristine AI questions (never the override-adjusted display).
+
+    Read-only: returns an empty list for anything that is not a well-formed
+    row/result, so identity checks fail closed instead of raising.
+    """
+    if not isinstance(row, dict):
+        return []
+    pristine = row.get("ai_result") or row.get("result") or {}
+    if not isinstance(pristine, dict):
+        return []
+    questions = pristine.get("questions", [])
+    return questions if isinstance(questions, list) else []
+
+
+def question_identity_status(row, question_number):
+    """Resolve one question id in the pristine output as ``(question, code)``.
+
+    C6-B3 authoritative identity check: ``code`` is
+    ``question_review.QUESTION_IDENTITY_OK`` only when exactly one question
+    carries this id, ``AMBIGUOUS_QUESTION_CODE`` when several do (a collision
+    that must never be bound, decided or overridden), otherwise
+    ``UNAVAILABLE_QUESTION_CODE``. Same tuple order as
+    ``question_review.resolve_question``.
+    """
+    return question_review.resolve_question(
+        pristine_question_list(row), question_number)
+
+
 def question_review_binding(student_key, row, question_number):
     """Bind one question decision to the exact evidence it reviewed.
 
     Covers the pristine AI marks (never the override-adjusted display), the
     marking-evidence digest, the row revision (Classroom resubmissions) and
     the selected-question set, so a decision recorded against other evidence
-    can never be replayed. Returns None when trustworthy inputs are missing.
+    can never be replayed. Returns None when trustworthy inputs are missing,
+    including when the question id collides with another question in the row
+    (an ambiguous id has no single authoritative set of marks to bind to).
     """
     if not isinstance(row, dict) or row.get("review_key") != student_key:
         return None
-    pristine = row.get("ai_result") or row.get("result") or {}
-    question = None
-    for candidate in pristine.get("questions", []):
-        if str(candidate.get("question_number", "")) == str(question_number):
-            question = candidate
-            break
+    question, identity = question_identity_status(row, question_number)
+    if identity != question_review.QUESTION_IDENTITY_OK:
+        return None
     if question is None or question.get("awarded_marks") is None:
         return None
     digest = question_review_evidence_digest(row)
@@ -2640,6 +2731,12 @@ def question_review_binding(student_key, row, question_number):
 
 
 def question_review_store():
+    """Session-state decision store (C6-B3: session-only, non-durable).
+
+    Decisions live here for the lifetime of one Streamlit session and are lost
+    when it ends; persistence is a separate, undecided scope and no durable
+    store is claimed by this path.
+    """
     return st.session_state.setdefault("question_review_decisions", {})
 
 
@@ -2664,8 +2761,15 @@ def stored_question_review(student_key, question_number, row):
     return decision, False
 
 
-def record_question_review_event(row, student_key, question_number, action, binding):
-    """Append one bounded, read-only audit event for this review decision."""
+def record_question_review_event(row, student_key, question_number, action,
+                                 binding, evidence=None):
+    """Append one bounded, read-only audit event for this review decision.
+
+    C6-B3: the event also retains the audit-only authorization evidence of
+    the gate that allowed this decision (scope, actor, fresh revision). The
+    trail is session-only and bounded (500 newest events) — not a durable
+    audit store — and it never stores tokens or credentials.
+    """
     events = st.session_state.setdefault("question_review_events", [])
     events.append(question_review.make_review_event(
         assignment_id=(str(row.get("classroom_assignment_id"))
@@ -2675,6 +2779,7 @@ def record_question_review_event(row, student_key, question_number, action, bind
         action=str(action),
         actor=str(sensitive_state_owner() or "unauthenticated"),
         binding=binding or "",
+        evidence=evidence,
         timestamp=f"{time.time():.0f}",
     ))
     st.session_state["question_review_events"] = question_review.bounded_events(events)
@@ -2695,6 +2800,14 @@ def apply_question_review_decision(student_key, question_number, action, reason,
     existing save_teacher_override mechanism, so the single override system
     stays authoritative, original AI marks are preserved and totals
     recalculate with the existing rules.
+
+    C6-B3 additions: the question id must resolve to exactly one question in
+    the row's pristine output (a duplicate/colliding id is refused before any
+    state changes), and the gate that authorized this decision is retained as
+    audit-only evidence on the decision record and its audit event. That
+    evidence is never read back as authorization: the next decision
+    re-verifies from scratch, so historical evidence can never become
+    reusable authorization.
     """
     st.session_state.pop("question_review_notice", None)
     subject = authenticated_google_identity()
@@ -2704,23 +2817,35 @@ def apply_question_review_decision(student_key, question_number, action, reason,
     if row is None or not row_owner_allowed(row) or row.get("review_key") != student_key:
         return _question_review_fail("review_context_unavailable", question_number)
     scope = row_review_scope(row)
+    actor = str(sensitive_state_owner() or "unauthenticated")
     if scope == "classroom":
-        _, code = reverify_classroom_review_access(row)
+        # Fresh F-1 re-verification; its result is retained as evidence only.
+        reverified, code = reverify_classroom_review_access(row)
         if code:
             return _question_review_fail(code, question_number)
-    elif not manual_document_provenance_verified(row):
-        return _question_review_fail("manual_document_provenance_required",
-                                     question_number)
+        evidence = question_review.authorization_evidence(
+            scope="classroom", actor=actor,
+            authorization_revision=(reverified or {}).get("revision", ""),
+            row_revision=str(row.get("revision") or ""),
+            verified_at=(reverified or {}).get("verified_at", ""))
+    else:
+        if not manual_document_provenance_verified(row):
+            return _question_review_fail("manual_document_provenance_required",
+                                         question_number)
+        evidence = question_review.authorization_evidence(
+            scope="manual", actor=actor,
+            authorization_revision=question_review_evidence_digest(row),
+            row_revision=str(row.get("revision") or ""),
+            verified_at=f"{time.time():.0f}")
     status = {"approve": "approved", "correct": "corrected",
               "flag": "flagged"}.get(action)
     if status is None:
         return _question_review_fail("review_action_invalid", question_number)
-    pristine = row.get("ai_result") or row.get("result") or {}
-    question = next(
-        (item for item in pristine.get("questions", [])
-         if str(item.get("question_number", "")) == str(question_number)), None)
-    if question is None:
-        return _question_review_fail("review_question_unavailable", question_number)
+    question, identity = question_identity_status(row, question_number)
+    if identity != question_review.QUESTION_IDENTITY_OK:
+        # Duplicate/colliding question id (or no such question): refuse the
+        # decision instead of binding it to whichever question matched first.
+        return _question_review_fail(identity, question_number)
     corrected = None
     if status == "corrected":
         ok, code = question_review.validate_mark_value(
@@ -2752,10 +2877,14 @@ def apply_question_review_decision(student_key, question_number, action, reason,
                 student_key, {}).get(str(question_number)) != corrected:
             return _question_review_fail("override_write_rejected", question_number)
     record = dict(state)
-    record["actor"] = str(sensitive_state_owner() or "unauthenticated")
+    record["actor"] = actor
     record["updated_at"] = f"{time.time():.0f}"
+    # Audit-only record of the gate that authorized THIS decision; no gate
+    # reads it back, so it can never be replayed as authorization.
+    record["authorization_evidence"] = evidence
     question_review_store()[key] = record
-    record_question_review_event(row, student_key, question_number, status, binding)
+    record_question_review_event(row, student_key, question_number, status,
+                                 binding, evidence)
     _question_review_fail("ok", question_number, status)
 
 
@@ -2774,6 +2903,7 @@ def save_question_review_from_widgets(student_key, question_number):
 def render_question_review_summary(row, student_key, result):
     """Read-only per-question review status table for one student."""
     rows = []
+    questions = pristine_question_list(row)
     pristine = row.get("ai_result") or row.get("result") or {}
     ai_marks_by_number = {
         str(item.get("question_number", "")): item.get("awarded_marks")
@@ -2781,6 +2911,18 @@ def render_question_review_summary(row, student_key, result):
     }
     for question in result.get("questions", []):
         number = str(question.get("question_number", ""))
+        if question_review.question_is_ambiguous(questions, number):
+            # C6-B3: never report a decision that could target two questions.
+            rows.append({
+                "Question": number,
+                "AI marks": ai_marks_by_number.get(
+                    number, question.get("awarded_marks")),
+                "Displayed marks": question.get("awarded_marks"),
+                "Max": question.get("max_marks"),
+                "Review status": "Blocked (duplicate question number)",
+                "Reason": "",
+            })
+            continue
         decision, invalidated = stored_question_review(student_key, number, row)
         if decision:
             status = str(decision.get("status", "unreviewed")).capitalize()
@@ -2811,6 +2953,14 @@ def render_question_review_block(row, student_key, question):
     if not student_key or not isinstance(row, dict):
         return
     number = str(question.get("question_number", ""))
+    if question_review.question_is_ambiguous(pristine_question_list(row), number):
+        # C6-B3: a colliding id has no single authoritative question, so no
+        # decision control is offered and no state can change here.
+        st.warning(
+            "This question number appears more than once in this result, so "
+            "no review decision can be recorded for it. Marks and totals "
+            "stay exactly as the AI produced them.")
+        return
     decision, invalidated = stored_question_review(student_key, number, row)
     st.markdown("**🧑‍🏫 Teacher question review**")
     if invalidated:
