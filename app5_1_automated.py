@@ -14,6 +14,9 @@ import scheme_review
 import teacher_authorization
 import question_review
 import audit_store
+# Session-free decision core (M5): the fail-closed decision policy lives
+# there so a non-Streamlit worker can drive it; this module only adapts.
+import decision_core
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 from queue import Queue, Empty
 
@@ -2563,14 +2566,7 @@ def row_review_scope(row):
     classroom-authorized: it falls back to the manual document-provenance gate
     and fails closed when no owned document matches (fail-closed direction).
     """
-    if not isinstance(row, dict):
-        return None
-    if (isinstance(row.get("classroom_course_id"), str)
-            and row.get("classroom_course_id")
-            and isinstance(row.get("classroom_assignment_id"), str)
-            and row.get("classroom_assignment_id")):
-        return "classroom"
-    return "manual"
+    return decision_core.row_review_scope(row)
 
 
 def manual_document_provenance_verified(row):
@@ -2665,14 +2661,12 @@ def question_review_evidence_digest(row):
     Classroom rows carry the job context digest (assignment, scheme bytes and
     marking settings); manual rows fall back to the server-derived document
     digest recorded at upload time. No browser-supplied value is ever used.
+
+    Session adapter over ``decision_core.evidence_digest``: only the manual
+    fallback is read from this session; the rest is row-derived policy.
     """
-    if not isinstance(row, dict):
-        return ""
-    for value in (row.get("classroom_context"), row.get("snapshot_context"),
-                  st.session_state.get("last_manual_context")):
-        if isinstance(value, str) and value:
-            return value
-    return ""
+    return decision_core.evidence_digest(
+        row, st.session_state.get("last_manual_context"))
 
 
 def pristine_question_list(row):
@@ -2681,13 +2675,7 @@ def pristine_question_list(row):
     Read-only: returns an empty list for anything that is not a well-formed
     row/result, so identity checks fail closed instead of raising.
     """
-    if not isinstance(row, dict):
-        return []
-    pristine = row.get("ai_result") or row.get("result") or {}
-    if not isinstance(pristine, dict):
-        return []
-    questions = pristine.get("questions", [])
-    return questions if isinstance(questions, list) else []
+    return decision_core.pristine_question_list(row)
 
 
 def question_identity_status(row, question_number):
@@ -2700,8 +2688,7 @@ def question_identity_status(row, question_number):
     ``UNAVAILABLE_QUESTION_CODE``. Same tuple order as
     ``question_review.resolve_question``.
     """
-    return question_review.resolve_question(
-        pristine_question_list(row), question_number)
+    return decision_core.question_identity_status(row, question_number)
 
 
 def question_review_binding(student_key, row, question_number):
@@ -2714,30 +2701,9 @@ def question_review_binding(student_key, row, question_number):
     including when the question id collides with another question in the row
     (an ambiguous id has no single authoritative set of marks to bind to).
     """
-    if not isinstance(row, dict) or row.get("review_key") != student_key:
-        return None
-    question, identity = question_identity_status(row, question_number)
-    if identity != question_review.QUESTION_IDENTITY_OK:
-        return None
-    if question is None or question.get("awarded_marks") is None:
-        return None
-    digest = question_review_evidence_digest(row)
-    if not digest:
-        return None
-    selection = row.get("selected_questions")
-    scope = row_review_scope(row) or "manual"
-    assignment = (str(row.get("classroom_course_id")) + "/"
-                  + str(row.get("classroom_assignment_id"))
-                  if scope == "classroom" else "manual")
-    return question_review.question_review_binding(
-        assignment_id=assignment,
-        student_id=str(student_key),
-        question_number=str(question_number),
-        variant=json.dumps(selection, sort_keys=True) if selection else "",
-        row_revision=str(row.get("revision") or ""),
-        ai_marks=[question.get("awarded_marks")],
-        scheme_digest=digest,
-    )
+    return decision_core.question_review_binding(
+        student_key, row, question_number,
+        question_review_evidence_digest(row))
 
 
 def question_review_store():
@@ -2752,7 +2718,7 @@ def question_review_store():
 
 
 def question_review_decision_key(student_key, question_number):
-    return str(student_key) + "::q" + str(question_number)
+    return decision_core.decision_key(student_key, question_number)
 
 
 def stored_question_review(student_key, question_number, row):
@@ -2875,28 +2841,8 @@ def durable_result_identity(row):
     session-scoped — an explicitly documented open decision, never invented
     here. Returns None when no trustworthy identity can be derived.
     """
-
-    if not isinstance(row, dict):
-        return None
-    if row_review_scope(row) == "classroom":
-        course = row.get("classroom_course_id")
-        assignment = row.get("classroom_assignment_id")
-        submission = row.get("submission_id")
-        if not (isinstance(course, str) and course
-                and isinstance(assignment, str) and assignment
-                and isinstance(submission, str) and submission):
-            return None
-        revision = row.get("revision")
-        revision = (str(revision) if isinstance(revision, str) and revision
-                    else "unversioned")
-        return ("classroom:" + course + ":" + assignment + ":"
-                + submission + ":" + revision)
-    digest = question_review_evidence_digest(row)
-    key = row.get("review_key")
-    if not (isinstance(digest, str) and digest
-            and isinstance(key, str) and key):
-        return None
-    return "manual:" + digest[:16] + ":" + key
+    return decision_core.durable_result_identity(
+        row, question_review_evidence_digest(row))
 
 
 def decision_session_snapshot(student_key, question_number):
@@ -2906,26 +2852,8 @@ def decision_session_snapshot(student_key, question_number):
     audit commit leave no partial session state behind — the override value and
     reason, plus any Classroom approval the override write invalidates.
     """
-
-    overrides = st.session_state.get("teacher_overrides", {})
-    reasons = st.session_state.get("teacher_override_reasons", {})
-    approvals = st.session_state.get("classroom_grade_approvals", {})
-    target = str(question_number)
-    entry = overrides.get(student_key, {}) if isinstance(overrides, dict) else {}
-    reasons_entry = (reasons.get(student_key, {})
-                     if isinstance(reasons, dict) else {})
-    return {
-        "override_present": isinstance(entry, dict) and target in entry,
-        "override_value": entry.get(target) if isinstance(entry, dict) else None,
-        "override_reason": (reasons_entry.get(target)
-                            if isinstance(reasons_entry, dict) else None),
-        "approval_present": (student_key in approvals
-                             if isinstance(approvals, dict) else False),
-        "approval_value": (approvals.get(student_key)
-                           if isinstance(approvals, dict) else None),
-        "approval_checkbox": st.session_state.get(
-            f"classroom_approval_checkbox_{student_key}"),
-    }
+    return decision_core.decision_session_snapshot(
+        st.session_state, student_key, question_number)
 
 
 def restore_decision_session_snapshot(student_key, question_number, snapshot):
@@ -2935,36 +2863,8 @@ def restore_decision_session_snapshot(student_key, question_number, snapshot):
     event could not be committed, and that a failed decision does not silently
     cost the teacher an approval that was never withdrawn by a real change.
     """
-
-    overrides = st.session_state.get("teacher_overrides")
-    reasons = st.session_state.get("teacher_override_reasons")
-    approvals = st.session_state.get("classroom_grade_approvals")
-    target = str(question_number)
-    if (snapshot or {}).get("override_present"):
-        if isinstance(overrides, dict):
-            overrides.setdefault(student_key, {})[target] = snapshot.get(
-                "override_value")
-        if isinstance(reasons, dict):
-            reasons.setdefault(student_key, {})[target] = snapshot.get(
-                "override_reason")
-    else:
-        for store_map in (overrides, reasons):
-            bucket = (store_map.get(student_key)
-                      if isinstance(store_map, dict) else None)
-            if isinstance(bucket, dict):
-                bucket.pop(target, None)
-                if not bucket:
-                    store_map.pop(student_key, None)
-    if isinstance(approvals, dict):
-        if snapshot.get("approval_present"):
-            approvals[student_key] = snapshot.get("approval_value")
-        else:
-            approvals.pop(student_key, None)
-    checkbox_key = f"classroom_approval_checkbox_{student_key}"
-    if (snapshot or {}).get("approval_checkbox") is None:
-        st.session_state.pop(checkbox_key, None)
-    else:
-        st.session_state[checkbox_key] = snapshot["approval_checkbox"]
+    decision_core.restore_decision_session_snapshot(
+        st.session_state, student_key, question_number, snapshot)
 
 
 def audit_persistence_plan(row, actor):
@@ -3009,39 +2909,11 @@ def commit_audit_decision(*, store, plan, actor, row, question_number, action,
     prior result instead of appending a second event, while a genuinely
     different correction is a different operation with a different key.
     """
-
-    payload = {
-        "question_number": str(question_number),
-        "action": str(action),
-        "review_status": str(review_status),
-        "old_score": "" if old_score is None else str(old_score),
-        "new_score": "" if corrected is None else str(corrected),
-        "reason": (reason or "").strip(),
-        "binding": binding or "",
-    }
-    event = {
-        "event_type": "question_review_decision",
-        "question_number": payload["question_number"],
-        "action": payload["action"],
-        "review_status": payload["review_status"],
-        "old_score": payload["old_score"],
-        "new_score": payload["new_score"],
-        "reason": payload["reason"],
-        "actor": actor,
-        "binding": payload["binding"],
-        "authorization_evidence": evidence,
-    }
-    # Register (or verify) the immutable original AI output reference first:
-    # a stored decision always has an original it was reviewed against.
-    store.register_result(owner=actor, result_id=plan["result_id"],
-                          original_output=(row.get("ai_result")
-                                           or row.get("result") or {}))
-    return store.commit_correction(
-        owner=actor, result_id=plan["result_id"],
-        expected_revision=plan["expected_revision"],
-        idempotency_key=audit_store.make_idempotency_key(
-            owner=actor, result_id=plan["result_id"], payload=payload),
-        payload=payload, event=event)
+    return decision_core.commit_audit_decision(
+        store=store, plan=plan, actor=actor, row=row,
+        question_number=question_number, action=action,
+        review_status=review_status, old_score=old_score, corrected=corrected,
+        reason=reason, binding=binding, evidence=evidence)
 
 
 def apply_question_review_decision(student_key, question_number, action, reason,
@@ -3072,124 +2944,29 @@ def apply_question_review_decision(student_key, question_number, action, reason,
     default — behaviour is exactly the session-only behaviour of C6-B3 M1.
     """
     st.session_state.pop("question_review_notice", None)
-    subject = authenticated_google_identity()
-    if subject is None:
-        return _question_review_fail("authentication_required", question_number)
-    row = owned_review_row(student_key)
-    if row is None or not row_owner_allowed(row) or row.get("review_key") != student_key:
-        return _question_review_fail("review_context_unavailable", question_number)
-    scope = row_review_scope(row)
-    actor = str(sensitive_state_owner() or "unauthenticated")
-    if scope == "classroom":
-        # Fresh F-1 re-verification; its result is retained as evidence only.
-        reverified, code = reverify_classroom_review_access(row)
-        if code:
-            return _question_review_fail(code, question_number)
-        evidence = question_review.authorization_evidence(
-            scope="classroom", actor=actor,
-            authorization_revision=(reverified or {}).get("revision", ""),
-            row_revision=str(row.get("revision") or ""),
-            verified_at=(reverified or {}).get("verified_at", ""))
-    else:
-        if not manual_document_provenance_verified(row):
-            return _question_review_fail("manual_document_provenance_required",
-                                         question_number)
-        evidence = question_review.authorization_evidence(
-            scope="manual", actor=actor,
-            authorization_revision=question_review_evidence_digest(row),
-            row_revision=str(row.get("revision") or ""),
-            verified_at=f"{time.time():.0f}")
-    status = {"approve": "approved", "correct": "corrected",
-              "flag": "flagged"}.get(action)
-    if status is None:
-        return _question_review_fail("review_action_invalid", question_number)
-    question, identity = question_identity_status(row, question_number)
-    if identity != question_review.QUESTION_IDENTITY_OK:
-        # Duplicate/colliding question id (or no such question): refuse the
-        # decision instead of binding it to whichever question matched first.
-        return _question_review_fail(identity, question_number)
-    corrected = None
-    if status == "corrected":
-        ok, code = question_review.validate_mark_value(
-            corrected_mark, question.get("max_marks"))
-        if not ok:
-            return _question_review_fail(code, question_number)
-        corrected = int(corrected_mark)
-    binding = question_review_binding(student_key, row, question_number)
-    if binding is None:
-        return _question_review_fail("review_binding_unavailable", question_number)
-    key = question_review_decision_key(student_key, question_number)
-    current = question_review_store().get(key)
-    if not isinstance(current, dict):
-        current = None
-    code, new_status, state = question_review.evaluate_question_review(
-        status=status, binding=binding,
-        corrected_marks=[corrected] if corrected is not None else None,
-        reason=reason,
-        prior_status=(current or {}).get("status"),
-        prior_binding=(current or {}).get("binding"))
-    if code != "ok":
-        return _question_review_fail(code, question_number)
-    # C6-B3 M2: durable persistence is dev-only and opt-in (both off by
-    # default). The plan is resolved and the stream revision is read BEFORE
-    # any write, so a decision based on a superseded revision is refused as
-    # stale rather than overwriting a concurrent decision.
-    store, plan, plan_error = audit_persistence_plan(row, actor)
-    if plan_error is not None:
-        return _question_review_fail(plan_error, question_number)
-    session_snapshot = None
-    if status == "corrected":
-        # Single override system: recalculates totals with existing rules and
-        # keeps the original AI marks in the override record.
-        if store is not None:
-            session_snapshot = decision_session_snapshot(student_key,
-                                                         question_number)
-        save_teacher_override(student_key, str(question_number), corrected,
-                              (reason or "").strip())
-        if st.session_state.get("teacher_overrides", {}).get(
-                student_key, {}).get(str(question_number)) != corrected:
-            return _question_review_fail("override_write_rejected", question_number)
-    committed = None
-    if store is not None:
-        # Commit the decision AND its audit event in ONE transaction before
-        # the decision is accepted: a correction never survives a failed audit
-        # write, and a failed commit rolls the session side effects back too.
-        try:
-            committed = commit_audit_decision(
-                store=store, plan=plan, actor=actor, row=row,
-                question_number=question_number, action=action,
-                review_status=new_status,
-                old_score=question.get("awarded_marks"),
-                corrected=corrected, reason=reason, binding=binding,
-                evidence=evidence)
-        except audit_store.AuditStoreError as failure:
-            if session_snapshot is not None:
-                restore_decision_session_snapshot(student_key, question_number,
-                                                  session_snapshot)
-            return _question_review_fail(failure.code, question_number)
-        except Exception:
-            if session_snapshot is not None:
-                restore_decision_session_snapshot(student_key, question_number,
-                                                  session_snapshot)
-            return _question_review_fail("audit_persist_failed", question_number)
-    record = dict(state)
-    record["actor"] = actor
-    record["updated_at"] = f"{time.time():.0f}"
-    # Audit-only record of the gate that authorized THIS decision; no gate
-    # reads it back, so it can never be replayed as authorization.
-    record["authorization_evidence"] = evidence
-    if committed is not None:
-        # Dev-only durable audit reference: WHICH stream event this decision
-        # is, so it can be replayed/verified independently of session state.
-        record["audit_reference"] = {
-            "result_id": plan["result_id"],
-            "sequence": committed["sequence"],
-            "event_id": committed["event_id"],
-        }
-    question_review_store()[key] = record
-    record_question_review_event(row, student_key, question_number, status,
-                                 binding, evidence)
-    _question_review_fail("ok", question_number, status)
+    # Session adapter: resolve identity, ownership and the visible row from
+    # this session, then run the fail-closed gate sequence in decision_core
+    # (streamlit-free). Every callable is bound in this module's scope, so
+    # headless test fakes keep patching exactly where they did before this
+    # extraction; decision_core itself sees only plain arguments and mappings.
+    decision_core.apply_review_decision(
+        st.session_state,
+        student_key=student_key, question_number=question_number,
+        action=action, reason=reason, corrected_mark=corrected_mark,
+        env=decision_core.DecisionEnv(
+            subject=authenticated_google_identity(),
+            owner=sensitive_state_owner(),
+            resolve_row=lambda: owned_review_row(student_key),
+            row_owner_allowed=row_owner_allowed,
+            manual_context=st.session_state.get("last_manual_context"),
+            reverify=reverify_classroom_review_access,
+            manual_provenance_ok=manual_document_provenance_verified,
+            plan_resolver=audit_persistence_plan,
+            write_override=save_teacher_override,
+            fail=_question_review_fail,
+            record_event=record_question_review_event,
+            now=lambda: f"{time.time():.0f}",
+        ))
 
 
 def save_question_review_from_widgets(student_key, question_number):
