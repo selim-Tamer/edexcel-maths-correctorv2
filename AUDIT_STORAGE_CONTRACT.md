@@ -200,11 +200,12 @@ Not implemented, not authorized; documented so the contract survives the swap:
 
 ### 7.1 Adapter boundary toward Supabase + private object storage
 
-Selected direction (documented only; **nothing provisioned, no region chosen,
-no real data migrated, no domain purchased** — each needs its own
-authorization): client data in **Supabase Postgres**, domain/DNS at
-**Cloudflare**, API integration via **FastAPI**. The boundary the M2 store
-already exposes is what makes that swap contained:
+Selected architecture (documented only; **nothing provisioned, no region
+chosen, no real data migrated, no domain purchased, nothing deployed or paid
+for** — each needs its own authorization): client data in **Supabase
+Postgres**, domain/DNS at **Cloudflare**, API integration via **FastAPI**,
+compute on **Google Cloud Run** (API + background workers). The boundary the
+M2 store already exposes is what makes that swap contained:
 
 - **Tables → Supabase Postgres**: `results` and `audit_events` become Postgres
   tables with the same composite keys; `supabase` client/`psycopg` replaces the
@@ -218,8 +219,9 @@ already exposes is what makes that swap contained:
   non-public URLs, owner-scoped) leaves the transactional path in Postgres;
   the immutable original reference stays a digest in the `results` row either
   way.
-- **FastAPI integration**: the app layer's gate order, fresh-authorization
-  checks and failure codes do not change — FastAPI would sit in front of the
+- **FastAPI integration on Cloud Run**: the app layer's gate order,
+  fresh-authorization checks and failure codes do not change — FastAPI (the
+  API and background-worker entrypoint on Cloud Run) would sit in front of the
   same `commit_audit_decision`/`audit_persistence_plan` calls, so the dev-only
   opt-in and fail-closed posture survive the integration untouched.
 - **Not a UI replay engine**: even after the swap, the session decision records
