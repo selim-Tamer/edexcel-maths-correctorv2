@@ -198,6 +198,33 @@ Not implemented, not authorized; documented so the contract survives the swap:
   tenant column and retention behaviour are exactly what a production store
   would have to enforce from day one.
 
+### 7.1 Adapter boundary toward Supabase + private object storage
+
+Selected direction (documented only; **nothing provisioned, no region chosen,
+no real data migrated, no domain purchased** — each needs its own
+authorization): client data in **Supabase Postgres**, domain/DNS at
+**Cloudflare**, API integration via **FastAPI**. The boundary the M2 store
+already exposes is what makes that swap contained:
+
+- **Tables → Supabase Postgres**: `results` and `audit_events` become Postgres
+  tables with the same composite keys; `supabase` client/`psycopg` replaces the
+  stdlib `sqlite3` connection inside `audit_store.py` only. Row-Level Security
+  can enforce the `owner` scoping the adapter enforces in code today, but the
+  adapter keeps its explicit owner predicates so behaviour is identical with or
+  without RLS.
+- **Marks-only projection and snapshots → Cloudflare private storage (or
+  Supabase Storage)**: `snapshot_to`/`restore_from` and `export_stream` are the
+  only byte-blob touch points. Pointing them at private object storage (signed,
+  non-public URLs, owner-scoped) leaves the transactional path in Postgres;
+  the immutable original reference stays a digest in the `results` row either
+  way.
+- **FastAPI integration**: the app layer's gate order, fresh-authorization
+  checks and failure codes do not change — FastAPI would sit in front of the
+  same `commit_audit_decision`/`audit_persistence_plan` calls, so the dev-only
+  opt-in and fail-closed posture survive the integration untouched.
+- **Not a UI replay engine**: even after the swap, the session decision records
+  remain the UI source of truth; the store stays an audit trail, per §9.
+
 ## 8. Acceptance mapping (plan row for M2)
 
 | Acceptance item | Where it is proved |
