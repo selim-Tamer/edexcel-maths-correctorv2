@@ -2868,7 +2868,8 @@ def durable_result_identity(row):
 
     Classroom rows use the provider-stable course/assignment/submission triple
     plus the submission revision, so one submission keeps one durable stream
-    across sessions and a resubmission is a new revision of that stream.
+    across sessions and a resubmission (new provider revision) starts a NEW
+    stream, because the revision is part of ``result_id`` itself.
     Manual rows have no provider identity today: they are keyed by the
     server-derived document digest plus the per-run review key, which is
     session-scoped — an explicitly documented open decision, never invented

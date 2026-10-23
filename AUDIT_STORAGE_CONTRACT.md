@@ -254,3 +254,18 @@ M2 store already exposes is what makes that swap contained:
 - Manual-upload streams are session-scoped (§6.3), so "history survives
   restart" holds fully for Classroom rows and only within a session for manual
   rows until that decision is made.
+
+## 10. Follow-ups (recorded for a later milestone; not in PR #48)
+
+IR low findings (defense-in-depth, dev-only store):
+- **Restrictive store file permissions** — the SQLite store and snapshot files
+  are created with the default umask; tighten to owner-only (`0600`) so a
+  co-located process cannot read the audit file.
+- **Reject self-snapshot / closed-store restore** — `snapshot_to` should refuse
+  a target resolving to the live store path, and `restore_from` should refuse
+  when the target store is still open, avoiding snapshot/restore onto a live
+  handle.
+
+Scope/limitation follow-ups (undecided, not invented here): the dev-only
+posture, manual-stream durable identity (§6.3) and retention policy (§6) must
+be settled before any production store.
