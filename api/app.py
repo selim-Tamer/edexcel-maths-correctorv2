@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import closing
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, Header, Query
@@ -58,6 +59,7 @@ from pydantic import BaseModel, Field
 
 import audit_store
 import decision_core
+import ingest_registry
 import question_review
 from auth_oidc import OidcError, OidcVerifier
 from membership_store import MembershipError
@@ -92,7 +94,11 @@ _STATUS_BY_CODE = {
     "audit_result_identity_unavailable": 503,
     "store_closed": 503,
     "classroom_verification_unavailable": 503,
+    "store_unusable": 503,
+    "audit_order_invalid": 500,
+    "audit_record_invalid": 500,
     "audit_persist_failed": 500,
+    "original_output_immutable": 409,
 }
 
 
@@ -126,6 +132,34 @@ class DecisionRequest(BaseModel):
     review_status: Optional[str] = Field(default=None, max_length=64)
     old_score: Optional[str] = Field(default=None, max_length=256)
     binding: Optional[str] = Field(default=None, max_length=512)
+
+
+class ClassroomIdentity(BaseModel):
+    course_id: str = Field(min_length=1, max_length=256)
+    assignment_id: str = Field(min_length=1, max_length=256)
+    submission_id: str = Field(min_length=1, max_length=256)
+    revision: Optional[str] = Field(default=None, max_length=256)
+
+
+class ManualIdentity(BaseModel):
+    # Server-issued opaque reference; no pupil name is ever accepted here.
+    submission_ref: str = Field(min_length=1, max_length=256)
+    document_digest: str = Field(min_length=64, max_length=64)
+
+
+class IngestRequest(BaseModel):
+    """``POST /v1/results`` body (contract): register a reviewed result.
+
+    ``result_id`` is NEVER accepted from the client: it is minted server-side
+    in the same durable-identity format the decision core derives, so the
+    registered stream is immediately addressable by decisions/events/
+    projection without any trust in client-supplied identifiers.
+    """
+
+    scope: str = Field(min_length=1, max_length=32)
+    original_output: dict
+    classroom_identity: Optional[ClassroomIdentity] = None
+    manual_identity: Optional[ManualIdentity] = None
 
 
 def _now() -> str:
@@ -164,11 +198,12 @@ def _default_store_provider() -> Callable[[], Tuple[Optional[object], Optional[s
 
 
 def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
-               rows_for: Callable[[str, str], Iterable[dict]],
+               rows_for: Optional[Callable[[str, str], Iterable[dict]]] = None,
                store_provider: Optional[Callable] = None,
                manual_document_provenance_ok: Optional[Callable[[dict], bool]] = None,
                reverify: Optional[Callable[[dict], tuple]] = None,
                membership_resolver: Optional[Callable[[str], Any]] = None,
+               authorize_ingest: Optional[Callable[[str, str, dict], bool]] = None,
                now: Callable[[], str] = _now) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
@@ -181,12 +216,13 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
       store (``membership_store``); unconfigured/unusable storage fails
       closed with 403 ``membership_unavailable``. Active tenant membership
       is verified server-side on EVERY endpoint that uses ``actor``.
-    * ``rows_for(subject, owner)`` provides owner-scoped row visibility and
+    * ``rows_for(subject, owner)`` defaults to the opt-in development registry and
       ``store_provider() -> (store, code | None)`` the persistence; both
       still fail closed when absent.
     """
     app = FastAPI(title="ai-maths-marker-api", version="0.1.0-slice-a",
                   docs_url=None, redoc_url=None, openapi_url=None)
+    registry_rows = ingest_registry.default_provider()
     store_provider = store_provider or _default_store_provider()
     provenance_ok = manual_document_provenance_ok or (lambda row: False)
     reverify_row = reverify or _refuse_classroom
@@ -224,6 +260,15 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                             "content-length header is not a number")
         if size < 0 or size > MAX_BODY_BYTES:
             return envelope(413, "payload_invalid", "request body too large")
+        chunks = []
+        observed = 0
+        async for chunk in request.stream():
+            observed += len(chunk)
+            if observed > MAX_BODY_BYTES:
+                return envelope(413, "payload_invalid", "request body too large")
+            chunks.append(chunk)
+        # Starlette reuses this bounded cached body for downstream parsing.
+        request._body = b"".join(chunks)
         return await call_next(request)
 
     @app.exception_handler(ApiError)
@@ -281,7 +326,12 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             raise ApiError("tenant_membership_required",
                            "an active tenant membership is required",
                            detail="membership_inactive_or_absent")
-        return subject, "google:" + subject
+        if (not isinstance(membership, membership_store.Membership)
+                or membership.subject != subject or not membership.tenant_id):
+            raise ApiError("tenant_membership_required",
+                           "an active tenant membership is required",
+                           detail="membership_unavailable")
+        return subject, "google:" + subject, membership.tenant_id
 
     def require_store():
         store, code = store_provider()
@@ -306,7 +356,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def healthz():
         return {"status": "ok"}
 
-    def visible_row(subject: str, owner: str, result_id: str):
+    def visible_row(subject: str, owner: str, tenant_id: str, result_id: str):
         """The ONE owner-visible row whose durable identity equals result_id.
 
         Shared by reads and writes so both obey the same visibility rule:
@@ -314,11 +364,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         about that stream is reachable - history included (finding O-1
         decision: reads are gated too; audit-export paths are future work).
         """
-        rows = [row for row in (rows_for(subject, owner) or [])
+        candidates = (rows_for(subject, owner) if rows_for is not None
+                      else registry_rows(subject, owner, tenant_id))
+        rows = [row for row in (candidates or [])
                 if isinstance(row, dict)]
         return next(
             (candidate for candidate in rows
              if candidate.get("report_owner") == owner
+             and candidate.get("tenant_id", tenant_id) == tenant_id
              and decision_core.durable_result_identity(candidate, "")
              == result_id), None)
 
@@ -326,14 +379,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def read_events(result_id: str,
                     limit: Optional[int] = Query(default=None, ge=1, le=500),
                     who=Depends(actor)):
-        subject, owner = who
-        if visible_row(subject, owner, result_id) is None:
+        subject, owner, tenant_id = who
+        if visible_row(subject, owner, tenant_id, result_id) is None:
             # Same indistinguishable denial as the write path.
             raise ApiError("result_not_registered", "no result for this owner")
         store = require_store()
         revision = stream_revision(store, owner, result_id)
-        if revision == 0:
-            # Owner-scoped miss is indistinguishable from "does not exist".
+        if store.current_revision(owner=owner, result_id=result_id) is None:
+            # A registered zero-event stream is valid; absence stays private.
             raise ApiError("result_not_registered", "no result for this owner")
         try:
             events = store.events(owner=owner, result_id=result_id, limit=limit)
@@ -342,16 +395,199 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         return {"result_id": result_id, "events": events,
                 "result_revision": revision}
 
+    @app.post("/v1/results", status_code=201)
+    def ingest_result(body: IngestRequest, who=Depends(actor)):
+        """Contract ingest: register an immutable original + its row.
+
+        Server mints result_id (never client-supplied); the audit-store
+        registration happens FIRST (the immutable anchor), then the dev
+        registry row that makes the stream visible through the same
+        owner-scoped rule as everything else. A registry failure after a
+        successful registration leaves an invisible-but-immutable stream;
+        a re-ingest completes the row idempotently.
+        """
+        subject, owner, tenant_id = who
+        scope = (body.scope or "").strip().lower()
+        if scope not in ("manual", "classroom"):
+            raise ApiError("payload_invalid", "scope must be manual or classroom")
+        original = body.original_output
+        if not isinstance(original, dict):
+            raise ApiError("original_output_invalid",
+                           "original_output must be a mapping")
+        if not isinstance(original.get("questions"), list):
+            raise ApiError("original_output_invalid",
+                           "original_output must carry a questions list")
+
+        digest = ""
+        revision = ""
+        submission = ""
+        if scope == "manual":
+            if body.manual_identity is None:
+                raise ApiError("payload_invalid",
+                               "manual_identity is required for manual scope")
+            digest = body.manual_identity.document_digest.strip().lower()
+            if len(digest) != 64 or any(c not in "0123456789abcdef"
+                                        for c in digest):
+                raise ApiError("payload_invalid",
+                               "document_digest must be a sha256 hex digest")
+            reference = body.manual_identity.submission_ref.strip()
+            if (not reference or len(reference) > 256 or "/" in reference
+                    or any(ord(c) < 32 for c in reference)):
+                raise ApiError("payload_invalid",
+                               "submission_ref is not a valid server-issued id")
+            review_key = reference
+            result_id = "manual:" + digest[:16] + ":" + reference
+        else:
+            if body.classroom_identity is None:
+                raise ApiError("payload_invalid",
+                               "classroom_identity is required for classroom scope")
+            identity = body.classroom_identity
+            parts = {}
+            for name, value in (("course", identity.course_id),
+                                ("assignment", identity.assignment_id),
+                                ("submission", identity.submission_id)):
+                cleaned = (value or "").strip()
+                if (not cleaned or len(cleaned) > 256 or "/" in cleaned
+                        or any(ord(c) < 32 for c in cleaned)):
+                    raise ApiError("payload_invalid",
+                                   f"{name} id is not a valid server identity")
+                parts[name] = cleaned
+            revision = (identity.revision or "").strip()
+            if revision and ("/" in revision or len(revision) > 256
+                             or any(ord(c) < 32 for c in revision)):
+                raise ApiError("payload_invalid", "revision is not valid")
+            submission = parts["submission"]
+            review_key = submission
+            result_id = ("classroom:" + parts["course"] + ":"
+                         + parts["assignment"] + ":" + submission + ":"
+                         + (revision or "unversioned"))
+
+        row = {"status": "Marked", "review_key": review_key,
+               "report_owner": owner, "snapshot_context": digest,
+               "tenant_id": tenant_id,
+               "revision": revision, "result": original,
+               "ai_result": original, "student_name": "",
+               "marking_model": "ingested", "audit_model": "Not run"}
+        if scope == "classroom":
+            row.update({"classroom_course_id": parts["course"],
+                        "classroom_assignment_id": parts["assignment"],
+                        "submission_id": submission})
+        # A client-supplied digest/reference or original output is not a
+        # server-issued marking result. The trusted job/provenance service
+        # must authorize the exact owner/tenant/identity/output tuple. Until
+        # that service is wired, ingestion is denied before any store write.
+        try:
+            authorized = (authorize_ingest is not None and
+                          authorize_ingest(subject, tenant_id, row) is True)
+        except Exception:
+            authorized = False
+        if not authorized:
+            raise ApiError("manual_document_provenance_required",
+                           "a server-authorized result is required",
+                           detail="ingest_authorization_required")
+        store = require_store()
+        try:
+            with closing(ingest_registry.require_connection()) as connection:
+                registered = store.register_result(
+                    owner=owner, result_id=result_id, original_output=original)
+                ingest_registry.put_row(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    result_id=result_id, scope=scope, review_key=review_key,
+                    document_digest=digest, row=row)
+        except audit_store.AuditStoreError as failure:
+            raise ApiError(failure.code, "registration refused")
+        except ingest_registry.RegistryError as failure:
+            raise ApiError(failure.detail,
+                           "the ingest registry row could not be written",
+                           detail=failure.detail)
+        return {"result_id": result_id, "owner": owner,
+                "result_revision": registered["result_revision"],
+                # Interpretation of the contract's audit_reference for a
+                # zero-event registration: the immutable original digest.
+                "audit_reference": registered["original_digest"],
+                "supersedes": None}
+
+    @app.get("/v1/results/{result_id}/projection")
+    def project_result(result_id: str, who=Depends(actor)):
+        """Contract projection: original + corrections ALONGSIDE, never over.
+
+        Originals come from the owner-visible row (the store deliberately
+        never holds answers/working text); corrections are the store's
+        chained events, latest-per-question wins; only a ``corrected``
+        status changes an effective mark (flags/approvals never do — the
+        single-override rule). Invariant: ``original_ai_output`` is returned
+        untouched and the store is never mutated.
+        """
+        subject, owner, tenant_id = who
+        row = visible_row(subject, owner, tenant_id, result_id)
+        if row is None:
+            raise ApiError("result_not_registered", "no result for this owner")
+        store = require_store()
+        try:
+            original_record = store.original_record(
+                owner=owner, result_id=result_id)
+            events = store.replay(owner=owner, result_id=result_id)
+        except audit_store.AuditStoreError as failure:
+            raise ApiError(failure.code, "projection read failed")
+
+        pristine = row.get("ai_result") or row.get("result") or {}
+        if audit_store.digest_value(pristine) != original_record["original_digest"]:
+            raise ApiError("audit_record_invalid", "the original output changed")
+        questions = pristine.get("questions") if isinstance(pristine, dict) \
+            else None
+        if not isinstance(questions, list):
+            questions = []
+        latest = {}
+        for event in events:  # stream order: later events win
+            latest[str(event.get("question_number"))] = event
+        earned = 0.0
+        available = 0.0
+        projected = []
+        for question in questions:
+            number = str(question.get("question_number", ""))
+            original_marks = question.get("awarded_marks")
+            max_marks = question.get("max_marks")
+            event = latest.get(number)
+            status = (event or {}).get("review_status") or "unreviewed"
+            effective = original_marks
+            corrected = False
+            if status == "corrected":
+                try:
+                    effective = int((event or {}).get("new_score"))
+                except (TypeError, ValueError):
+                    raise ApiError("audit_record_invalid",
+                                   "a stored correction is unreadable")
+                corrected = True
+            entry = {"question_number": number, "max_marks": max_marks,
+                     "original_awarded_marks": original_marks,
+                     "effective_awarded_marks": effective,
+                     "corrected": corrected, "review_status": status}
+            if event is not None:
+                entry["last_action"] = event.get("action")
+                entry["last_reason"] = event.get("reason")
+            projected.append(entry)
+            if isinstance(effective, (int, float)):
+                earned += float(effective)
+            if isinstance(max_marks, (int, float)):
+                available += float(max_marks)
+        return {"result_id": result_id,
+                "result_revision": original_record["result_revision"],
+                "questions": projected,
+                "original_ai_output": pristine,
+                "totals": {"earned": earned, "available": available,
+                           "percentage": (round(earned * 100.0 / available, 2)
+                                          if available else 0.0)}}
+
     @app.post("/v1/results/{result_id}/decisions")
     def submit_decision(result_id: str, body: DecisionRequest,
                         who=Depends(actor)):
-        subject, owner = who
+        subject, owner, tenant_id = who
         store = require_store()
 
         # 1. Owner-scoped row resolution: the durable identity of a visible
         #    row must equal the requested result_id, else nothing is known
         #    about that stream for this owner (fail closed, leak nothing).
-        row = visible_row(subject, owner, result_id)
+        row = visible_row(subject, owner, tenant_id, result_id)
         if row is None:
             raise ApiError("result_not_registered", "no result for this owner")
 
