@@ -306,11 +306,30 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def healthz():
         return {"status": "ok"}
 
+    def visible_row(subject: str, owner: str, result_id: str):
+        """The ONE owner-visible row whose durable identity equals result_id.
+
+        Shared by reads and writes so both obey the same visibility rule:
+        if the provider no longer lists the row for this owner, NOTHING
+        about that stream is reachable - history included (finding O-1
+        decision: reads are gated too; audit-export paths are future work).
+        """
+        rows = [row for row in (rows_for(subject, owner) or [])
+                if isinstance(row, dict)]
+        return next(
+            (candidate for candidate in rows
+             if candidate.get("report_owner") == owner
+             and decision_core.durable_result_identity(candidate, "")
+             == result_id), None)
+
     @app.get("/v1/results/{result_id}/events")
     def read_events(result_id: str,
                     limit: Optional[int] = Query(default=None, ge=1, le=500),
                     who=Depends(actor)):
-        _, owner = who
+        subject, owner = who
+        if visible_row(subject, owner, result_id) is None:
+            # Same indistinguishable denial as the write path.
+            raise ApiError("result_not_registered", "no result for this owner")
         store = require_store()
         revision = stream_revision(store, owner, result_id)
         if revision == 0:
@@ -332,13 +351,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         # 1. Owner-scoped row resolution: the durable identity of a visible
         #    row must equal the requested result_id, else nothing is known
         #    about that stream for this owner (fail closed, leak nothing).
-        rows = [row for row in (rows_for(subject, owner) or [])
-                if isinstance(row, dict)]
-        row = next(
-            (candidate for candidate in rows
-             if candidate.get("report_owner") == owner
-             and decision_core.durable_result_identity(candidate, "")
-             == result_id), None)
+        row = visible_row(subject, owner, result_id)
         if row is None:
             raise ApiError("result_not_registered", "no result for this owner")
 

@@ -353,6 +353,37 @@ class OwnerScopeTests(ApiTestCase):
         self.assertEqual(missing.json()["error"]["code"],
                          "result_not_registered")
 
+    def test_withdrawn_row_gates_history_reads_too(self):
+        """Finding O-1 decision: reads obey the same visibility rule as
+        writes - provider withdraws the row => no history, stream intact."""
+        row = manual_row()
+        self.rows[OWNER] = [row]
+        result_id = result_id_of(row)
+        committed = self.client.post(
+            f"/v1/results/{result_id}/decisions", headers=self.auth(),
+            json={"question_number": "1", "action": "approve",
+                  "expected_revision": 0, "idempotency_key": "k1"})
+        self.assertEqual(committed.status_code, 200, committed.text)
+        visible = self.client.get(f"/v1/results/{result_id}/events",
+                                  headers=self.auth())
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(len(visible.json()["events"]), 1)
+
+        self.rows[OWNER] = []  # provider withdraws the row
+        denied_write = self.client.post(
+            f"/v1/results/{result_id}/decisions", headers=self.auth(),
+            json={"question_number": "2", "action": "approve",
+                  "expected_revision": 1, "idempotency_key": "k2"})
+        self.assertEqual(denied_write.status_code, 404)
+        denied_read = self.client.get(f"/v1/results/{result_id}/events",
+                                      headers=self.auth())
+        self.assertEqual(denied_read.status_code, 404)
+        self.assertEqual(denied_read.json()["error"]["code"],
+                         "result_not_registered")
+        # The audit stream itself is untouched by the denial.
+        self.assertEqual(self.store.current_revision(owner=OWNER,
+                                                     result_id=result_id), 1)
+
 
 class RequestBodyLimitTests(ApiTestCase):
 
