@@ -16,3 +16,7 @@ sympy==1.14.0
 # is what fastapi.testclient drives. Both are scanned by dependency-audit.
 fastapi==0.162.0
 httpx==0.28.1
+# Auth foundation (tests/test_auth_oidc_verifier.py, test_tenant_membership.py):
+# PyJWT[crypto] -- also pinned in requirements.txt now that the real verifier
+# ships; offline tests build their own RSA keys, no network.
+PyJWT[crypto]==2.15.1

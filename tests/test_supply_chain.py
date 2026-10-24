@@ -64,11 +64,27 @@ class ProductionRequirements(TestCase):
             )
 
     def test_declared_dependency_set_matches_stage_s5_plan(self):
+        # S5 plan amended deliberately by the M5 auth foundation slice:
+        # PyJWT[crypto] ships because auth_oidc.py verifies real OIDC ID
+        # tokens in production (IR design review: exact pin, RS256-only,
+        # python-jose rejected for algorithm-confusion advisories).
         self.assertEqual(
             {name.lower() for name, _ in self.records},
             {"streamlit", "authlib", "google-genai", "pandas",
-             "requests", "pypdf", "pypdfium2", "pillow"},
+             "requests", "pypdf", "pypdfium2", "pillow", "pyjwt"},
         )
+
+    def test_pyjwt_is_exact_pinned_with_its_crypto_extra(self):
+        # read_manifest splits the extra off, so check the raw line too.
+        raw_lines = [chunk.split("#", 1)[0].strip()
+                     for chunk in
+                     (ROOT / "requirements.txt").read_text(
+                         encoding="utf-8").splitlines()]
+        line = next((chunk for chunk in raw_lines
+                     if chunk.lower().startswith("pyjwt")), None)
+        self.assertIsNotNone(line, "pyjwt missing from requirements.txt")
+        self.assertEqual(line.lower(), "pyjwt[crypto]==2.15.1",
+                         "PyJWT must keep its crypto extra and exact pin")
 
     def test_untrusted_pdf_stack_stays_exactly_pinned(self):
         for name in ("pypdf", "pypdfium2", "Pillow"):

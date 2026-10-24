@@ -20,6 +20,12 @@ import audit_store
 import question_review as qr
 from api.app import create_app
 from fastapi.testclient import TestClient
+from membership_store import Membership
+
+
+def active_member(subject: str) -> Membership:
+    """Fixture membership: every fake-verified subject is one active teacher."""
+    return Membership(subject, "tenant-beta", "teacher")
 
 SUBJECT = "alice-subject"
 OWNER = "google:" + SUBJECT
@@ -81,6 +87,7 @@ class ApiTestCase(unittest.TestCase):
             rows_for=lambda subject, owner: self.rows.get(owner, []),
             store_provider=lambda: (self.store, None),
             manual_document_provenance_ok=lambda row: True,
+            membership_resolver=active_member,
         )
         self.client = TestClient(self.app)
 
@@ -259,7 +266,8 @@ class FailClosedDefaultTests(ApiTestCase):
     def test_without_a_provenance_grant_the_decision_is_refused(self):
         app = create_app(verify_token=TOKENS.get,
                          rows_for=lambda subject, owner: [manual_row()],
-                         store_provider=lambda: (self.store, None))
+                         store_provider=lambda: (self.store, None),
+                         membership_resolver=active_member)
         client = TestClient(app)
         response = client.post(
             f"/v1/results/{result_id_of(manual_row())}/decisions",
@@ -287,7 +295,8 @@ class FailClosedDefaultTests(ApiTestCase):
     def test_missing_store_opt_in_is_dev_opt_in_required(self):
         app = create_app(verify_token=TOKENS.get,
                          rows_for=lambda subject, owner: [manual_row()],
-                         store_provider=lambda: (None, "dev_opt_in_required"))
+                         store_provider=lambda: (None, "dev_opt_in_required"),
+                         membership_resolver=active_member)
         client = TestClient(app)
         response = client.post(
             f"/v1/results/{result_id_of(manual_row())}/decisions",
