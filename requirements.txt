@@ -18,7 +18,7 @@ streamlit>=1.66.1,<1.67
 # (S5 finding F-12: retained, not unused).
 Authlib>=1.3.2,<2
 google-genai>=1.40,<3
-pandas>=2.0,<4
+pandas>=3.0.6,<4
 requests>=2.31,<3
 # Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls).
 # pypdf 6.21.1 fixes CVE-2026-113786; 6.21.2 additionally fixes three
