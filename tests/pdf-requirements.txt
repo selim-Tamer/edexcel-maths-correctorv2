@@ -16,3 +16,8 @@ sympy==1.14.0
 # is what fastapi.testclient drives. Both are scanned by dependency-audit.
 fastapi==0.162.0
 httpx==0.28.1
+# M5 persistence slice (tests/test_postgres_store_contract.py): PostgreSQL
+# driver. Test/CI-only for now - no API deployment is authorized, so it stays
+# out of requirements.txt; the CI postgres-tests service container is the
+# authoritative integration run (local runs skip without a DSN).
+psycopg[binary]==3.3.6
