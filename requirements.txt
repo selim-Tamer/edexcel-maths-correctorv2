@@ -29,3 +29,8 @@ requests>=2.31,<3
 pypdf==6.21.2
 pypdfium2==5.14.0
 Pillow==13.0.0
+# OIDC ID-token verification for the API auth foundation (auth_oidc.py; IR
+# design review: PyJWT[crypto] exact pin, RS256-only allowlist, python-jose
+# rejected for its algorithm-confusion advisory history). Ships with the
+# verifier slice; audited by the dependency-audit job.
+PyJWT[crypto]==2.15.1
