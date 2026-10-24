@@ -307,7 +307,7 @@ class PostgresAuditStore:
                     " supersedes_event_id, actor, binding,"
                     " authorization_json, created_at)"
                     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-                    " %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())",
+                    " %s, %s, %s, %s, %s, %s, %s, %s, %s, now())",
                     (self.tenant_id, owner, result_id, sequence, event_id,
                      key, digest, fields["event_type"], fields["question_number"],
                      fields["action"], fields["review_status"],
