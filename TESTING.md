@@ -210,6 +210,12 @@ Constraints are intentional, not accidental (findings F-10, F-11, F-12):
   Google sign-in on Streamlit Cloud. `tests/test_supply_chain.py` guards this.
 - `sympy` is development-only (offline verification research/benchmarks in
   `investigation/`); the deployed app performs plain Python arithmetic.
+- `PyJWT[crypto]==2.15.1` (M5 auth foundation) is exactly pinned and verifies
+  Google **OIDC ID tokens** in `auth_oidc.py` with an RS256-only allowlist
+  checked before any key use. It ships with the verifier slice after IR design
+  review and a clean `pip-audit`; `python-jose` was deliberately rejected for
+  its algorithm-confusion advisory history. `tests/test_supply_chain.py`
+  guards the declared set, and the exact pin.
 - There is intentionally no lockfile: Streamlit Community Cloud does not
   consume one, and duplicating the manifest would create two drifting sources
   of truth. Reproducibility instead comes from pinned PDF stack versions,

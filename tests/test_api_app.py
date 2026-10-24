@@ -20,6 +20,12 @@ import audit_store
 import question_review as qr
 from api.app import create_app
 from fastapi.testclient import TestClient
+from membership_store import Membership
+
+
+def active_member(subject: str) -> Membership:
+    """Fixture membership: every fake-verified subject is one active teacher."""
+    return Membership(subject, "tenant-beta", "teacher")
 
 SUBJECT = "alice-subject"
 OWNER = "google:" + SUBJECT
@@ -81,6 +87,7 @@ class ApiTestCase(unittest.TestCase):
             rows_for=lambda subject, owner: self.rows.get(owner, []),
             store_provider=lambda: (self.store, None),
             manual_document_provenance_ok=lambda row: True,
+            membership_resolver=active_member,
         )
         self.client = TestClient(self.app)
 
@@ -259,7 +266,8 @@ class FailClosedDefaultTests(ApiTestCase):
     def test_without_a_provenance_grant_the_decision_is_refused(self):
         app = create_app(verify_token=TOKENS.get,
                          rows_for=lambda subject, owner: [manual_row()],
-                         store_provider=lambda: (self.store, None))
+                         store_provider=lambda: (self.store, None),
+                         membership_resolver=active_member)
         client = TestClient(app)
         response = client.post(
             f"/v1/results/{result_id_of(manual_row())}/decisions",
@@ -287,7 +295,8 @@ class FailClosedDefaultTests(ApiTestCase):
     def test_missing_store_opt_in_is_dev_opt_in_required(self):
         app = create_app(verify_token=TOKENS.get,
                          rows_for=lambda subject, owner: [manual_row()],
-                         store_provider=lambda: (None, "dev_opt_in_required"))
+                         store_provider=lambda: (None, "dev_opt_in_required"),
+                         membership_resolver=active_member)
         client = TestClient(app)
         response = client.post(
             f"/v1/results/{result_id_of(manual_row())}/decisions",
@@ -343,6 +352,37 @@ class OwnerScopeTests(ApiTestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["error"]["code"],
                          "result_not_registered")
+
+    def test_withdrawn_row_gates_history_reads_too(self):
+        """Finding O-1 decision: reads obey the same visibility rule as
+        writes - provider withdraws the row => no history, stream intact."""
+        row = manual_row()
+        self.rows[OWNER] = [row]
+        result_id = result_id_of(row)
+        committed = self.client.post(
+            f"/v1/results/{result_id}/decisions", headers=self.auth(),
+            json={"question_number": "1", "action": "approve",
+                  "expected_revision": 0, "idempotency_key": "k1"})
+        self.assertEqual(committed.status_code, 200, committed.text)
+        visible = self.client.get(f"/v1/results/{result_id}/events",
+                                  headers=self.auth())
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(len(visible.json()["events"]), 1)
+
+        self.rows[OWNER] = []  # provider withdraws the row
+        denied_write = self.client.post(
+            f"/v1/results/{result_id}/decisions", headers=self.auth(),
+            json={"question_number": "2", "action": "approve",
+                  "expected_revision": 1, "idempotency_key": "k2"})
+        self.assertEqual(denied_write.status_code, 404)
+        denied_read = self.client.get(f"/v1/results/{result_id}/events",
+                                      headers=self.auth())
+        self.assertEqual(denied_read.status_code, 404)
+        self.assertEqual(denied_read.json()["error"]["code"],
+                         "result_not_registered")
+        # The audit stream itself is untouched by the denial.
+        self.assertEqual(self.store.current_revision(owner=OWNER,
+                                                     result_id=result_id), 1)
 
 
 class RequestBodyLimitTests(ApiTestCase):

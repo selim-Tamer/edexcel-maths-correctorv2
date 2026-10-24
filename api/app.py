@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, Header, Query
 from fastapi.exceptions import RequestValidationError
@@ -59,6 +59,9 @@ from pydantic import BaseModel, Field
 import audit_store
 import decision_core
 import question_review
+from auth_oidc import OidcError, OidcVerifier
+from membership_store import MembershipError
+import membership_store
 
 DEV_STORE_ENV = "AI_MARKER_AUDIT_DEV_STORE"
 DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
@@ -76,6 +79,7 @@ MAX_BODY_BYTES = 32_768
 _STATUS_BY_CODE = {
     "authentication_required": 401,
     "manual_document_provenance_required": 403,
+    "tenant_membership_required": 403,
     "result_not_registered": 404,
     "review_context_unavailable": 404,
     "review_question_unavailable": 404,
@@ -159,24 +163,44 @@ def _default_store_provider() -> Callable[[], Tuple[Optional[object], Optional[s
     return provider
 
 
-def create_app(*, verify_token: Callable[[str], Optional[str]],
+def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                rows_for: Callable[[str, str], Iterable[dict]],
                store_provider: Optional[Callable] = None,
                manual_document_provenance_ok: Optional[Callable[[dict], bool]] = None,
                reverify: Optional[Callable[[dict], tuple]] = None,
+               membership_resolver: Optional[Callable[[str], Any]] = None,
                now: Callable[[], str] = _now) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
-    ``verify_token(token) -> subject | None`` decides authentication,
-    ``rows_for(subject, owner)`` the owner-scoped row visibility, and
-    ``store_provider() -> (store, code | None)`` the persistence. Every one of
-    them fails closed when absent.
+    Defaults are the REAL controls, not a bypass:
+    * ``verify_token=None`` builds the Google OIDC **ID-token** verifier
+      (``auth_oidc.OidcVerifier``) from ``GOOGLE_OIDC_AUDIENCE``; with no
+      audience configured every protected call fails closed with 401
+      ``oidc_not_configured``. Only tests pass a fake verifier.
+    * ``membership_resolver=None`` uses the env-configured dev membership
+      store (``membership_store``); unconfigured/unusable storage fails
+      closed with 403 ``membership_unavailable``. Active tenant membership
+      is verified server-side on EVERY endpoint that uses ``actor``.
+    * ``rows_for(subject, owner)`` provides owner-scoped row visibility and
+      ``store_provider() -> (store, code | None)`` the persistence; both
+      still fail closed when absent.
     """
     app = FastAPI(title="ai-maths-marker-api", version="0.1.0-slice-a",
                   docs_url=None, redoc_url=None, openapi_url=None)
     store_provider = store_provider or _default_store_provider()
     provenance_ok = manual_document_provenance_ok or (lambda row: False)
     reverify_row = reverify or _refuse_classroom
+    membership_resolver = membership_resolver or membership_store.default_resolver()
+    if verify_token is None:
+        audience = (os.environ.get("GOOGLE_OIDC_AUDIENCE") or "").strip()
+        if audience:
+            _oidc = OidcVerifier(audience=audience)
+
+            def verify_token(token: str) -> str:
+                return _oidc.verify(token)  # raises OidcError (static detail)
+        else:
+            def verify_token(token: str) -> str:
+                raise OidcError("oidc_not_configured")
 
     def envelope(status: int, code: str, message: str, detail: str = ""):
         error = {"code": code, "message": message}
@@ -211,15 +235,53 @@ def create_app(*, verify_token: Callable[[str], Optional[str]],
         return envelope(400, "payload_invalid", "request body failed validation")
 
     def actor(authorization: str = Header(default="", alias="Authorization")):
-        """Authenticated subject + server-derived owner, or 401."""
+        """Verified subject + server-derived owner + active membership, or 401/403.
+
+        Order: bearer parsing (missing header => detail token_missing) ->
+        signature/claims verification (granular STATIC detail per failure
+        class: token_expired, token_issuer_mismatch, token_audience_mismatch,
+        token_algorithm_not_allowed, token_signature_invalid, ...) ->
+        server-side ACTIVE tenant membership (403 tenant_membership_required;
+        inactive/absent collapse into one non-enumerating detail).
+        The owner is always derived here as ``google:`` + verified subject.
+        """
         scheme, _, token = (authorization or "").partition(" ")
-        subject = None
-        if scheme.lower() == "bearer" and token.strip():
+        if scheme.lower() != "bearer" or not token.strip():
+            raise ApiError("authentication_required",
+                           "a valid bearer token is required",
+                           detail="token_missing")
+        try:
             subject = verify_token(token.strip())
+        except OidcError as failure:
+            raise ApiError("authentication_required",
+                           "a valid bearer token is required",
+                           detail=failure.detail)
+        except Exception:
+            # Anything unexpected from a verifier fails closed and never
+            # echoes internals (or the token).
+            raise ApiError("authentication_required",
+                           "a valid bearer token is required",
+                           detail="token_verification_failed")
         if not isinstance(subject, str) or not subject.strip():
             raise ApiError("authentication_required",
-                           "a valid bearer token is required")
-        return subject.strip(), "google:" + subject.strip()
+                           "a valid bearer token is required",
+                           detail="token_invalid")
+        subject = subject.strip()
+        try:
+            membership = membership_resolver(subject)
+        except MembershipError as failure:
+            raise ApiError("tenant_membership_required",
+                           "an active tenant membership is required",
+                           detail=failure.detail)
+        except Exception:
+            raise ApiError("tenant_membership_required",
+                           "an active tenant membership is required",
+                           detail="membership_unavailable")
+        if membership is None:
+            raise ApiError("tenant_membership_required",
+                           "an active tenant membership is required",
+                           detail="membership_inactive_or_absent")
+        return subject, "google:" + subject
 
     def require_store():
         store, code = store_provider()
@@ -244,11 +306,30 @@ def create_app(*, verify_token: Callable[[str], Optional[str]],
     def healthz():
         return {"status": "ok"}
 
+    def visible_row(subject: str, owner: str, result_id: str):
+        """The ONE owner-visible row whose durable identity equals result_id.
+
+        Shared by reads and writes so both obey the same visibility rule:
+        if the provider no longer lists the row for this owner, NOTHING
+        about that stream is reachable - history included (finding O-1
+        decision: reads are gated too; audit-export paths are future work).
+        """
+        rows = [row for row in (rows_for(subject, owner) or [])
+                if isinstance(row, dict)]
+        return next(
+            (candidate for candidate in rows
+             if candidate.get("report_owner") == owner
+             and decision_core.durable_result_identity(candidate, "")
+             == result_id), None)
+
     @app.get("/v1/results/{result_id}/events")
     def read_events(result_id: str,
                     limit: Optional[int] = Query(default=None, ge=1, le=500),
                     who=Depends(actor)):
-        _, owner = who
+        subject, owner = who
+        if visible_row(subject, owner, result_id) is None:
+            # Same indistinguishable denial as the write path.
+            raise ApiError("result_not_registered", "no result for this owner")
         store = require_store()
         revision = stream_revision(store, owner, result_id)
         if revision == 0:
@@ -270,13 +351,7 @@ def create_app(*, verify_token: Callable[[str], Optional[str]],
         # 1. Owner-scoped row resolution: the durable identity of a visible
         #    row must equal the requested result_id, else nothing is known
         #    about that stream for this owner (fail closed, leak nothing).
-        rows = [row for row in (rows_for(subject, owner) or [])
-                if isinstance(row, dict)]
-        row = next(
-            (candidate for candidate in rows
-             if candidate.get("report_owner") == owner
-             and decision_core.durable_result_identity(candidate, "")
-             == result_id), None)
+        row = visible_row(subject, owner, result_id)
         if row is None:
             raise ApiError("result_not_registered", "no result for this owner")
 
