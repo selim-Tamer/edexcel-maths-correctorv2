@@ -56,6 +56,10 @@ class PostgresStoreContractTests(unittest.TestCase):
     def setUp(self):
         self.conn = psycopg.connect(DSN)
         self.addCleanup(self.conn.close)
+        # Self-heal schema_version: the unsupported-version test deliberately
+        # breaks it and must never poison the next test.
+        self.conn.execute(
+            "UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'")
         self.conn.execute(
             "TRUNCATE audit_events, results, pdf_references, "
             "tenant_membership, tenants RESTART IDENTITY CASCADE")
@@ -73,7 +77,7 @@ class PostgresStoreContractTests(unittest.TestCase):
 
     def register(self, store=None, result_id=RESULT, output=ORIGINAL,
                  owner=SUBJECT):
-        (store or self.store).register_result(
+        return (store or self.store).register_result(
             owner=owner, result_id=result_id, original_output=output)
 
     def commit(self, *, key, expected, question="1", action="correct",
