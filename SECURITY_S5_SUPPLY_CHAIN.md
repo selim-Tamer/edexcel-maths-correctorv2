@@ -9,7 +9,7 @@ Base commit: `da2521809e3e23d664a6920cfca5b0f3a52f0f08` (merge of PR #29).
 | Package | Proposed constraint | Purpose | Directly imported | Also required transitively by |
 |---|---|---|---|---|
 | streamlit | `>=1.66.1,<1.67` | UI framework | yes (production app) | — |
-| Authlib | `>=1.3.2,<2` | OIDC session tokens (S2 auth) | **no** — needed by Streamlit `st.login()` | Streamlit `auth` extra (`authlib.jose` in `streamlit/auth_util.py`) |
+| Authlib | `>=1.9.1,<2` | OIDC client and token validation (S2 auth) | **no** — needed by Streamlit `st.login()` | Streamlit `auth` extra; see [current floor review](DEPENDENCY_AUTHLIB_REVIEW.md) |
 | google-genai | `>=1.40,<3` | Gemini SDK | yes | — |
 | pandas | `>=2.0,<4` | report tables | yes | Streamlit (floor `>=1.4.0`) |
 | requests | `>=2.31,<3` | Classroom/Drive REST transport, bounded downloads | yes | google-genai, streamlit |

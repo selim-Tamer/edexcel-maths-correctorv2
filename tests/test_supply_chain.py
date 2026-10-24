@@ -98,7 +98,8 @@ class ProductionRequirements(TestCase):
             "google-genai": ((1, 40), (3,)),
             "pandas": ((2, 0), (4,)),
             "requests": ((2, 31), (3,)),
-            "Authlib": ((1, 3, 2), (2,)),
+            # Reviewed security floor; explicit minimum/latest CI coverage.
+            "Authlib": ((1, 9, 1), (2,)),
         }
         for name, (floor, cap) in expectations.items():
             specifiers = spec_of(self.records, name)
@@ -107,6 +108,10 @@ class ProductionRequirements(TestCase):
                           f"{name} lost its documented floor")
             self.assertEqual(specifiers[0][1], ".".join(map(str, floor)),
                              f"{name} floor drifted from the CI-validated baseline")
+            self.assertEqual(set(specifiers), {
+                (">=", ".".join(map(str, floor))),
+                ("<", ".".join(map(str, cap))),
+            }, f"{name} must preserve the reviewed floor AND upper bound")
 
 
 class AuthlibRetention(TestCase):
