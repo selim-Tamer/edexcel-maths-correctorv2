@@ -241,10 +241,12 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
       ``store_provider() -> (store, code | None)`` the persistence; both
       still fail closed when absent.
     * ``authorize_ingest=None`` defaults to the JOB-BACKED provenance gate:
-      ingest is allowed only for an owner+tenant document with a running or
-      succeeded marking job in the opt-in job store, and denied (no store
-      write) whenever that store is unconfigured or has no matching job -
-      i.e. the default fails closed, never open.
+      client ingest is allowed only for an owner+tenant document whose
+      marking job has SUCCEEDED (i.e. the genuine engine output is already
+      registered), and denied (no store write) whenever the job store is
+      unconfigured or has no matching succeeded job - i.e. the default fails
+      closed, never open. The lease-holding runner does not go through this
+      status check: it passes its claimed ``job_id`` as its own authority.
     * ``engine=None`` means no marking engine is wired: the synchronous job
       runner refuses with 503 ``model_unavailable`` instead of pretending a
       result exists. Tests and dev wiring inject the real/fake engine.
@@ -431,12 +433,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
 
     def job_backed_ingest_authorizer(subject: str, tenant_id: str,
                                      row: dict) -> bool:
-        """Default provenance gate: a REAL server-side job authorizes ingest.
+        """Default provenance gate: a COMPLETED server-side job authorizes.
 
-        The row's ``snapshot_context`` is the document digest; ingest is
-        allowed only when this exact owner+tenant has a running or succeeded
-        marking job for that document. Unconfigured job store, missing row or
-        any store failure means False - the default fails closed.
+        The row's ``snapshot_context`` is the document digest; client ingest
+        is allowed only when this exact owner+tenant has a SUCCEEDED marking
+        job for that document (the genuine output is already registered).
+        Unconfigured job store, missing row, an in-flight ``running`` job or
+        any store failure means False - the default fails closed, and the
+        claim->succeed window can never be pre-empted (finding J-1).
         """
         digest = str(row.get("snapshot_context") or "")
         owner = str(row.get("report_owner") or "")
@@ -453,16 +457,47 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
 
     authorize_ingest = authorize_ingest or job_backed_ingest_authorizer
 
+    def runner_authority_ok(job_id: str, tenant_id: str, owner: str,
+                            digest: str) -> bool:
+        """Server-side proof that THIS request holds the job's live lease.
+
+        The runner is inside the claim it just made: the row must be
+        ``running`` with an unexpired ``lease_until`` for exactly this
+        owner+tenant+document. A client cannot reach this code path (only
+        the run endpoint passes a ``runner_job_id``), and a stale/expired
+        lease fails the check - stronger evidence than a status string
+        (finding J-1 prescribed fix, part 2).
+        """
+        try:
+            with closing(job_store.require_connection()) as connection:
+                job = job_store.get_job(connection, tenant_id=tenant_id,
+                                        owner=owner, job_id=job_id)
+        except job_store.JobStoreError:
+            return False
+        return bool(job and job["status"] == "running"
+                    and int(job["lease_until"]) > int(time.time())
+                    and job["document_digest"] == digest
+                    and job["tenant_id"] == tenant_id
+                    and job["owner_subject"] == owner)
+
     def finish_ingest(*, subject: str, owner: str, tenant_id: str,
                       scope: str, original: dict, digest: str,
                       review_key: str, result_id: str, revision: str,
-                      parts: dict) -> dict:
+                      parts: dict, runner_job_id: str = None) -> dict:
         """Shared registration path for the API and the marking-job runner.
 
-        Order (unchanged from the contract slice): build the owner+tenant
-        row -> trusted-provenance gate -> audit anchor FIRST -> registry row.
-        Any gate or store failure happens before a write.
+        Order (unchanged from the contract slice): shape validation of the
+        original -> trusted-provenance gate -> audit anchor FIRST ->
+        registry row. Authority for the gate is EITHER the client-facing
+        job-backed check (succeeded jobs only) OR, when the caller is the
+        lease-holding runner, its live claim (``runner_job_id``).
         """
+        if not isinstance(original, dict):
+            raise ApiError("original_output_invalid",
+                           "original_output must be a mapping")
+        if not isinstance(original.get("questions"), list):
+            raise ApiError("original_output_invalid",
+                           "original_output must carry a questions list")
         row = {"status": "Marked", "review_key": review_key,
                "report_owner": owner, "snapshot_context": digest,
                "tenant_id": tenant_id,
@@ -475,12 +510,18 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                         "submission_id": parts["submission"]})
         # A client-supplied digest/reference or original output is not a
         # server-issued marking result: the trusted job/provenance service
-        # must authorize the exact owner/tenant/identity/output tuple.
-        try:
-            authorized = (authorize_ingest is not None and
-                          authorize_ingest(subject, tenant_id, row) is True)
-        except Exception:
-            authorized = False
+        # must authorize the exact owner/tenant/identity/output tuple. The
+        # lease-holding runner authorizes with its own live claim instead of
+        # the client-facing status check (finding J-1).
+        if runner_job_id is not None:
+            authorized = runner_authority_ok(runner_job_id, tenant_id,
+                                             owner, digest)
+        else:
+            try:
+                authorized = (authorize_ingest is not None and
+                              authorize_ingest(subject, tenant_id, row) is True)
+            except Exception:
+                authorized = False
         if not authorized:
             raise ApiError("manual_document_provenance_required",
                            "a server-authorized result is required",
@@ -864,7 +905,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                         scope="manual", original=original, digest=digest,
                         review_key=job_id,
                         result_id="manual:" + digest[:16] + ":" + job_id,
-                        revision="", parts={})
+                        revision="", parts={},
+                        runner_job_id=job_id)
                 except ApiError as failure:
                     job_store.settle_failure(
                         connection, tenant_id=tenant_id, owner=owner,

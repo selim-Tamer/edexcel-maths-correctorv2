@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 
+import audit_store
 import document_store
 import ingest_registry
 import job_store
@@ -208,6 +209,18 @@ class JobApiTests(unittest.TestCase):
                          "manual_document_provenance_required")
         self.assertEqual(denied.json()["error"].get("detail"),
                          "ingest_authorization_required")
+        # Configured store, but no job: the denial wrote NOTHING.
+        result_id = "manual:" + digest[:16] + ":ref-1"
+        audit = audit_store.open_store(
+            self._env["AI_MARKER_AUDIT_DEV_STORE"], dev_only_ack=True)
+        self.addCleanup(audit.close)
+        self.assertIsNone(audit.current_revision(owner=OWNER,
+                                                 result_id=result_id))
+        registry = ingest_registry.open_store(
+            self._env[ingest_registry.PATH_ENV])
+        self.addCleanup(registry.close)
+        self.assertEqual(ingest_registry.find_rows(registry, OWNER, TENANT),
+                         [])
         # A succeeded job for THIS owner+tenant+document authorizes it.
         job_id = self._create().json()["job_id"]
         self.assertEqual(self._run(job_id).json()["status"], "succeeded")
@@ -266,6 +279,63 @@ class JobApiTests(unittest.TestCase):
             json={"idempotency_key": "job-key-0002",
                   "document_digest": self.digest})
         self.assertEqual(blocked.status_code, 404, blocked.text)
+
+    def test_running_window_cannot_preempt_the_result(self):
+        """Finding J-1 regression: a live claim is runner-only authority.
+
+        While a job is in flight (status running, unexpired lease), an
+        authenticated owner posting /v1/results with a fabricated original -
+        under EITHER an arbitrary reference or the job's deterministic
+        identity - must be denied, with ZERO rows written anywhere.
+        """
+        job_id = self._create().json()["job_id"]
+        connection = job_store.open_store(self._env[job_store.PATH_ENV])
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE marking_jobs SET status = 'running', attempts = 1,"
+            " lease_until = ? WHERE job_id = ?",
+            (int(time.time()) + 3600, job_id))
+        connection.commit()
+        audit = audit_store.open_store(
+            self._env["AI_MARKER_AUDIT_DEV_STORE"], dev_only_ack=True)
+        self.addCleanup(audit.close)
+        registry = ingest_registry.open_store(
+            self._env[ingest_registry.PATH_ENV])
+        self.addCleanup(registry.close)
+        for reference in ("attacker-ref-0001", job_id):
+            result_id = "manual:" + self.digest[:16] + ":" + reference
+            denied = self.client.post(
+                "/v1/results", headers=self._headers(),
+                json={"scope": "manual",
+                      "manual_identity": {"submission_ref": reference,
+                                          "document_digest": self.digest},
+                      "original_output": engine_output()})
+            self.assertEqual(denied.status_code, 403, denied.text)
+            self.assertEqual(denied.json()["error"]["code"],
+                             "manual_document_provenance_required")
+            self.assertEqual(denied.json()["error"].get("detail"),
+                             "ingest_authorization_required")
+            # Zero writes: no audit registration, no registry row.
+            self.assertIsNone(audit.current_revision(owner=OWNER,
+                                                     result_id=result_id))
+            self.assertEqual(
+                ingest_registry.find_rows(registry, OWNER, TENANT), [])
+        # The lease-holding runner itself still succeeds through its own
+        # authority even though the client-facing gate now refuses.
+        connection.execute(
+            "UPDATE marking_jobs SET status = 'queued', attempts = 0,"
+            " lease_until = 0 WHERE job_id = ?", (job_id,))
+        connection.commit()
+        self.assertEqual(self._run(job_id).json()["status"], "succeeded")
+
+    def test_garbage_engine_output_fails_with_a_specific_code(self):
+        self.engine = lambda data: "not a marking result"
+        client = self._client(TENANT)
+        job_id = self._create(client=client).json()["job_id"]
+        state = self._run(job_id, client=client).json()
+        self.assertEqual(state["status"], "queued")
+        self.assertEqual(state["error_code"], "original_output_invalid")
+        self.assertEqual(state["attempts"], 1)
 
     def test_no_engine_is_refused_not_faked(self):
         client = self._client(TENANT, engine_marker=None)

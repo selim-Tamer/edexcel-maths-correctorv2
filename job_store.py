@@ -160,17 +160,21 @@ def get_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
 
 def find_authorizable_job(connection: sqlite3.Connection, *, tenant_id: str,
                           owner: str, document_digest: str):
-    """A running/succeeded job for this exact owner+tenant+document.
+    """A SUCCEEDED job for this exact owner+tenant+document.
 
-    This is the production shape of PR57's trusted-provenance gate: ingest is
-    authorised by a server-side job that actually processed the document,
-    not by anything the client asserts.
+    This is the production shape of PR57's trusted-provenance gate: client
+    ingest is authorised only by a job that has COMPLETED and already
+    registered the genuine engine output. The in-flight ``running`` state is
+    deliberately NOT authorizing for clients - the lease-holding runner uses
+    its own authority instead (see ``finish_ingest`` in api/app.py), so an
+    authenticated owner cannot pre-empt a job's result with a fabricated
+    ``original_output`` during the claim->succeed window (finding J-1).
     """
     try:
         row = connection.execute(
             "SELECT job_id FROM marking_jobs WHERE tenant_id = ?"
             " AND owner_subject = ? AND document_digest = ?"
-            " AND status IN ('running', 'succeeded')"
+            " AND status = 'succeeded'"
             " ORDER BY created_at DESC LIMIT 1",
             (tenant_id, owner, document_digest)).fetchone()
     except sqlite3.Error as error:
