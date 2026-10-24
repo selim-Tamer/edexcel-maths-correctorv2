@@ -48,17 +48,20 @@ in-process with ``fastapi.testclient``.
 from __future__ import annotations
 
 import os
+import hashlib
 import time
 from contextlib import closing
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
-from fastapi import Depends, FastAPI, Header, Query
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import audit_store
 import decision_core
+import document_limits
+import document_store
 import ingest_registry
 import question_review
 from auth_oidc import OidcError, OidcVerifier
@@ -71,8 +74,9 @@ DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
 # Untrusted-input guard: every contract body is a few hundred bytes at most
 # (reason is capped at 2000 characters), so anything near this size is not a
 # legitimate request. Declared Content-Length is checked before the body is
-# read; chunked bodies without a length are rejected too, because this API
-# never accepts streaming uploads.
+# read; chunked bodies without a length are rejected too. The single write
+# route allowed a larger bound is POST /v1/documents, which is capped at the
+# document limits instead (and validated again by document_limits).
 MAX_BODY_BYTES = 32_768
 
 # Provisional HTTP mapping for the contract's error codes (the contract names
@@ -99,6 +103,8 @@ _STATUS_BY_CODE = {
     "audit_record_invalid": 500,
     "audit_persist_failed": 500,
     "original_output_immutable": 409,
+    # document_limits vocabulary (existing source codes, not invented):
+    "document_too_large": 413,
 }
 
 
@@ -249,6 +255,11 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         """Bound the body of write requests before any parsing."""
         if request.method not in ("POST", "PUT", "PATCH"):
             return await call_next(request)
+        # Document uploads are bounded by the document limits (and re-checked
+        # by document_limits.validate_document); every other write keeps the
+        # strict contract cap.
+        cap = (document_limits.MAX_DOCUMENT_BYTES
+               if request.url.path == "/v1/documents" else MAX_BODY_BYTES)
         declared = request.headers.get("content-length")
         if declared is None:
             return envelope(413, "payload_invalid",
@@ -258,13 +269,13 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         except ValueError:
             return envelope(413, "payload_invalid",
                             "content-length header is not a number")
-        if size < 0 or size > MAX_BODY_BYTES:
+        if size < 0 or size > cap:
             return envelope(413, "payload_invalid", "request body too large")
         chunks = []
         observed = 0
         async for chunk in request.stream():
             observed += len(chunk)
-            if observed > MAX_BODY_BYTES:
+            if observed > cap:
                 return envelope(413, "payload_invalid", "request body too large")
             chunks.append(chunk)
         # Starlette reuses this bounded cached body for downstream parsing.
@@ -577,6 +588,83 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                 "totals": {"earned": earned, "available": available,
                            "percentage": (round(earned * 100.0 / available, 2)
                                           if available else 0.0)}}
+
+    def require_document_connection():
+        """Opt-in dev document store, failing closed when unconfigured."""
+        path = (os.environ.get(document_store.PATH_ENV) or "").strip()
+        acknowledged = (os.environ.get(document_store.ACK_ENV) or "").strip() == "1"
+        if not path or not acknowledged:
+            raise ApiError("dev_opt_in_required",
+                           "the document store is not configured for development")
+        try:
+            return document_store.open_store(path)
+        except document_store.DocumentStoreError:
+            raise ApiError("store_unusable", "the document store is unusable")
+
+    @app.post("/v1/documents", status_code=201)
+    async def upload_document(request: Request,
+                              filename: str = Query(default="", max_length=256),
+                              who=Depends(actor)):
+        """Private document adapter: validate, hash, store - never publish.
+
+        The raw PDF bytes are the request body (already bounded by the
+        middleware at the document limits). The server computes the sha256
+        digest - the client never supplies the key - validates through
+        ``document_limits`` (signature, size, page cap, encryption), then
+        stores the bytes under owner+tenant scope. Re-uploading identical
+        content is idempotent (200 + stored:false); no URL, no presigning,
+        no anonymous route exists anywhere.
+        """
+        subject, owner, tenant_id = who
+        data = bytes(await request.body())
+        try:
+            info = document_limits.validate_document(data, filename or None)
+        except document_limits.DocumentValidationError as failure:
+            # Content-free category message from the existing vocabulary.
+            raise ApiError(failure.code.lower(), str(failure))
+        digest = hashlib.sha256(data).hexdigest()
+        connection = require_document_connection()
+        try:
+            with closing(connection):
+                created = document_store.put_document(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest, filename=filename or "",
+                    page_count=info.get("pages"), content=data)
+        except document_store.DocumentStoreError as failure:
+            raise ApiError(failure.detail, "the document could not be stored")
+        receipt = {"document_digest": digest, "owner": owner,
+                   "bytes": len(data), "pages": info.get("pages"),
+                   "kind": info.get("kind"), "stored": created}
+        if not created:
+            return JSONResponse(status_code=200, content=receipt)
+        return receipt
+
+    @app.get("/v1/documents/{document_digest}")
+    def read_document(document_digest: str, who=Depends(actor)):
+        """Owner+tenant-scoped private read of stored PDF bytes.
+
+        A foreign, unknown or malformed digest is the SAME 404
+        ``result_not_registered`` (indistinguishable, enumeration-safe), and
+        the response carries no-store caching headers so intermediaries do
+        not keep a student document.
+        """
+        subject, owner, tenant_id = who
+        digest = (document_digest or "").strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ApiError("result_not_registered", "no document for this owner")
+        connection = require_document_connection()
+        try:
+            with closing(connection):
+                content = document_store.find_document(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest)
+        except document_store.DocumentStoreError as failure:
+            raise ApiError(failure.detail, "the document could not be read")
+        if content is None:
+            raise ApiError("result_not_registered", "no document for this owner")
+        return Response(content=content, media_type="application/pdf",
+                        headers={"Cache-Control": "private, no-store",
+                                 "X-Content-Type-Options": "nosniff"})
 
     @app.post("/v1/results/{result_id}/decisions")
     def submit_decision(result_id: str, body: DecisionRequest,
