@@ -1,0 +1,232 @@
+{
+  "spec": {
+    "name": "ai-maths-marker-backend-contract",
+    "version": "0.1.0-draft",
+    "status": "SPEC_NOT_IMPLEMENTED",
+    "milestone": "M5 (C11 foundation + C10 contracts)",
+    "framework_target": "FastAPI",
+    "compute_target": "Google Cloud Run",
+    "storage_target": "Supabase Postgres (+ private object storage for snapshots)",
+    "provisioned": false,
+    "deployed": false,
+    "note": "This document is a PROPOSAL. No FastAPI dependency exists in requirements.txt and none is added by this PR. No endpoint here is served by any running process. Every failure code is drawn from the existing source vocabulary; no code is invented."
+  },
+
+  "error_envelope": {
+    "description": "Every non-2xx response uses this shape. Codes are a subset of the existing source vocabulary.",
+    "type": "object",
+    "required": ["error"],
+    "properties": {
+      "error": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string" },
+          "message": { "type": "string" },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  },
+
+  "auth": {
+    "scheme": "Bearer (OIDC identity token)",
+    "actor_is_not_tenant": true,
+    "description": "The authenticated teacher is the ACTOR (owner scope), never the tenant. Tenant membership is resolved server-side from the actor. Authorization is re-verified fresh at every privileged action; no token or historical evidence is a reusable grant.",
+    "server_side_checks": [
+      "authenticated_identity_present",
+      "tenant_membership_active",
+      "resource_owner_match",
+      "fresh_reverification_for_classroom_scope"
+    ]
+  },
+
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/v1/results",
+      "purpose": "Register one reviewed result and its immutable original AI output.",
+      "implemented": false,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "request": {
+        "type": "object",
+        "required": ["scope", "original_output"],
+        "properties": {
+          "scope": { "enum": ["classroom", "manual"] },
+          "classroom_identity": {
+            "type": "object",
+            "properties": {
+              "course_id": { "type": "string" },
+              "assignment_id": { "type": "string" },
+              "submission_id": { "type": "string" },
+              "revision": { "type": "string" }
+            },
+            "required": ["course_id", "assignment_id", "submission_id"]
+          },
+          "manual_identity": {
+            "type": "object",
+            "description": "Opaque server-issued submission id bound to document digest + owner. No pupil name in the key.",
+            "properties": {
+              "submission_ref": { "type": "string" },
+              "document_digest": { "type": "string" }
+            },
+            "required": ["document_digest"]
+          },
+          "original_output": { "type": "object" }
+        }
+      },
+      "response_201": {
+        "type": "object",
+        "required": ["result_id", "owner", "result_revision", "audit_reference"],
+        "properties": {
+          "result_id": { "type": "string" },
+          "owner": { "type": "string" },
+          "result_revision": { "type": "integer" },
+          "audit_reference": { "type": "string" },
+          "supersedes": { "type": ["string", "null"] }
+        }
+      },
+      "error_codes": ["payload_invalid", "original_output_invalid", "store_unusable", "audit_store_unavailable"]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/results/{result_id}/decisions",
+      "purpose": "Atomically commit one accepted teacher question-level decision together with its audit event.",
+      "implemented": false,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "idempotent": true,
+      "optimistic_concurrency": true,
+      "request": {
+        "type": "object",
+        "required": ["question_number", "action", "expected_revision", "idempotency_key"],
+        "properties": {
+          "question_number": { "type": "string" },
+          "action": { "enum": ["approve", "correct", "flag"] },
+          "review_status": { "type": "string" },
+          "old_score": { "type": ["string", "null"] },
+          "new_score": { "type": ["string", "null"] },
+          "reason": { "type": "string", "maxLength": 2000 },
+          "binding": { "type": "string" },
+          "expected_revision": { "type": "integer" },
+          "idempotency_key": { "type": "string" }
+        }
+      },
+      "response_200": {
+        "type": "object",
+        "required": ["result_id", "result_revision", "event_sequence", "audit_reference", "replayed"],
+        "properties": {
+          "result_id": { "type": "string" },
+          "result_revision": { "type": "integer" },
+          "event_sequence": { "type": "integer" },
+          "audit_reference": { "type": "string" },
+          "replayed": { "type": "boolean" }
+        }
+      },
+      "error_codes": [
+        "stale_revision",
+        "stream_sequence_conflict",
+        "idempotency_key_conflict",
+        "idempotency_key_payload_mismatch",
+        "result_not_registered",
+        "review_question_ambiguous",
+        "review_question_unavailable",
+        "evidence_invalid",
+        "payload_invalid",
+        "audit_result_identity_unavailable",
+        "audit_store_unavailable",
+        "store_closed"
+      ],
+      "atomicity_invariant": "No successful correction is persisted if its audit write fails. A failed commit leaves no partial state.",
+      "maps_to": "app5_1_automated.commit_audit_decision -> audit_store.commit_correction"
+    },
+    {
+      "method": "GET",
+      "path": "/v1/results/{result_id}/events",
+      "purpose": "Ordered, owner-scoped audit event history for one result stream.",
+      "implemented": false,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "response_200": {
+        "type": "object",
+        "required": ["result_id", "events"],
+        "properties": {
+          "result_id": { "type": "string" },
+          "events": { "type": "array", "items": { "type": "object" } },
+          "result_revision": { "type": "integer" }
+        }
+      },
+      "error_codes": ["result_not_registered", "store_closed", "audit_store_unavailable"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/results/{result_id}/projection",
+      "purpose": "Derived current-state projection. NOT an independently editable grade source.",
+      "implemented": false,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "response_200": {
+        "type": "object",
+        "required": ["result_id", "result_revision", "questions", "original_ai_output"],
+        "properties": {
+          "result_id": { "type": "string" },
+          "result_revision": { "type": "integer" },
+          "questions": { "type": "array", "items": { "type": "object" } },
+          "original_ai_output": { "type": "object" },
+          "totals": { "type": "object" }
+        }
+      },
+      "invariant": "Original AI marks are preserved and returned unchanged; corrected values sit alongside, never overwriting.",
+      "error_codes": ["result_not_registered", "audit_store_unavailable"]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/results/{result_id}/approvals",
+      "purpose": "The single teacher sign-off gate for a reviewed result.",
+      "implemented": false,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "request": {
+        "type": "object",
+        "required": ["approved", "expected_revision"],
+        "properties": {
+          "approved": { "type": "boolean" },
+          "expected_revision": { "type": "integer" }
+        }
+      },
+      "response_200": {
+        "type": "object",
+        "required": ["result_id", "approved", "approved_by", "approved_at"],
+        "properties": {
+          "result_id": { "type": "string" },
+          "approved": { "type": "boolean" },
+          "approved_by": { "type": "string" },
+          "approved_at": { "type": "string" }
+        }
+      },
+      "note": "Exactly ONE sign-off gate exists. There is no grade-publication endpoint in this contract, because the application performs zero mutating Classroom/Drive calls.",
+      "error_codes": ["stale_revision", "result_not_registered", "audit_store_unavailable"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/healthz",
+      "purpose": "Liveness/readiness probe. No data access.",
+      "implemented": false,
+      "auth_required": false,
+      "tenant_scoped": false,
+      "response_200": {
+        "type": "object",
+        "required": ["status"],
+        "properties": { "status": { "enum": ["ok"] } }
+      },
+      "error_codes": []
+    }
+  ],
+
+  "absent_by_design": {
+    "grade_publication": "No POST/PUT/PATCH/DELETE to Classroom or Drive exists in the application. All five classroom_request call sites pass GET. Scores surface to the teacher for manual entry.",
+    "payments": "Not in scope; separately gated.",
+    "public_signups": "Not in scope; brand/claims/privacy gate is separate."
+  }
+}
