@@ -37,6 +37,7 @@ import json
 import time
 import uuid
 from contextlib import contextmanager
+from threading import RLock
 from typing import Any, Callable, Optional
 
 import audit_store
@@ -61,7 +62,7 @@ _EVENT_COLUMNS = (
     "sequence, event_id, idempotency_key, payload_digest, event_type, "
     "question_number, action, review_status, old_score, new_score, reason, "
     "expected_revision, resulting_revision, supersedes_event_id, actor, "
-    "binding, authorization_json, created_at"
+    "binding, authorization_json, EXTRACT(EPOCH FROM created_at)::text"
 )
 
 FAULT_STAGES = ("begin", "after_event_insert", "before_commit")
@@ -99,6 +100,9 @@ class PostgresAuditStore:
         self.tenant_id = _identity(str(tenant_id), "tenant_id")
         self._owns_connection = bool(owns_connection)
         self._closed = False
+        # Each handle owns a dedicated connection. Serialize its operations;
+        # concurrent requests must not share one PostgreSQL transaction.
+        self._lock = RLock()
         self._fault: Optional[Callable[[str], Any]] = None
         # Fail closed on a missing/unsupported schema: no silent migration.
         with self._conn.transaction():
@@ -133,12 +137,29 @@ class PostgresAuditStore:
             self._fault(stage)
 
     @contextmanager
+    def _read_transaction(self):
+        with self._lock:
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            with self._conn.transaction():
+                yield
+
+    @contextmanager
     def _transaction(self):
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        with self._conn.transaction():
-            self._fault_point("begin")
-            yield
+        from psycopg.pq import TransactionStatus
+
+        with self._lock:
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            if self._conn.info.transaction_status != TransactionStatus.IDLE:
+                # A nested transaction only releases a savepoint. Reporting a
+                # successful durable commit here would be false; never commit
+                # or roll back a caller-owned transaction to hide that error.
+                raise AuditStoreError("store_unusable",
+                                      "store requires an idle dedicated connection")
+            with self._conn.transaction():
+                self._fault_point("begin")
+                yield
 
     def close(self) -> None:
         if not self._closed:
@@ -158,7 +179,8 @@ class PostgresAuditStore:
 
     def _select_result(self, owner: str, result_id: str, *, for_update=False):
         sql = ("SELECT result_revision, original_digest, original_scores, "
-               "original_scores_digest, created_at FROM results "
+               "original_scores_digest, EXTRACT(EPOCH FROM created_at)::text "
+               "FROM results "
                "WHERE tenant_id = %s AND owner_subject = %s "
                "AND result_id = %s")
         if for_update:
@@ -215,23 +237,25 @@ class PostgresAuditStore:
                     "original_digest": digest, "original_scores": scores}
 
     def current_revision(self, *, owner: Any, result_id: Any) -> Optional[int]:
-        owner = _identity(owner, "owner")
-        result_id = _identity(result_id, "result_id")
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        row = self._select_result(owner, result_id)
-        return None if row is None else int(row[0])
+        with self._read_transaction():
+            owner = _identity(owner, "owner")
+            result_id = _identity(result_id, "result_id")
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            row = self._select_result(owner, result_id)
+            return None if row is None else int(row[0])
 
     def original_record(self, *, owner: Any, result_id: Any) -> dict:
-        owner = _identity(owner, "owner")
-        result_id = _identity(result_id, "result_id")
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        row = self._require_result(owner, result_id)
-        scores = json.loads(row[2])
-        return {"owner": owner, "result_id": result_id,
-                "result_revision": int(row[0]), "original_digest": row[1],
-                "original_scores": scores, "created_at": row[4]}
+        with self._read_transaction():
+            owner = _identity(owner, "owner")
+            result_id = _identity(result_id, "result_id")
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            row = self._require_result(owner, result_id)
+            scores = json.loads(row[2])
+            return {"owner": owner, "result_id": result_id,
+                    "result_revision": int(row[0]), "original_digest": row[1],
+                    "original_scores": scores, "created_at": row[4]}
 
     # -- corrections (atomic with their audit event) ----------------------
     def commit_correction(self, *, owner: Any, result_id: Any,
@@ -255,10 +279,15 @@ class PostgresAuditStore:
                                   "expected_revision must not be negative")
 
         with self._transaction():
+            row = self._select_result(owner, result_id, for_update=True)
+            if row is None:
+                raise AuditStoreError("result_not_registered",
+                                      "no result registered for this owner")
             # PINNED ORDERING (BCM invariant): the idempotency key is checked
             # BEFORE the revision, so a late retry of a committed operation
             # replays the prior result even though its expected_revision is
-            # now stale.
+            # now stale. Resolve it AFTER acquiring the writer lock so a
+            # simultaneous identical retry sees the first writer's commit.
             prior = self._conn.execute(
                 "SELECT sequence, event_id, payload_digest, resulting_revision"
                 " FROM audit_events WHERE tenant_id = %s AND owner_subject = %s"
@@ -275,10 +304,6 @@ class PostgresAuditStore:
                         "resulting_revision": int(prior[3]),
                         "idempotent": True}
 
-            row = self._select_result(owner, result_id, for_update=True)
-            if row is None:
-                raise AuditStoreError("result_not_registered",
-                                      "no result registered for this owner")
             if expected != int(row[0]):
                 raise AuditStoreError(
                     "stale_revision",
@@ -333,32 +358,34 @@ class PostgresAuditStore:
     # -- reads, replay, verification --------------------------------------
     def events(self, *, owner: Any, result_id: Any,
                limit: Optional[int] = None) -> list:
-        owner = _identity(owner, "owner")
-        result_id = _identity(result_id, "result_id")
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        self._require_result(owner, result_id)
-        sql = (f"SELECT {_EVENT_COLUMNS} FROM audit_events"
-               " WHERE tenant_id = %s AND owner_subject = %s"
-               " AND result_id = %s ORDER BY sequence")
-        params = [self.tenant_id, owner, result_id]
-        if limit is not None:
-            sql += " LIMIT %s"
-            params.append(int(limit))
-        rows = self._conn.execute(sql, tuple(params)).fetchall()
-        return [_row_to_event(row) for row in rows]
+        with self._read_transaction():
+            owner = _identity(owner, "owner")
+            result_id = _identity(result_id, "result_id")
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            self._require_result(owner, result_id)
+            sql = (f"SELECT {_EVENT_COLUMNS} FROM audit_events"
+                   " WHERE tenant_id = %s AND owner_subject = %s"
+                   " AND result_id = %s ORDER BY sequence")
+            params = [self.tenant_id, owner, result_id]
+            if limit is not None:
+                sql += " LIMIT %s"
+                params.append(int(limit))
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            return [_row_to_event(row) for row in rows]
 
     def replay(self, *, owner: Any, result_id: Any) -> list:
-        owner = _identity(owner, "owner")
-        result_id = _identity(result_id, "result_id")
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        row = self._require_result(owner, result_id)
-        events = self.events(owner=owner, result_id=result_id)
-        problems = _chain_problems(events, result_revision=int(row[0]))
-        if problems:
-            raise AuditStoreError("audit_order_invalid", "; ".join(problems))
-        return events
+        with self._read_transaction():
+            owner = _identity(owner, "owner")
+            result_id = _identity(result_id, "result_id")
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            row = self._require_result(owner, result_id)
+            events = self.events(owner=owner, result_id=result_id)
+            problems = _chain_problems(events, result_revision=int(row[0]))
+            if problems:
+                raise AuditStoreError("audit_order_invalid", "; ".join(problems))
+            return events
 
     def verify(self, *, owner: Any, result_id: Any) -> dict:
         """Integrity report: chain, projections and evidence whitelist.
@@ -368,37 +395,38 @@ class PostgresAuditStore:
         instead of pretending to a check that did not run; the chain,
         uniqueness, supersedes and evidence checks all still execute.
         """
-        owner = _identity(owner, "owner")
-        result_id = _identity(result_id, "result_id")
-        problems: list = []
-        if self._closed:
-            raise AuditStoreError("store_closed", "store is closed")
-        row = self._select_result(owner, result_id)
-        events: list = []
-        if row is None:
-            problems.append("result_not_registered")
-        else:
-            try:
-                stored = json.loads(row[2])
-            except (TypeError, ValueError):
-                stored = None
-                problems.append("original_scores_unparseable")
-            if stored is not None and digest_value(stored) != row[3]:
-                problems.append("original_projection_digest_mismatch")
-            try:
-                events = self.events(owner=owner, result_id=result_id)
-            except AuditStoreError as failure:
-                problems.append(f"audit_events_unreadable:{failure.code}")
+        with self._read_transaction():
+            owner = _identity(owner, "owner")
+            result_id = _identity(result_id, "result_id")
+            problems: list = []
+            if self._closed:
+                raise AuditStoreError("store_closed", "store is closed")
+            row = self._select_result(owner, result_id)
+            events: list = []
+            if row is None:
+                problems.append("result_not_registered")
             else:
-                problems.extend(_chain_problems(
-                    events, result_revision=int(row[0])))
-        return {"ok": not problems, "problems": problems,
-                "mode": MODE_LABEL, "schema_version": SCHEMA_VERSION,
-                "owner": owner, "result_id": result_id,
-                "event_count": len(events),
-                "sequences": [event["sequence"] for event in events],
-                "original_digest": row[1] if row is not None else "",
-                "integrity_check": "not-applicable-postgresql"}
+                try:
+                    stored = json.loads(row[2])
+                except (TypeError, ValueError):
+                    stored = None
+                    problems.append("original_scores_unparseable")
+                if stored is not None and digest_value(stored) != row[3]:
+                    problems.append("original_projection_digest_mismatch")
+                try:
+                    events = self.events(owner=owner, result_id=result_id)
+                except AuditStoreError as failure:
+                    problems.append(f"audit_events_unreadable:{failure.code}")
+                else:
+                    problems.extend(_chain_problems(
+                        events, result_revision=int(row[0])))
+            return {"ok": not problems, "problems": problems,
+                    "mode": MODE_LABEL, "schema_version": SCHEMA_VERSION,
+                    "owner": owner, "result_id": result_id,
+                    "event_count": len(events),
+                    "sequences": [event["sequence"] for event in events],
+                    "original_digest": row[1] if row is not None else "",
+                    "integrity_check": "not-applicable-postgresql"}
 
 
 def open_store(dsn: str, *, tenant_id: str) -> PostgresAuditStore:

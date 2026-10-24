@@ -17,6 +17,8 @@ What is pinned here (the security contract, engine-translated):
 import json
 import os
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from pathlib import Path
 
 try:
@@ -109,6 +111,8 @@ class PostgresStoreContractTests(unittest.TestCase):
         self.assertEqual(record["original_digest"], result["original_digest"])
         # Marks-only projection: the student's answer text is not stored.
         self.assertEqual(record["original_scores"], [["1", 3]])
+        self.assertIsInstance(record["created_at"], str)
+        self.assertGreater(float(record["created_at"]), 0)
         self.assertNotIn("SECRET-ANSWER-TEXT", json.dumps(record))
 
     def test_different_original_output_is_immutable(self):
@@ -134,6 +138,8 @@ class PostgresStoreContractTests(unittest.TestCase):
             owner=SUBJECT, result_id=RESULT), 1)
         events = self.store.events(owner=SUBJECT, result_id=RESULT)
         self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0]["created_at"], str)
+        json.dumps(events)  # The adapter must preserve the JSON-safe contract.
         self.assertEqual(self.store.replay(
             owner=SUBJECT, result_id=RESULT)[0]["sequence"], 1)
         verdict = self.store.verify(owner=SUBJECT, result_id=RESULT)
@@ -166,6 +172,63 @@ class PostgresStoreContractTests(unittest.TestCase):
             self.commit(key="k1", expected=1, question="9", action="flag")
         self.assertEqual(caught.exception.code,
                          "idempotency_key_payload_mismatch")
+
+    def test_read_then_commit_is_durable_to_an_independent_connection(self):
+        self.register()
+        self.assertEqual(self.store.current_revision(
+            owner=SUBJECT, result_id=RESULT), 0)
+        self.commit(key="after-read", expected=0)
+        with psycopg.connect(DSN, autocommit=True) as observer:
+            self.assertEqual(observer.execute(
+                "SELECT result_revision FROM results WHERE tenant_id = %s"
+                " AND owner_subject = %s AND result_id = %s",
+                (TENANT, SUBJECT, RESULT)).fetchone()[0], 1)
+            self.assertEqual(observer.execute(
+                "SELECT count(*) FROM audit_events WHERE tenant_id = %s"
+                " AND owner_subject = %s AND result_id = %s",
+                (TENANT, SUBJECT, RESULT)).fetchone()[0], 1)
+
+    def test_simultaneous_identical_retries_commit_once_and_replay(self):
+        self.register()
+        at_lock = Barrier(2)
+
+        def worker():
+            with psycopg.connect(DSN) as connection:
+                connection.execute("SET lock_timeout = '5s'")
+                connection.commit()
+                store = postgres_store.PostgresAuditStore(
+                    connection, tenant_id=TENANT)
+                original_select = store._select_result
+
+                def synchronized_select(owner, result_id, *, for_update=False):
+                    if for_update:
+                        at_lock.wait(timeout=5)
+                    return original_select(owner, result_id,
+                                           for_update=for_update)
+
+                store._select_result = synchronized_select
+                try:
+                    return self.commit(store=store, key="same", expected=0)
+                finally:
+                    store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(worker) for _ in range(2)]
+            outcomes = [future.result(timeout=15) for future in futures]
+        self.assertEqual(sorted(item["status"] for item in outcomes),
+                         ["committed", "duplicate"])
+        self.assertEqual(outcomes[0]["event_id"], outcomes[1]["event_id"])
+        self.assertEqual(len(self.store.events(
+            owner=SUBJECT, result_id=RESULT)), 1)
+
+    def test_caller_transaction_is_refused_without_committing_callers_work(self):
+        self.register()
+        self.conn.execute("SELECT 1")  # An outer transaction is caller-owned.
+        with self.assertRaises(audit_store.AuditStoreError) as caught:
+            self.commit(key="nested", expected=0)
+        self.assertEqual(caught.exception.code, "store_unusable")
+        self.conn.rollback()
+        self.assertEqual(self.store.events(owner=SUBJECT, result_id=RESULT), [])
 
     def test_stale_fresh_key_write_appends_nothing(self):
         self.register()
