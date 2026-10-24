@@ -2,7 +2,7 @@
 
 **Status: SPEC / PROPOSAL — nothing implemented, nothing provisioned.**
 Milestone M5 (C11 foundation + C10 contracts). Companion to `m5_api_contract.json`
-and `M5_FASTAPI_EXTRACTION.md`. Baseline: main `3cfef2a`.
+and `M5_SESSION_STATE_SEPARATION.md`. Baseline: main `3cfef2a`.
 
 This document proposes the tenant model, the durable identity scheme for
 manual uploads and re-marks, and the Postgres migration path from the C6-B3

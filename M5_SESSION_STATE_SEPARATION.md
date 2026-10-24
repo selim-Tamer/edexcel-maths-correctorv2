@@ -94,12 +94,24 @@ vocabulary.
 
 **Does not:** move or edit any of the functions above; add FastAPI (or any
 dependency); create a worker; provision anything; touch the Streamlit
-behavior. Extraction is scoped here, not performed here.
+behavior. The extraction itself is not performed here — it exists separately
+in PR #52 as `decision_core.py`, where the functions above remain
+session-coupled *adapters* over the extracted core.
 
 ## 6. Consequence for ordering
 
 Because the session-coupled orchestration is the real gap, the next
-*implementation* slice is the extraction of a session-free decision core —
+*implementation* slice was the extraction of a session-free decision core —
 **not** the adapter swap. Doing the adapter swap first would leave a worker
 with a portable store it still cannot drive, which is precisely the
 "polishing infrastructure we must replace" risk this plan is meant to avoid.
+
+**Status update:** that extraction now exists — PR #52 adds
+`decision_core.py` (gate sequence behind explicit context injection) and
+converts the three functions named in section 4 into session-coupled
+adapters, so this document's coupling map still describes them accurately.
+The adapter swap, the worker, and the Postgres/Supabase adapter remain
+future work. This document still marks every listed endpoint
+`SPEC_NOT_IMPLEMENTED`; the first running subset (`/v1/healthz`, the
+decision endpoint and the events read) is delivered separately by PR #53,
+which records its deviations from this contract in its PR body.
