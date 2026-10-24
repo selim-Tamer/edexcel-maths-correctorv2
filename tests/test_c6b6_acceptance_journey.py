@@ -6,8 +6,9 @@ no inflated live claims; do not claim unsupported features pass"):
 
  stage  component                                          real or mocked
   1  auth (bearer -> subject)                          TEST-ONLY seam: the
-     production OIDC/JWKS verifier is NOT implemented; the seam itself is
-     attacked in test_c6b6_verifier_boundary.py. Mocked, labelled.
+     real Google OIDC/JWKS verifier now exists (auth_oidc.py) and is
+     attacked in test_c6b6_oidc_attacks.py; this journey uses a revocable
+     MOCKED seam so stage 12 can flip it off. Mocked, labelled.
   2  dashboard (teacher sees own results)              NO list endpoint
      exists (pinned as absent); the owner-scoped row provider stands in.
      Mocked, labelled.
@@ -55,9 +56,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import audit_store
 import decision_core
+import membership_store
 from api.app import create_app
 from fastapi.testclient import TestClient
-from support import benchmark, fake_client, load_app, model_question, remote
+try:
+    # package-style loading (python -m unittest tests.test_...)
+    from tests.support import benchmark, fake_client, load_app, \
+        model_question, remote
+except ImportError:  # pytest prepend-mode: tests/ is on sys.path
+    from support import benchmark, fake_client, load_app, model_question, \
+        remote
 
 SUBJECT = "journey-teacher-a"
 OWNER = "google:" + SUBJECT
@@ -65,6 +73,15 @@ OTHER = "google:journey-teacher-b"
 PDF = b"%PDF-1.7 c6b6 journey synthetic scheme"
 DIGEST = hashlib.sha256(PDF).hexdigest()
 STUDENT_CANARY = "SENTINEL_journey_answer"
+
+
+def _active_membership(subject):
+    # Explicit ACTIVE membership fixture (real membership_store.Membership),
+    # never a bypass: the membership layer itself is attacked in
+    # test_c6b6_oidc_attacks.py. The journey only needs each teacher subject
+    # to pass the now-present membership gate so stage 13 keeps pinning owner
+    # scoping (404 for the second teacher), not the membership layer.
+    return membership_store.Membership(subject, "tenant-c6b6", "teacher")
 
 
 def marked_engine_row(f):
@@ -125,7 +142,8 @@ class JourneyTests(unittest.TestCase):
             store_provider=lambda: (self.store, None),
             # Stage 4 (mocked grant store; predicate shape from the app).
             manual_document_provenance_ok=lambda row: (
-                row.get("snapshot_context") == DIGEST))
+                row.get("snapshot_context") == DIGEST),
+            membership_resolver=_active_membership)
         self.client = TestClient(self.app, raise_server_exceptions=False)
 
     def auth(self, who="a"):

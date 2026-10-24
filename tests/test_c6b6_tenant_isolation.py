@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import audit_store
 import decision_core
+import membership_store
 from api.app import create_app
 from fastapi.testclient import TestClient
 
@@ -43,6 +44,15 @@ BOB = "google:bob-subject"
 PDF = b"%PDF-1.7 c6b6 tenant isolation fixture"
 DIGEST = hashlib.sha256(PDF).hexdigest()
 STUDENT_CANARY = "SENTINEL_student_answer_c6b6_7f3a"
+
+
+def _active_membership(subject):
+    # Explicit ACTIVE membership fixture (real membership_store.Membership),
+    # never a bypass: the membership layer itself is attacked in
+    # test_c6b6_oidc_attacks.py. The tenant/owner isolation attacks below only
+    # need each subject to pass the now-present membership gate so they keep
+    # pinning owner scoping, not the membership layer.
+    return membership_store.Membership(subject, "tenant-c6b6", "teacher")
 
 
 def question(number="1", awarded=1):
@@ -91,7 +101,8 @@ class TenantIsolationAttacks(unittest.TestCase):
             verify_token=TOKENS.get,
             rows_for=lambda subject, owner: list(self.rows.get(owner, [])),
             store_provider=lambda: (self.store, None),
-            manual_document_provenance_ok=lambda row: True)
+            manual_document_provenance_ok=lambda row: True,
+            membership_resolver=_active_membership)
         self.client = TestClient(self.app, raise_server_exceptions=False)
 
     def auth(self, who="alice"):
@@ -174,12 +185,12 @@ class TenantIsolationAttacks(unittest.TestCase):
 
     def test_membership_inactive_rows_refuse_writes_and_history_stays_scoped(
             self):
-        # Finding O-1 (contract review needed): with rows withdrawn, the
-        # API fails writes closed but STILL serves the owner's own audit
-        # history from the store. That is defensible (audit outlives a job
-        # row) but it is not what a tenant-authorization slice will want
-        # by default -- pinned here so the behaviour change is deliberate
-        # and reviewed, never accidental.
+        # Finding O-1 (resolved by PR #55): with the row withdrawn, the API
+        # now denies BOTH writes and reads with the same indistinguishable 404
+        # result_not_registered — the shared visible_row() resolver gates
+        # history reads too, so a withdrawn row's audit stream is not
+        # reachable over HTTP (pinned here as the reviewed decision, never an
+        # accidental regression).
         row = manual_row(ALICE)
         rid = identity_of(row)
         self.rows[ALICE] = [row]
@@ -199,8 +210,9 @@ class TenantIsolationAttacks(unittest.TestCase):
                                                      result_id=rid), 1)
         late_read = self.client.get(f"/v1/results/{rid}/events",
                                     headers=self.auth("alice"))
-        self.assertEqual(late_read.status_code, 200)
-        self.assertEqual(len(late_read.json()["events"]), 1)
+        self.assertEqual(late_read.status_code, 404, late_read.text)
+        self.assertEqual(late_read.json()["error"]["code"],
+                         "result_not_registered")
         # Other tenants still get nothing at all.
         foreign = self.client.get(f"/v1/results/{rid}/events",
                                   headers=self.auth("bob"))
@@ -219,21 +231,27 @@ class TenantIsolationAttacks(unittest.TestCase):
 
         big_owner = "google:" + "g" * 600
 
-        # Honest provider (no rows for an unknown tenant): reads hit the
-        # store guard as 400 owner_too_long; writes fail closed at the row
-        # gate as 404 before the store is ever asked to register.
+        # Honest provider (no rows for an unknown tenant): with the O-1
+        # decision, BOTH routes are denied at the row gate with the same
+        # indistinguishable 404 result_not_registered BEFORE the store is
+        # ever touched - the oversized owner is just one more owner with no
+        # visible rows (leak nothing), not a 400 about store internals.
         app = create_app(verify_token=big_subject,
                          rows_for=lambda s, o: [],
                          store_provider=lambda: (self.store, None),
-                         manual_document_provenance_ok=lambda r: True)
+                         manual_document_provenance_ok=lambda r: True,
+                         membership_resolver=_active_membership)
         client = TestClient(app, raise_server_exceptions=False)
         headers = {"Authorization": "Bearer big"}
         events = client.get(f"/v1/results/{rid}/events", headers=headers)
-        self.assertEqual(events.status_code, 400)
-        self.assertEqual(events.json()["error"]["code"], "owner_too_long")
+        self.assertEqual(events.status_code, 404)
+        self.assertEqual(events.json()["error"]["code"],
+                         "result_not_registered")
         write = client.post(f"/v1/results/{rid}/decisions", headers=headers,
                             json=decision_body())
         self.assertEqual(write.status_code, 404)
+        self.assertEqual(write.json()["error"]["code"],
+                         "result_not_registered")
 
         # Leaked-provider provider (the row IS handed over): the store's
         # identity guard still refuses at registration time -- a deny code,
@@ -243,7 +261,8 @@ class TenantIsolationAttacks(unittest.TestCase):
             rows_for=lambda s, o: ([dict(row, report_owner=big_owner)]
                                    if o == big_owner else []),
             store_provider=lambda: (self.store, None),
-            manual_document_provenance_ok=lambda r: True)
+            manual_document_provenance_ok=lambda r: True,
+            membership_resolver=_active_membership)
         leaky_client = TestClient(leaky, raise_server_exceptions=False)
         leaked_write = leaky_client.post(
             f"/v1/results/{rid}/decisions", headers=headers,
@@ -263,12 +282,18 @@ class TenantIsolationAttacks(unittest.TestCase):
         finally:
             connection.close()
 
+        # An oversized result_id is now first a ROW-GATE miss (O-1): it is
+        # indistinguishable from any nonexistent result - 404, leak nothing.
+        # The store's own result_id_too_long guard stays real behind the gate
+        # (owner-side enforcement is still pinned via the leaked-provider
+        # registration above); it is the audit store's suite, not the API,
+        # that owns that guard now.
         long_rid = "manual:" + ("m" * 600)
         oversized = self.client.get(f"/v1/results/{long_rid}/events",
                                     headers=self.auth("alice"))
-        self.assertEqual(oversized.status_code, 400)
+        self.assertEqual(oversized.status_code, 404)
         self.assertEqual(oversized.json()["error"]["code"],
-                         "result_id_too_long")
+                         "result_not_registered")
 
     def test_traversal_and_encoded_segments_cannot_escape_the_route(self):
         # result_id is a single path segment; traversal-looking ids must

@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import audit_store
 import decision_core
+import membership_store
 from api.app import create_app
 from fastapi.testclient import TestClient
 
@@ -50,6 +51,15 @@ OWNER = "google:" + SUBJECT
 PDF = b"%PDF-1.7 c6b6 transaction attack fixture"
 DIGEST = hashlib.sha256(PDF).hexdigest()
 STUDENT_CANARY = "SENTINEL_student_answer_c6b6_transaction_5e1c"
+
+
+def _active_membership(subject):
+    # Explicit ACTIVE membership fixture (real membership_store.Membership),
+    # never a bypass: the membership layer itself is attacked in
+    # test_c6b6_oidc_attacks.py. These transaction/replay attacks only need a
+    # subject to pass the now-present membership gate so they keep pinning the
+    # store/transaction guarantees, not the membership layer.
+    return membership_store.Membership(subject, "tenant-c6b6", "teacher")
 
 
 def question(number, awarded=1):
@@ -92,7 +102,8 @@ class TransactionAttackTests(unittest.TestCase):
             rows_for=lambda subject, owner: [
                 r for r in self.rows if r.get("report_owner") == owner],
             store_provider=lambda: (self.store, None),
-            manual_document_provenance_ok=lambda row: True)
+            manual_document_provenance_ok=lambda row: True,
+            membership_resolver=_active_membership)
         self.client = TestClient(app, raise_server_exceptions=False)
 
     def auth(self):
@@ -189,7 +200,8 @@ class TransactionAttackTests(unittest.TestCase):
                     verify_token={"tok": SUBJECT}.get,
                     rows_for=lambda s, o: [row],
                     store_provider=lambda: (fresh, None),
-                    manual_document_provenance_ok=lambda r: True)
+                    manual_document_provenance_ok=lambda r: True,
+                    membership_resolver=_active_membership)
                 client = TestClient(app, raise_server_exceptions=False)
                 body = {"question_number": "1", "action": "correct",
                         "new_score": "2", "reason": "fault " + stage,

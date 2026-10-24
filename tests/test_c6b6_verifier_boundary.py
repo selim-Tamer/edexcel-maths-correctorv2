@@ -1,22 +1,22 @@
 """C6-B6 independent attacks: the bearer-identity boundary of api/app.py.
 
 These tests probe what CM's own API tests do not: the VERIFIER SEAM itself
-and every way identity could arrive at the decision path. Honest framing
-(Mr.G: "don't accept injected identity as proof of a real verifier"): the
-production OIDC/JWKS verifier is NOT implemented — ``create_app`` takes a
-caller-injected ``verify_token``. There is therefore no product code here
-that parses signed tokens, and no test here claims otherwise. What IS
-product behavior and gets pinned:
+and every way identity could arrive at the decision path. Honest framing:
+the real Google OIDC/JWKS verifier NOW EXISTS (``auth_oidc.OidcVerifier``,
+PR #55) and is attacked directly in ``test_c6b6_oidc_attacks.py``. This file
+pins the SEAM CONTRACT that ``create_app``'s ``verify_token`` injection must
+still honor, because the ``actor`` dependency treats the verifier as a seam
+regardless of which verifier is wired:
 
-  - the documented default (a reject-everything verifier) denies every
-    protected route; nothing is readable/writable without the seam;
+  - the documented default (no audience configured) denies every protected
+    route; nothing is readable/writable without the seam;
   - authentication is decided BEFORE any body is parsed or any store is
     touched (attacker learns nothing about validation internals);
   - only a non-empty string return value from the verifier can ever
     produce identity; garbage returns, blanks and verifier crashes all
-    deny with ZERO store mutation (the crash is a 500, not a success —
-    recorded as finding F-1 for CM: the contract names no envelope for a
-    verifier exception; the API must not pretend it is 401);
+    deny with ZERO store mutation (a crash is now a static 401
+    ``token_verification_failed`` - finding F-1 closed by CM - and this
+    suite pins the security outcome regardless of the code chosen);
   - the identity can only come from the verifier: body fields, query
     parameters and duplicate headers never override or merge it;
   - the token never echoes: not in responses, not in error bodies, not in
@@ -25,9 +25,7 @@ product behavior and gets pinned:
     verifier stops accepting can neither read nor write anything further,
     and the SAME token re-accepted under a DIFFERENT subject cannot
     hijack the previous owner's owner-scoped stream;
-  - the public surface stays minimal (healthz only; docs/openapi disabled)
-    and a static guard fails this suite if a JWT/cookie verifier is ever
-    shipped inside ``api/`` without this seam being re-attacked.
+  - the public surface stays minimal (healthz only; docs/openapi disabled).
 
 Offline, in-process, synthetic only: temporary SQLite, fake subjects.
 """
@@ -42,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import audit_store
 import decision_core
+import membership_store
 from api.app import create_app
 from fastapi.testclient import TestClient
 
@@ -50,6 +49,15 @@ OWNER = "google:" + SUBJECT
 PDF = b"%PDF-1.7 c6b6 verifier boundary fixture"
 DIGEST = hashlib.sha256(PDF).hexdigest()
 TOKEN_CANARY = "tok-canary-never-echo-9d3f"
+
+
+def _active_membership(subject):
+    # Explicit ACTIVE membership fixture (the real membership_store.Membership
+    # class), never a bypass: the membership layer itself is attacked
+    # separately in test_c6b6_oidc_attacks.py. These seam tests only need a
+    # subject to pass the now-present membership gate so they keep pinning the
+    # VERIFIER boundary rather than the membership layer.
+    return membership_store.Membership(subject, "tenant-c6b6", "teacher")
 
 
 def question(number="1", awarded=1):
@@ -97,7 +105,8 @@ class VerifierSeamTests(unittest.TestCase):
             store_provider=lambda: (self.store, None),
             manual_document_provenance_ok=(
                 (lambda row: True) if provenance_ok else
-                (lambda row: False)))
+                (lambda row: False)),
+            membership_resolver=_active_membership)
         return TestClient(built, raise_server_exceptions=False)
 
     def assert_denied_everywhere(self, client):
@@ -150,13 +159,13 @@ class VerifierSeamTests(unittest.TestCase):
             owner=OWNER, result_id=RESULT_ID))
 
     def test_verifier_exception_denies_without_any_mutation(self):
-        # Finding F-1 (recorded, not papered over): a verifier crash
-        # surfaces as a raw 500, not the contract's envelope. It is still a
-        # DENIAL — no decision path runs, no registration, no event — and
-        # the token never appears in the response. CM owes the contract an
-        # explicit verifier-failure code; this test pins the SECURITY
-        # outcome regardless of which code is later chosen, and would fail
-        # if a crash ever became a success.
+        # Finding F-1 is CLOSED by CM: a verifier crash now maps to a static
+        # 401 ``token_verification_failed`` (pinned in
+        # test_c6b6_oidc_attacks.py). This seam test pins the SECURITY
+        # outcome regardless of which code is chosen: it is always a DENIAL —
+        # no decision path runs, no registration, no event — and the token
+        # never appears in the response. It fails if a crash ever becomes a
+        # success.
         exploded = "verifier-exploded-canary"
 
         def boom(token):
@@ -315,12 +324,11 @@ class VerifierSeamTests(unittest.TestCase):
             self.assertEqual(client.get(route).status_code, 404, route)
 
     def test_api_package_ships_no_local_token_parser(self):
-        # Missing-behavior guard (Mr.G: real verifier is a future CM slice).
-        # Identity in this app may ONLY come through the injected seam. If
-        # a JWT/JWKS/cookie verifier is ever added inside api/, this test
-        # must be replaced by seam-parsing attacks on that verifier, not
-        # silently deleted: shipping a verifier without extending this
-        # suite is the failure mode being prevented.
+        # Identity in this app may ONLY come through the injected seam or the
+        # root-level auth_oidc.py verifier. If a JWT/JWKS/cookie verifier is
+        # ever added inside api/, the VerifierCoverageGuardTests in
+        # test_c6b6_oidc_attacks.py (which now follow the verifier wherever it
+        # ships, not just api/) must be extended, not silently deleted.
         api_dir = Path(__file__).resolve().parents[1] / "api"
         offenders = []
         pattern = re.compile(
