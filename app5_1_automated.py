@@ -2662,11 +2662,12 @@ def question_review_evidence_digest(row):
     marking settings); manual rows fall back to the server-derived document
     digest recorded at upload time. No browser-supplied value is ever used.
 
-    Session adapter over ``decision_core.evidence_digest``: only the manual
-    fallback is read from this session; the rest is row-derived policy.
+    Session adapter over ``decision_core.evidence_digest``: the manual
+    fallback is supplied lazily so a non-dict row never touches the session,
+    exactly like the pre-extraction body; the rest is row-derived policy.
     """
     return decision_core.evidence_digest(
-        row, st.session_state.get("last_manual_context"))
+        row, lambda: st.session_state.get("last_manual_context"))
 
 
 def pristine_question_list(row):
@@ -2703,7 +2704,7 @@ def question_review_binding(student_key, row, question_number):
     """
     return decision_core.question_review_binding(
         student_key, row, question_number,
-        question_review_evidence_digest(row))
+        lambda: question_review_evidence_digest(row))
 
 
 def question_review_store():
@@ -2842,7 +2843,7 @@ def durable_result_identity(row):
     here. Returns None when no trustworthy identity can be derived.
     """
     return decision_core.durable_result_identity(
-        row, question_review_evidence_digest(row))
+        row, lambda: question_review_evidence_digest(row))
 
 
 def decision_session_snapshot(student_key, question_number):
@@ -2958,7 +2959,7 @@ def apply_question_review_decision(student_key, question_number, action, reason,
             owner=sensitive_state_owner(),
             resolve_row=lambda: owned_review_row(student_key),
             row_owner_allowed=row_owner_allowed,
-            manual_context=st.session_state.get("last_manual_context"),
+            manual_context=lambda: st.session_state.get("last_manual_context"),
             reverify=reverify_classroom_review_access,
             manual_provenance_ok=manual_document_provenance_verified,
             plan_resolver=audit_persistence_plan,

@@ -417,5 +417,59 @@ class AppAdapterParityTests(unittest.TestCase):
         self.assert_parity(app_session, core_state)
 
 
+class LazyContextTests(unittest.TestCase):
+    """Session context is resolved only after a gate accepts the row.
+
+    Regression cover for the C6-B5 compatibility failure: BCM's AppTest
+    helper derives a Classroom result identity through ``load_app()`` with no
+    ``st`` injected (legitimate on main, where Classroom identity never reads
+    the session), and the first extraction of the core used to read the
+    session eagerly for EVERY row.
+    """
+
+    @staticmethod
+    def explode():
+        raise AssertionError("session context read before any gate accepted")
+
+    def test_non_dict_and_classroom_rows_never_resolve_the_context(self):
+        self.assertEqual(decision_core.evidence_digest("junk", self.explode),
+                         "")
+        self.assertIsNone(
+            decision_core.durable_result_identity(None, self.explode))
+        classroom = manual_row()
+        classroom.update({"classroom_course_id": "course-1",
+                          "classroom_assignment_id": "work-1",
+                          "classroom_context": "c" * 64,
+                          "submission_id": "sub-1", "revision": "rev-1"})
+        identity = decision_core.durable_result_identity(classroom,
+                                                         self.explode)
+        self.assertEqual(
+            identity, "classroom:course-1:work-1:sub-1:rev-1")
+
+    def test_forged_bindings_never_resolve_the_context(self):
+        self.assertIsNone(decision_core.question_review_binding(
+            "review-2", manual_row(), "1", self.explode))
+        self.assertIsNone(decision_core.question_review_binding(
+            "review-1", manual_row(), "99", self.explode))
+
+    def test_accepted_binding_resolves_the_context_lazily(self):
+        binding = decision_core.question_review_binding(
+            "review-1", manual_row(), "1", lambda: DIGEST)
+        self.assertEqual(len(binding), 64)
+
+    def test_stless_load_app_identity_read_matches_main_behaviour(self):
+        """Reproduce the C6-B5 helper exactly: load_app() without f['st']."""
+        scope = load_app()  # note: no scope["st"] is ever set
+        classroom = manual_row()
+        classroom.update({"classroom_course_id": "course-1",
+                          "classroom_assignment_id": "work-1",
+                          "classroom_context": "c" * 64,
+                          "submission_id": "sub-1", "revision": "rev-1"})
+        self.assertEqual(
+            scope["durable_result_identity"](classroom),
+            "classroom:course-1:work-1:sub-1:rev-1")
+        self.assertIsNone(scope["durable_result_identity"]("junk"))
+
+
 if __name__ == "__main__":
     unittest.main()
