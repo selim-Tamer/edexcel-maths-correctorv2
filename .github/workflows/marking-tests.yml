@@ -28,7 +28,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Syntax validation
-        run: python -m py_compile app5_1_automated.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py scheme_review.py teacher_authorization.py scheme_authorization.py question_review.py audit_store.py
+        run: python -m py_compile app5_1_automated.py decision_core.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py scheme_review.py teacher_authorization.py scheme_authorization.py question_review.py audit_store.py
       - name: Install offline PDF and symbolic benchmark dependencies
         # Patch pip first (pip itself carries advisories between releases),
         # then install the single complete test manifest from tests/.
