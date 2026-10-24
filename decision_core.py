@@ -37,7 +37,7 @@ tenant authorization are NOT part of this slice.
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, MutableMapping, Optional
+from typing import Any, Callable, MutableMapping, Optional, Union
 
 import audit_store
 import question_review
@@ -74,7 +74,7 @@ class DecisionEnv:
         owner: Optional[str],
         resolve_row: Callable[[], Optional[dict]],
         row_owner_allowed: Callable[[dict], bool],
-        manual_context: str,
+        manual_context: Union[str, Callable[[], str]],
         reverify: Callable[[dict], tuple[Optional[dict], Optional[str]]],
         manual_provenance_ok: Callable[[dict], bool],
         plan_resolver: Callable[[dict, str], tuple[Any, Optional[dict], Optional[str]]],
@@ -95,6 +95,17 @@ class DecisionEnv:
         self.fail = fail
         self.record_event = record_event
         self.now = now
+
+
+def _context(manual_context: Any) -> Any:
+    """Resolve the manual context, honouring a lazy (zero-arg) callable.
+
+    Callers pass a callable when the value lives in a session they must not
+    touch until a gate has actually accepted the row. That preserves the
+    application's original conditional-read behaviour: a non-dict row, a
+    Classroom row, or a forged binding never reads session state at all.
+    """
+    return manual_context() if callable(manual_context) else manual_context
 
 
 def row_review_scope(row: Any) -> Optional[str]:
@@ -120,6 +131,7 @@ def evidence_digest(row: Any, manual_context: Any) -> str:
     """
     if not isinstance(row, dict):
         return ""
+    manual_context = _context(manual_context)
     for value in (row.get("classroom_context"), row.get("snapshot_context"),
                   manual_context):
         if isinstance(value, str) and value:
