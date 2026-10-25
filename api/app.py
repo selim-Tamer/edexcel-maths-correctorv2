@@ -64,6 +64,7 @@ import document_limits
 import document_store
 import ingest_registry
 import job_store
+import marking_engine
 import question_review
 from auth_oidc import OidcError, OidcVerifier
 from membership_store import MembershipError
@@ -79,6 +80,11 @@ DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
 # route allowed a larger bound is POST /v1/documents, which is capped at the
 # document limits instead (and validated again by document_limits).
 MAX_BODY_BYTES = 32_768
+
+# Sentinel distinguishing "build the real engine from configuration" (the
+# argument is omitted) from an explicit ``engine=None`` ("no engine wired",
+# used by tests to pin the 503 refusal).
+_ENGINE_UNSET = object()
 
 # Provisional HTTP mapping for the contract's error codes (the contract names
 # codes, not statuses). Anything unmapped is a 400: it came from the source
@@ -224,7 +230,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                reverify: Optional[Callable[[dict], tuple]] = None,
                membership_resolver: Optional[Callable[[str], Any]] = None,
                authorize_ingest: Optional[Callable[[str, str, dict], bool]] = None,
-               engine: Optional[Callable[[bytes], dict]] = None,
+               engine: Any = _ENGINE_UNSET,
                now: Callable[[], str] = _now) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
@@ -247,9 +253,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
       unconfigured or has no matching succeeded job - i.e. the default fails
       closed, never open. The lease-holding runner does not go through this
       status check: it passes its claimed ``job_id`` as its own authority.
-    * ``engine=None`` means no marking engine is wired: the synchronous job
-      runner refuses with 503 ``model_unavailable`` instead of pretending a
-      result exists. Tests and dev wiring inject the real/fake engine.
+    * ``engine`` is omitted => the REAL wiring is attempted via
+      ``marking_engine.build_engine()``, which returns a callable only when
+      the operator has explicitly opted in (``AI_MARKER_ENGINE_REAL=1`` +
+      API key + a ``%PDF`` mark scheme) - i.e. a configured dev box runs the
+      existing marking path, and everything else gets ``None``. ``engine=None``
+      means "no marking engine" explicitly (tests use this): the synchronous
+      job runner then refuses with 503 ``model_unavailable`` instead of
+      pretending a result exists. No test or CI run ever spends tokens.
     """
     app = FastAPI(title="ai-maths-marker-api", version="0.1.0-slice-a",
                   docs_url=None, redoc_url=None, openapi_url=None)
@@ -258,6 +269,11 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     provenance_ok = manual_document_provenance_ok or (lambda row: False)
     reverify_row = reverify or _refuse_classroom
     membership_resolver = membership_resolver or membership_store.default_resolver()
+    if engine is _ENGINE_UNSET:
+        # Real wiring attempt: a configured opt-in dev box gets the existing
+        # marking path; everywhere else this returns None and the runner
+        # refuses 503 model_unavailable (never a fabricated result).
+        engine = marking_engine.build_engine()
     if verify_token is None:
         audience = (os.environ.get("GOOGLE_OIDC_AUDIENCE") or "").strip()
         if audience:
@@ -781,14 +797,48 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         except job_store.JobStoreError:
             raise ApiError("store_unusable", "the job store is unusable")
 
+    def _marks_only(owner: Optional[str], result_id: str):
+        """Marks-only question projection for one registered result.
+
+        Reads the audit store's stored ``original_scores`` (question number +
+        awarded marks only - never answers or working text). Returns ``None``
+        whenever it cannot be read (unconfigured/unusable store, unknown
+        result): the caller then omits the field instead of guessing, and the
+        full result stays readable through the projection endpoint.
+        """
+        if not owner:
+            return None
+        try:
+            store = require_store()
+            record = store.original_record(owner=owner, result_id=result_id)
+        except Exception:
+            return None
+        scores = record.get("original_scores") if isinstance(record, dict) else None
+        if not isinstance(scores, list):
+            return None
+        return [{"question_number": pair[0], "awarded_marks": pair[1]}
+                for pair in scores
+                if isinstance(pair, (list, tuple)) and len(pair) == 2]
+
     def job_payload(job: dict) -> dict:
-        """Job state as served: no tenant, no key, no document bytes."""
-        return {"job_id": job["job_id"], "status": job["status"],
-                "attempts": int(job["attempts"]),
-                "max_attempts": int(job["max_attempts"]),
-                "document_digest": job["document_digest"],
-                "result_id": job["result_id"],
-                "error_code": job["error_code"]}
+        """Job state as served: no tenant, no key, no document bytes.
+
+        A ``succeeded`` job additionally carries its question results as the
+        MARKS-ONLY projection (question number + awarded marks), so a demo
+        client can render the outcome without a second round trip and without
+        student text ever passing through a status response.
+        """
+        payload = {"job_id": job["job_id"], "status": job["status"],
+                   "attempts": int(job["attempts"]),
+                   "max_attempts": int(job["max_attempts"]),
+                   "document_digest": job["document_digest"],
+                   "result_id": job["result_id"],
+                   "error_code": job["error_code"]}
+        if job["status"] == "succeeded" and job.get("result_id"):
+            questions = _marks_only(job.get("owner_subject"), job["result_id"])
+            if questions is not None:
+                payload["questions"] = questions
+        return payload
 
     @app.post("/v1/jobs", status_code=201)
     def create_marking_job(body: JobRequest, who=Depends(actor)):
