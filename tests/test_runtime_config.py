@@ -276,6 +276,18 @@ class MigrationRunbookTests(unittest.TestCase):
         self.assertIn("append-only", text)
         self.assertIn("audit_events", text)
 
+    def test_runbook_requires_a_backout_drill_before_any_populated_apply(self):
+        # IR: a backout that was never executed is not a backout, and the
+        # empty-project shortcut must be proven, not assumed.
+        text = self._runbook()
+        self.assertIn("Backout drill", text)
+        self.assertIn("conditional, never assumed", text)
+        self.assertIn("scratch", text)
+        drill = text.split("Backout drill", 1)[1]
+        for step in ("restore the dump", "apply the forward file",
+                     "apply the backout file", "re-apply the forward file"):
+            self.assertIn(step, drill)
+
     def test_migration_grants_no_delete_and_no_audit_update(self):
         sql = (ROOT / "schema" / "postgres_v2_tenant_rls.sql").read_text(
             encoding="utf-8")

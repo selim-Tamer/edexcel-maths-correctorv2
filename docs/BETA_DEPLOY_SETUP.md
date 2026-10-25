@@ -120,9 +120,12 @@ Data API disabled, automatic RLS enabled, **no schema applied yet**.
 
 1. Connect as the project `postgres` role (SQL editor or `psql` with the
    database password from the dashboard - never committed).
-2. **Take the pre-migration `pg_dump`** described in `schema/MIGRATIONS.md` §2.
+2. **Take the pre-migration `pg_dump`** described in `schema/MIGRATIONS.md` §2,
+   and run the **§2.1 backout drill** on the restored copy.
    Supabase Free has **no automatic backups and no PITR**, so the platform is
-   not a backout.
+   not a backout. The empty-project shortcut applies **only** when the §2
+   emptiness query is recorded and shows zero rows - it is never assumed from
+   the project being new.
 3. Apply `schema/postgres_v1.sql` (tables + constraints).
 4. Apply `schema/postgres_v2_tenant_rls.sql` (roles + least privilege + RLS).
 5. Create the runtime login role, password generated once and stored only in

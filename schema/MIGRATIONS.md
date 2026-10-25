@@ -75,8 +75,37 @@ pg_restore --clean --if-exists --no-owner --no-privileges \
 
 Store the dump encrypted, outside the repository, and delete it only after the
 post-migration verification below passes and the agreed retention window ends.
-For the **first** apply (empty project, no data) the dump is trivial but still
-recorded, so the habit and the evidence exist before the first real row.
+
+**The empty-project exception is conditional, never assumed.** It may be used
+only when this query proves there is nothing to lose, and its output is pasted
+into the evidence record (step 7). "The project is new" is not evidence.
+
+```sql
+select 'schema_meta' as table_name, to_regclass('public.schema_meta') is not null as exists,
+       coalesce((select count(*) from schema_meta), 0) as rows
+union all select 'tenants', to_regclass('public.tenants') is not null, coalesce((select count(*) from tenants), 0)
+union all select 'tenant_membership', to_regclass('public.tenant_membership') is not null, coalesce((select count(*) from tenant_membership), 0)
+union all select 'results', to_regclass('public.results') is not null, coalesce((select count(*) from results), 0)
+union all select 'audit_events', to_regclass('public.audit_events') is not null, coalesce((select count(*) from audit_events), 0)
+union all select 'pdf_references', to_regclass('public.pdf_references') is not null, coalesce((select count(*) from pdf_references), 0);
+```
+
+If any row reports `exists = true` with `rows > 0`, the exception does **not**
+apply: take the dump, then run the drill below before touching the project.
+
+### 2.1 Backout drill (mandatory for every migration after 0002)
+
+A backout that has never been executed is not a backout. Before a migration
+touches a project that holds data, rehearse it on a restored copy:
+
+1. restore the dump from §2 into a scratch database or a second Free project;
+2. apply the forward file there and run the §4 verification block, capturing the output;
+3. apply the backout file, then re-assert the pre-migration shape **and** compare row counts with step 1;
+4. re-apply the forward file (idempotency), and only then apply it to the real project.
+
+Record the drill's commands and outputs with the dump id in step 7. For 0002 on
+an empty project the drill is still run against the scratch copy, so the
+rollback path is known-good before it is ever needed.
 
 ---
 
@@ -84,13 +113,13 @@ recorded, so the habit and the evidence exist before the first real row.
 
 | # | Action | Verify | Backout |
 |---|---|---|---|
-| 1 | Confirm target: project ref, region `eu-central-1`, `schema_meta` absent or empty, Data API disabled | `select to_regclass('public.schema_meta');` → `NULL` on a fresh project | none needed |
-| 2 | `pg_dump` (§2) | `pg_restore --list` succeeds | delete the dump only after §4 passes |
+| 1 | Confirm target: project ref, region `eu-central-1`, Data API disabled, and **judge emptiness with the §2 query** (output recorded, never assumed) | `select to_regclass('public.schema_meta');` → `NULL` on a fresh project, and all six §2 rows either absent or `rows = 0` | none needed |
+| 2 | `pg_dump` (§2) **and** the §2.1 backout drill on the restored copy | `pg_restore --list` succeeds; drill step 4 (re-apply) passes | delete the dump only after §4 passes |
 | 3 | Apply `postgres_v1.sql` on a direct connection | `select value from schema_meta where key='schema_version';` → `1`; `\dt public.*` shows 5 tables | drop the 5 tables in dependency order (no data yet) |
 | 4 | Apply `postgres_v2_tenant_rls.sql` | §4 verification block: `rls_version='1'`, `relrowsecurity` + `relforcerowsecurity` true on all 5, 5 policies, roles present, `anon`/`authenticated` revoked | `postgres_v2_tenant_rls_rollback.sql` → then §4 shape check → re-apply 0002 |
 | 5 | Create runtime logins (operator, once per environment): `CREATE ROLE marker_runtime LOGIN PASSWORD '<generated>'; GRANT marker_app TO marker_runtime;` (and, later, `marker_worker_login` → `marker_worker`) | `select current_user, session_user;` as the login shows the login, and `select rolname from pg_roles where pg_has_role(current_user, oid, 'member')` shows `marker_app` | `REVOKE marker_app FROM marker_runtime; DROP ROLE marker_runtime;` — do this **before** the 0002 backout, which refuses to drop a role with dependents |
 | 6 | Smoke test as the login: one `BEGIN; select set_config('app.tenant_id','<tenant>',true); select count(*) from results; COMMIT;` and one unbound `select count(*) from results;` | bound sees that tenant only; unbound sees `0` | none (read only) |
-| 7 | Record evidence: dump id, verification output, who applied what, errors | §4 | — |
+| 7 | Record evidence: dump id, the §2 emptiness output (or the drill transcript), §4 verification output, who applied what, errors | §4 | — |
 
 The generated password for step 5 is created once, stored only in Secret
 Manager, and never written to this repository, a message or a log.
@@ -211,7 +240,8 @@ service:
   cross-tenant read/insert, unbound fail-closed, pooled-request identity leak
   demonstration, `SET ROLE` escalation, inherited-privilege check,
   `SECURITY DEFINER` inventory, DDL/TRUNCATE/worker-DELETE denial,
-  **audit-trail UPDATE/DELETE denial for both runtime roles**, **no DELETE held
+  **audit-trail UPDATE/DELETE denial for both runtime roles with the seeded
+  audit row byte-identical afterwards**, **no DELETE held
   by any runtime role on any table**, `schema_meta` read-only,
   rollback-then-re-apply.
 * `tests/test_postgres_store_contract.py` — the adapter contract on the same
