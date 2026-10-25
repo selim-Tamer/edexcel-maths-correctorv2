@@ -353,14 +353,21 @@ class TenantRlsContractTests(unittest.TestCase):
                         "SELECT count(*) FROM audit_events").fetchone()[0], 1)
                 for statement in (
                         "UPDATE audit_events SET review_status = 'approved'",
-                        "UPDATE audit_events SET payload_digest = 'b' * 64",
+                        "UPDATE audit_events SET payload_digest ="
+                        " repeat('b', 64)",
                         "DELETE FROM audit_events",
                         "DELETE FROM audit_events"
                         " WHERE event_id = 'evt-denial-1'"):
                     with self.subTest(role=role, statement=statement):
-                        with self.assertRaises(pg_errors.InsufficientPrivilege):
-                            connection.execute(statement)
-                        connection.rollback()
+                        try:
+                            with self.assertRaises(
+                                    pg_errors.InsufficientPrivilege):
+                                connection.execute(statement)
+                        finally:
+                            # Always reset, even when the statement failed for
+                            # a different reason, so one bad case cannot abort
+                            # the rest of the subtests.
+                            connection.rollback()
                 # The existing row is untouched by the refused writes.
                 self.assertEqual(
                     snapshot(), before,
