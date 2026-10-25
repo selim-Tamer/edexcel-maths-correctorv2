@@ -48,16 +48,23 @@ in-process with ``fastapi.testclient``.
 from __future__ import annotations
 
 import os
+import hashlib
 import time
+from contextlib import closing
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
-from fastapi import Depends, FastAPI, Header, Query
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 import audit_store
 import decision_core
+import document_limits
+import document_store
+import ingest_registry
+import job_store
+import marking_engine
 import question_review
 from auth_oidc import OidcError, OidcVerifier
 from membership_store import MembershipError
@@ -69,9 +76,15 @@ DEV_ONLY_ENV = "AI_MARKER_AUDIT_DEV_ONLY"
 # Untrusted-input guard: every contract body is a few hundred bytes at most
 # (reason is capped at 2000 characters), so anything near this size is not a
 # legitimate request. Declared Content-Length is checked before the body is
-# read; chunked bodies without a length are rejected too, because this API
-# never accepts streaming uploads.
+# read; chunked bodies without a length are rejected too. The single write
+# route allowed a larger bound is POST /v1/documents, which is capped at the
+# document limits instead (and validated again by document_limits).
 MAX_BODY_BYTES = 32_768
+
+# Sentinel distinguishing "build the real engine from configuration" (the
+# argument is omitted) from an explicit ``engine=None`` ("no engine wired",
+# used by tests to pin the 503 refusal).
+_ENGINE_UNSET = object()
 
 # Provisional HTTP mapping for the contract's error codes (the contract names
 # codes, not statuses). Anything unmapped is a 400: it came from the source
@@ -92,7 +105,15 @@ _STATUS_BY_CODE = {
     "audit_result_identity_unavailable": 503,
     "store_closed": 503,
     "classroom_verification_unavailable": 503,
+    "store_unusable": 503,
+    "audit_order_invalid": 500,
+    "audit_record_invalid": 500,
     "audit_persist_failed": 500,
+    "original_output_immutable": 409,
+    # document_limits vocabulary (existing source codes, not invented):
+    "document_too_large": 413,
+    # marking_requests vocabulary for an unconfigured marking engine:
+    "model_unavailable": 503,
 }
 
 
@@ -126,6 +147,45 @@ class DecisionRequest(BaseModel):
     review_status: Optional[str] = Field(default=None, max_length=64)
     old_score: Optional[str] = Field(default=None, max_length=256)
     binding: Optional[str] = Field(default=None, max_length=512)
+
+
+class ClassroomIdentity(BaseModel):
+    course_id: str = Field(min_length=1, max_length=256)
+    assignment_id: str = Field(min_length=1, max_length=256)
+    submission_id: str = Field(min_length=1, max_length=256)
+    revision: Optional[str] = Field(default=None, max_length=256)
+
+
+class ManualIdentity(BaseModel):
+    # Server-issued opaque reference; no pupil name is ever accepted here.
+    submission_ref: str = Field(min_length=1, max_length=256)
+    document_digest: str = Field(min_length=64, max_length=64)
+
+
+class IngestRequest(BaseModel):
+    """``POST /v1/results`` body (contract): register a reviewed result.
+
+    ``result_id`` is NEVER accepted from the client: it is minted server-side
+    in the same durable-identity format the decision core derives, so the
+    registered stream is immediately addressable by decisions/events/
+    projection without any trust in client-supplied identifiers.
+    """
+
+    scope: str = Field(min_length=1, max_length=32)
+    original_output: dict
+    classroom_identity: Optional[ClassroomIdentity] = None
+    manual_identity: Optional[ManualIdentity] = None
+
+
+class JobRequest(BaseModel):
+    """``POST /v1/jobs`` body (PROPOSED contract addition).
+
+    The client supplies an idempotency key and the document it wants marked;
+    it never chooses the job id, the owner, the tenant or the result id.
+    """
+
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    document_digest: str = Field(min_length=64, max_length=64)
 
 
 def _now() -> str:
@@ -164,11 +224,13 @@ def _default_store_provider() -> Callable[[], Tuple[Optional[object], Optional[s
 
 
 def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
-               rows_for: Callable[[str, str], Iterable[dict]],
+               rows_for: Optional[Callable[[str, str], Iterable[dict]]] = None,
                store_provider: Optional[Callable] = None,
                manual_document_provenance_ok: Optional[Callable[[dict], bool]] = None,
                reverify: Optional[Callable[[dict], tuple]] = None,
                membership_resolver: Optional[Callable[[str], Any]] = None,
+               authorize_ingest: Optional[Callable[[str, str, dict], bool]] = None,
+               engine: Any = _ENGINE_UNSET,
                now: Callable[[], str] = _now) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
@@ -181,16 +243,37 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
       store (``membership_store``); unconfigured/unusable storage fails
       closed with 403 ``membership_unavailable``. Active tenant membership
       is verified server-side on EVERY endpoint that uses ``actor``.
-    * ``rows_for(subject, owner)`` provides owner-scoped row visibility and
+    * ``rows_for(subject, owner)`` defaults to the opt-in development registry and
       ``store_provider() -> (store, code | None)`` the persistence; both
       still fail closed when absent.
+    * ``authorize_ingest=None`` defaults to the JOB-BACKED provenance gate:
+      client ingest is allowed only for an owner+tenant document whose
+      marking job has SUCCEEDED (i.e. the genuine engine output is already
+      registered), and denied (no store write) whenever the job store is
+      unconfigured or has no matching succeeded job - i.e. the default fails
+      closed, never open. The lease-holding runner does not go through this
+      status check: it passes its claimed ``job_id`` as its own authority.
+    * ``engine`` is omitted => the REAL wiring is attempted via
+      ``marking_engine.build_engine()``, which returns a callable only when
+      the operator has explicitly opted in (``AI_MARKER_ENGINE_REAL=1`` +
+      API key + a ``%PDF`` mark scheme) - i.e. a configured dev box runs the
+      existing marking path, and everything else gets ``None``. ``engine=None``
+      means "no marking engine" explicitly (tests use this): the synchronous
+      job runner then refuses with 503 ``model_unavailable`` instead of
+      pretending a result exists. No test or CI run ever spends tokens.
     """
     app = FastAPI(title="ai-maths-marker-api", version="0.1.0-slice-a",
                   docs_url=None, redoc_url=None, openapi_url=None)
+    registry_rows = ingest_registry.default_provider()
     store_provider = store_provider or _default_store_provider()
     provenance_ok = manual_document_provenance_ok or (lambda row: False)
     reverify_row = reverify or _refuse_classroom
     membership_resolver = membership_resolver or membership_store.default_resolver()
+    if engine is _ENGINE_UNSET:
+        # Real wiring attempt: a configured opt-in dev box gets the existing
+        # marking path; everywhere else this returns None and the runner
+        # refuses 503 model_unavailable (never a fabricated result).
+        engine = marking_engine.build_engine()
     if verify_token is None:
         audience = (os.environ.get("GOOGLE_OIDC_AUDIENCE") or "").strip()
         if audience:
@@ -213,6 +296,11 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         """Bound the body of write requests before any parsing."""
         if request.method not in ("POST", "PUT", "PATCH"):
             return await call_next(request)
+        # Document uploads are bounded by the document limits (and re-checked
+        # by document_limits.validate_document); every other write keeps the
+        # strict contract cap.
+        cap = (document_limits.MAX_DOCUMENT_BYTES
+               if request.url.path == "/v1/documents" else MAX_BODY_BYTES)
         declared = request.headers.get("content-length")
         if declared is None:
             return envelope(413, "payload_invalid",
@@ -222,8 +310,17 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         except ValueError:
             return envelope(413, "payload_invalid",
                             "content-length header is not a number")
-        if size < 0 or size > MAX_BODY_BYTES:
+        if size < 0 or size > cap:
             return envelope(413, "payload_invalid", "request body too large")
+        chunks = []
+        observed = 0
+        async for chunk in request.stream():
+            observed += len(chunk)
+            if observed > cap:
+                return envelope(413, "payload_invalid", "request body too large")
+            chunks.append(chunk)
+        # Starlette reuses this bounded cached body for downstream parsing.
+        request._body = b"".join(chunks)
         return await call_next(request)
 
     @app.exception_handler(ApiError)
@@ -281,7 +378,12 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             raise ApiError("tenant_membership_required",
                            "an active tenant membership is required",
                            detail="membership_inactive_or_absent")
-        return subject, "google:" + subject
+        if (not isinstance(membership, membership_store.Membership)
+                or membership.subject != subject or not membership.tenant_id):
+            raise ApiError("tenant_membership_required",
+                           "an active tenant membership is required",
+                           detail="membership_unavailable")
+        return subject, "google:" + subject, membership.tenant_id
 
     def require_store():
         store, code = store_provider()
@@ -306,7 +408,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def healthz():
         return {"status": "ok"}
 
-    def visible_row(subject: str, owner: str, result_id: str):
+    def visible_row(subject: str, owner: str, tenant_id: str, result_id: str):
         """The ONE owner-visible row whose durable identity equals result_id.
 
         Shared by reads and writes so both obey the same visibility rule:
@@ -314,11 +416,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         about that stream is reachable - history included (finding O-1
         decision: reads are gated too; audit-export paths are future work).
         """
-        rows = [row for row in (rows_for(subject, owner) or [])
+        candidates = (rows_for(subject, owner) if rows_for is not None
+                      else registry_rows(subject, owner, tenant_id))
+        rows = [row for row in (candidates or [])
                 if isinstance(row, dict)]
         return next(
             (candidate for candidate in rows
              if candidate.get("report_owner") == owner
+             and candidate.get("tenant_id", tenant_id) == tenant_id
              and decision_core.durable_result_identity(candidate, "")
              == result_id), None)
 
@@ -326,14 +431,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def read_events(result_id: str,
                     limit: Optional[int] = Query(default=None, ge=1, le=500),
                     who=Depends(actor)):
-        subject, owner = who
-        if visible_row(subject, owner, result_id) is None:
+        subject, owner, tenant_id = who
+        if visible_row(subject, owner, tenant_id, result_id) is None:
             # Same indistinguishable denial as the write path.
             raise ApiError("result_not_registered", "no result for this owner")
         store = require_store()
         revision = stream_revision(store, owner, result_id)
-        if revision == 0:
-            # Owner-scoped miss is indistinguishable from "does not exist".
+        if store.current_revision(owner=owner, result_id=result_id) is None:
+            # A registered zero-event stream is valid; absence stays private.
             raise ApiError("result_not_registered", "no result for this owner")
         try:
             events = store.events(owner=owner, result_id=result_id, limit=limit)
@@ -342,16 +447,546 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         return {"result_id": result_id, "events": events,
                 "result_revision": revision}
 
+    def job_backed_ingest_authorizer(subject: str, tenant_id: str,
+                                     row: dict) -> bool:
+        """Default provenance gate: a COMPLETED server-side job authorizes.
+
+        The row's ``snapshot_context`` is the document digest; client ingest
+        is allowed only when this exact owner+tenant has a SUCCEEDED marking
+        job for that document (the genuine output is already registered).
+        Unconfigured job store, missing row, an in-flight ``running`` job or
+        any store failure means False - the default fails closed, and the
+        claim->succeed window can never be pre-empted (finding J-1).
+        """
+        digest = str(row.get("snapshot_context") or "")
+        owner = str(row.get("report_owner") or "")
+        if not digest or not owner:
+            return False
+        try:
+            with closing(job_store.require_connection()) as connection:
+                job_id = job_store.find_authorizable_job(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest)
+        except job_store.JobStoreError:
+            return False
+        return job_id is not None
+
+    authorize_ingest = authorize_ingest or job_backed_ingest_authorizer
+
+    def runner_authority_ok(job_id: str, tenant_id: str, owner: str,
+                            digest: str) -> bool:
+        """Server-side proof that THIS request holds the job's live lease.
+
+        The runner is inside the claim it just made: the row must be
+        ``running`` with an unexpired ``lease_until`` for exactly this
+        owner+tenant+document. A client cannot reach this code path (only
+        the run endpoint passes a ``runner_job_id``), and a stale/expired
+        lease fails the check - stronger evidence than a status string
+        (finding J-1 prescribed fix, part 2).
+        """
+        try:
+            with closing(job_store.require_connection()) as connection:
+                job = job_store.get_job(connection, tenant_id=tenant_id,
+                                        owner=owner, job_id=job_id)
+        except job_store.JobStoreError:
+            return False
+        return bool(job and job["status"] == "running"
+                    and int(job["lease_until"]) > int(time.time())
+                    and job["document_digest"] == digest
+                    and job["tenant_id"] == tenant_id
+                    and job["owner_subject"] == owner)
+
+    def finish_ingest(*, subject: str, owner: str, tenant_id: str,
+                      scope: str, original: dict, digest: str,
+                      review_key: str, result_id: str, revision: str,
+                      parts: dict, runner_job_id: str = None) -> dict:
+        """Shared registration path for the API and the marking-job runner.
+
+        Order (unchanged from the contract slice): shape validation of the
+        original -> trusted-provenance gate -> audit anchor FIRST ->
+        registry row. Authority for the gate is EITHER the client-facing
+        job-backed check (succeeded jobs only) OR, when the caller is the
+        lease-holding runner, its live claim (``runner_job_id``).
+        """
+        if not isinstance(original, dict):
+            raise ApiError("original_output_invalid",
+                           "original_output must be a mapping")
+        if not isinstance(original.get("questions"), list):
+            raise ApiError("original_output_invalid",
+                           "original_output must carry a questions list")
+        row = {"status": "Marked", "review_key": review_key,
+               "report_owner": owner, "snapshot_context": digest,
+               "tenant_id": tenant_id,
+               "revision": revision, "result": original,
+               "ai_result": original, "student_name": "",
+               "marking_model": "ingested", "audit_model": "Not run"}
+        if scope == "classroom":
+            row.update({"classroom_course_id": parts["course"],
+                        "classroom_assignment_id": parts["assignment"],
+                        "submission_id": parts["submission"]})
+        # A client-supplied digest/reference or original output is not a
+        # server-issued marking result: the trusted job/provenance service
+        # must authorize the exact owner/tenant/identity/output tuple. The
+        # lease-holding runner authorizes with its own live claim instead of
+        # the client-facing status check (finding J-1).
+        if runner_job_id is not None:
+            authorized = runner_authority_ok(runner_job_id, tenant_id,
+                                             owner, digest)
+        else:
+            try:
+                authorized = (authorize_ingest is not None and
+                              authorize_ingest(subject, tenant_id, row) is True)
+            except Exception:
+                authorized = False
+        if not authorized:
+            raise ApiError("manual_document_provenance_required",
+                           "a server-authorized result is required",
+                           detail="ingest_authorization_required")
+        store = require_store()
+        try:
+            with closing(ingest_registry.require_connection()) as connection:
+                registered = store.register_result(
+                    owner=owner, result_id=result_id, original_output=original)
+                ingest_registry.put_row(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    result_id=result_id, scope=scope, review_key=review_key,
+                    document_digest=digest, row=row)
+        except audit_store.AuditStoreError as failure:
+            raise ApiError(failure.code, "registration refused")
+        except ingest_registry.RegistryError as failure:
+            raise ApiError(failure.detail,
+                           "the ingest registry row could not be written",
+                           detail=failure.detail)
+        return {"result_id": result_id, "owner": owner,
+                "result_revision": registered["result_revision"],
+                # Interpretation of the contract's audit_reference for a
+                # zero-event registration: the immutable original digest.
+                "audit_reference": registered["original_digest"],
+                "supersedes": None}
+
+    @app.post("/v1/results", status_code=201)
+    def ingest_result(body: IngestRequest, who=Depends(actor)):
+        """Contract ingest: register an immutable original + its row.
+
+        Server mints result_id (never client-supplied); the audit-store
+        registration happens FIRST (the immutable anchor), then the dev
+        registry row that makes the stream visible through the same
+        owner-scoped rule as everything else. A registry failure after a
+        successful registration leaves an invisible-but-immutable stream;
+        a re-ingest completes the row idempotently.
+        """
+        subject, owner, tenant_id = who
+        scope = (body.scope or "").strip().lower()
+        if scope not in ("manual", "classroom"):
+            raise ApiError("payload_invalid", "scope must be manual or classroom")
+        original = body.original_output
+        if not isinstance(original, dict):
+            raise ApiError("original_output_invalid",
+                           "original_output must be a mapping")
+        if not isinstance(original.get("questions"), list):
+            raise ApiError("original_output_invalid",
+                           "original_output must carry a questions list")
+
+        digest = ""
+        revision = ""
+        submission = ""
+        parts: dict = {}
+        if scope == "manual":
+            if body.manual_identity is None:
+                raise ApiError("payload_invalid",
+                               "manual_identity is required for manual scope")
+            digest = body.manual_identity.document_digest.strip().lower()
+            if len(digest) != 64 or any(c not in "0123456789abcdef"
+                                        for c in digest):
+                raise ApiError("payload_invalid",
+                               "document_digest must be a sha256 hex digest")
+            reference = body.manual_identity.submission_ref.strip()
+            if (not reference or len(reference) > 256 or "/" in reference
+                    or any(ord(c) < 32 for c in reference)):
+                raise ApiError("payload_invalid",
+                               "submission_ref is not a valid server-issued id")
+            review_key = reference
+            result_id = "manual:" + digest[:16] + ":" + reference
+        else:
+            if body.classroom_identity is None:
+                raise ApiError("payload_invalid",
+                               "classroom_identity is required for classroom scope")
+            identity = body.classroom_identity
+            parts = {}
+            for name, value in (("course", identity.course_id),
+                                ("assignment", identity.assignment_id),
+                                ("submission", identity.submission_id)):
+                cleaned = (value or "").strip()
+                if (not cleaned or len(cleaned) > 256 or "/" in cleaned
+                        or any(ord(c) < 32 for c in cleaned)):
+                    raise ApiError("payload_invalid",
+                                   f"{name} id is not a valid server identity")
+                parts[name] = cleaned
+            revision = (identity.revision or "").strip()
+            if revision and ("/" in revision or len(revision) > 256
+                             or any(ord(c) < 32 for c in revision)):
+                raise ApiError("payload_invalid", "revision is not valid")
+            submission = parts["submission"]
+            review_key = submission
+            result_id = ("classroom:" + parts["course"] + ":"
+                         + parts["assignment"] + ":" + submission + ":"
+                         + (revision or "unversioned"))
+
+        return finish_ingest(
+            subject=subject, owner=owner, tenant_id=tenant_id, scope=scope,
+            original=original, digest=digest, review_key=review_key,
+            result_id=result_id, revision=revision, parts=parts)
+
+    @app.get("/v1/results/{result_id}/projection")
+    def project_result(result_id: str, who=Depends(actor)):
+        """Contract projection: original + corrections ALONGSIDE, never over.
+
+        Originals come from the owner-visible row (the store deliberately
+        never holds answers/working text); corrections are the store's
+        chained events, latest-per-question wins; only a ``corrected``
+        status changes an effective mark (flags/approvals never do — the
+        single-override rule). Invariant: ``original_ai_output`` is returned
+        untouched and the store is never mutated.
+        """
+        subject, owner, tenant_id = who
+        row = visible_row(subject, owner, tenant_id, result_id)
+        if row is None:
+            raise ApiError("result_not_registered", "no result for this owner")
+        store = require_store()
+        try:
+            original_record = store.original_record(
+                owner=owner, result_id=result_id)
+            events = store.replay(owner=owner, result_id=result_id)
+        except audit_store.AuditStoreError as failure:
+            raise ApiError(failure.code, "projection read failed")
+
+        pristine = row.get("ai_result") or row.get("result") or {}
+        if audit_store.digest_value(pristine) != original_record["original_digest"]:
+            raise ApiError("audit_record_invalid", "the original output changed")
+        questions = pristine.get("questions") if isinstance(pristine, dict) \
+            else None
+        if not isinstance(questions, list):
+            questions = []
+        latest = {}
+        for event in events:  # stream order: later events win
+            latest[str(event.get("question_number"))] = event
+        earned = 0.0
+        available = 0.0
+        projected = []
+        for question in questions:
+            number = str(question.get("question_number", ""))
+            original_marks = question.get("awarded_marks")
+            max_marks = question.get("max_marks")
+            event = latest.get(number)
+            status = (event or {}).get("review_status") or "unreviewed"
+            effective = original_marks
+            corrected = False
+            if status == "corrected":
+                try:
+                    effective = int((event or {}).get("new_score"))
+                except (TypeError, ValueError):
+                    raise ApiError("audit_record_invalid",
+                                   "a stored correction is unreadable")
+                corrected = True
+            entry = {"question_number": number, "max_marks": max_marks,
+                     "original_awarded_marks": original_marks,
+                     "effective_awarded_marks": effective,
+                     "corrected": corrected, "review_status": status}
+            if event is not None:
+                entry["last_action"] = event.get("action")
+                entry["last_reason"] = event.get("reason")
+            projected.append(entry)
+            if isinstance(effective, (int, float)):
+                earned += float(effective)
+            if isinstance(max_marks, (int, float)):
+                available += float(max_marks)
+        return {"result_id": result_id,
+                "result_revision": original_record["result_revision"],
+                "questions": projected,
+                "original_ai_output": pristine,
+                "totals": {"earned": earned, "available": available,
+                           "percentage": (round(earned * 100.0 / available, 2)
+                                          if available else 0.0)}}
+
+    def require_document_connection():
+        """Opt-in dev document store, failing closed when unconfigured."""
+        path = (os.environ.get(document_store.PATH_ENV) or "").strip()
+        acknowledged = (os.environ.get(document_store.ACK_ENV) or "").strip() == "1"
+        if not path or not acknowledged:
+            raise ApiError("dev_opt_in_required",
+                           "the document store is not configured for development")
+        try:
+            return document_store.open_store(path)
+        except document_store.DocumentStoreError:
+            raise ApiError("store_unusable", "the document store is unusable")
+
+    @app.post("/v1/documents", status_code=201)
+    async def upload_document(request: Request,
+                              filename: str = Query(default="", max_length=256),
+                              who=Depends(actor)):
+        """Private document adapter: validate, hash, store - never publish.
+
+        The raw PDF bytes are the request body (already bounded by the
+        middleware at the document limits). The server computes the sha256
+        digest - the client never supplies the key - validates through
+        ``document_limits`` (signature, size, page cap, encryption), then
+        stores the bytes under owner+tenant scope. Re-uploading identical
+        content is idempotent (200 + stored:false); no URL, no presigning,
+        no anonymous route exists anywhere.
+        """
+        subject, owner, tenant_id = who
+        data = bytes(await request.body())
+        try:
+            info = document_limits.validate_document(data, filename or None)
+        except document_limits.DocumentValidationError as failure:
+            # Content-free category message from the existing vocabulary.
+            raise ApiError(failure.code.lower(), str(failure))
+        digest = hashlib.sha256(data).hexdigest()
+        connection = require_document_connection()
+        try:
+            with closing(connection):
+                created = document_store.put_document(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest, filename=filename or "",
+                    page_count=info.get("pages"), content=data)
+        except document_store.DocumentStoreError as failure:
+            raise ApiError(failure.detail, "the document could not be stored")
+        receipt = {"document_digest": digest, "owner": owner,
+                   "bytes": len(data), "pages": info.get("pages"),
+                   "kind": info.get("kind"), "stored": created}
+        if not created:
+            return JSONResponse(status_code=200, content=receipt)
+        return receipt
+
+    @app.get("/v1/documents/{document_digest}")
+    def read_document(document_digest: str, who=Depends(actor)):
+        """Owner+tenant-scoped private read of stored PDF bytes.
+
+        A foreign, unknown or malformed digest is the SAME 404
+        ``result_not_registered`` (indistinguishable, enumeration-safe), and
+        the response carries no-store caching headers so intermediaries do
+        not keep a student document.
+        """
+        subject, owner, tenant_id = who
+        digest = (document_digest or "").strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ApiError("result_not_registered", "no document for this owner")
+        connection = require_document_connection()
+        try:
+            with closing(connection):
+                content = document_store.find_document(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest)
+        except document_store.DocumentStoreError as failure:
+            raise ApiError(failure.detail, "the document could not be read")
+        if content is None:
+            raise ApiError("result_not_registered", "no document for this owner")
+        return Response(content=content, media_type="application/pdf",
+                        headers={"Cache-Control": "private, no-store",
+                                 "X-Content-Type-Options": "nosniff"})
+
+    def require_job_connection():
+        """Opt-in dev job store, failing closed when unconfigured."""
+        path = (os.environ.get(job_store.PATH_ENV) or "").strip()
+        acknowledged = (os.environ.get(job_store.ACK_ENV) or "").strip() == "1"
+        if not path or not acknowledged:
+            raise ApiError("dev_opt_in_required",
+                           "the job store is not configured for development")
+        try:
+            return job_store.open_store(path)
+        except job_store.JobStoreError:
+            raise ApiError("store_unusable", "the job store is unusable")
+
+    def _marks_only(owner: Optional[str], result_id: str):
+        """Marks-only question projection for one registered result.
+
+        Reads the audit store's stored ``original_scores`` (question number +
+        awarded marks only - never answers or working text). Returns ``None``
+        whenever it cannot be read (unconfigured/unusable store, unknown
+        result): the caller then omits the field instead of guessing, and the
+        full result stays readable through the projection endpoint.
+        """
+        if not owner:
+            return None
+        try:
+            store = require_store()
+            record = store.original_record(owner=owner, result_id=result_id)
+        except Exception:
+            return None
+        scores = record.get("original_scores") if isinstance(record, dict) else None
+        if not isinstance(scores, list):
+            return None
+        return [{"question_number": pair[0], "awarded_marks": pair[1]}
+                for pair in scores
+                if isinstance(pair, (list, tuple)) and len(pair) == 2]
+
+    def job_payload(job: dict) -> dict:
+        """Job state as served: no tenant, no key, no document bytes.
+
+        A ``succeeded`` job additionally carries its question results as the
+        MARKS-ONLY projection (question number + awarded marks), so a demo
+        client can render the outcome without a second round trip and without
+        student text ever passing through a status response.
+        """
+        payload = {"job_id": job["job_id"], "status": job["status"],
+                   "attempts": int(job["attempts"]),
+                   "max_attempts": int(job["max_attempts"]),
+                   "document_digest": job["document_digest"],
+                   "result_id": job["result_id"],
+                   "error_code": job["error_code"]}
+        if job["status"] == "succeeded" and job.get("result_id"):
+            questions = _marks_only(job.get("owner_subject"), job["result_id"])
+            if questions is not None:
+                payload["questions"] = questions
+        return payload
+
+    @app.post("/v1/jobs", status_code=201)
+    def create_marking_job(body: JobRequest, who=Depends(actor)):
+        """Create (or replay) one durable marking job - idempotent.
+
+        The referenced document must already exist for THIS owner+tenant,
+        otherwise the ordinary indistinguishable 404. Replaying the same key
+        with the same digest returns the SAME job (200 + current state);
+        reusing the key for a different document is refused 409
+        ``idempotency_key_payload_mismatch``.
+        """
+        subject, owner, tenant_id = who
+        digest = (body.document_digest or "").strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef"
+                                    for c in digest):
+            raise ApiError("payload_invalid",
+                           "document_digest must be a sha256 hex digest")
+        key = (body.idempotency_key or "").strip()
+        if (not key or len(key) > 128 or "/" in key
+                or any(ord(c) < 32 for c in key)):
+            raise ApiError("payload_invalid",
+                           "idempotency_key is not a valid server-safe id")
+        with closing(require_document_connection()) as documents:
+            stored = document_store.find_document(
+                documents, tenant_id=tenant_id, owner=owner,
+                document_digest=digest)
+        if stored is None:
+            raise ApiError("result_not_registered", "no document for this owner")
+        connection = require_job_connection()
+        try:
+            with closing(connection):
+                created = job_store.create_job(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    idempotency_key=key, document_digest=digest)
+                current = job_store.get_job(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    job_id=created["job_id"])
+        except job_store.JobStoreError as failure:
+            raise ApiError(failure.detail, "the job could not be created")
+        payload = job_payload(current)
+        payload["owner"] = owner
+        payload["created"] = bool(created["created"])
+        if not created["created"]:
+            return JSONResponse(status_code=200, content=payload)
+        return payload
+
+    @app.get("/v1/jobs/{job_id}")
+    def read_marking_job(job_id: str, who=Depends(actor)):
+        """Owner+tenant-scoped durable status; misses are indistinguishable."""
+        subject, owner, tenant_id = who
+        connection = require_job_connection()
+        try:
+            with closing(connection):
+                job = job_store.get_job(connection, tenant_id=tenant_id,
+                                        owner=owner, job_id=job_id)
+        except job_store.JobStoreError as failure:
+            raise ApiError(failure.detail, "the job could not be read")
+        if job is None:
+            raise ApiError("result_not_registered", "no job for this owner")
+        return job_payload(job)
+
+    @app.post("/v1/jobs/{job_id}/run")
+    def run_marking_job(job_id: str, who=Depends(actor)):
+        """Synchronously execute one job (dev/demo worker, lease-guarded).
+
+        Claim -> engine(document) -> SAME registration path as
+        ``POST /v1/results`` (so the job-backed provenance gate authorizes
+        it) -> success. Failures are settled with an existing-vocabulary
+        error code and requeued while attempts remain; an expired lease is
+        reclaimable, a live lease is never stolen. The engine is injected;
+        without one this refuses 503 ``model_unavailable`` rather than
+        fabricating a result.
+        """
+        subject, owner, tenant_id = who
+        connection = require_job_connection()
+        try:
+            with closing(connection):
+                job = job_store.get_job(connection, tenant_id=tenant_id,
+                                        owner=owner, job_id=job_id)
+                if job is None:
+                    raise ApiError("result_not_registered",
+                                   "no job for this owner")
+                if engine is None:
+                    raise ApiError("model_unavailable",
+                                   "no marking engine is configured")
+                with closing(require_document_connection()) as documents:
+                    content = document_store.find_document(
+                        documents, tenant_id=tenant_id, owner=owner,
+                        document_digest=job["document_digest"])
+                claimed_job, claimed = job_store.claim_job(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    job_id=job_id)
+                if claimed_job is None:
+                    raise ApiError("result_not_registered",
+                                   "no job for this owner")
+                if not claimed:
+                    # Succeeded/failed, or another worker holds a live lease:
+                    # report state, never double-run.
+                    return job_payload(claimed_job)
+                if content is None:
+                    # The store lost the document: settle this attempt with a
+                    # static code instead of executing.
+                    job_store.settle_failure(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        job_id=job_id, error_code="result_not_registered")
+                    return job_payload(job_store.get_job(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        job_id=job_id))
+                digest = job["document_digest"]
+                try:
+                    original = engine(content)
+                    receipt = finish_ingest(
+                        subject=subject, owner=owner, tenant_id=tenant_id,
+                        scope="manual", original=original, digest=digest,
+                        review_key=job_id,
+                        result_id="manual:" + digest[:16] + ":" + job_id,
+                        revision="", parts={},
+                        runner_job_id=job_id)
+                except ApiError as failure:
+                    job_store.settle_failure(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        job_id=job_id, error_code=failure.code)
+                except Exception:
+                    # Engine/transport failure: static existing-vocabulary
+                    # outcome, retried until max_attempts is exhausted.
+                    job_store.settle_failure(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        job_id=job_id, error_code="service_unavailable")
+                else:
+                    job_store.succeed_job(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        job_id=job_id, result_id=receipt["result_id"])
+                return job_payload(job_store.get_job(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    job_id=job_id))
+        except job_store.JobStoreError as failure:
+            raise ApiError(failure.detail, "the job could not be run")
+
     @app.post("/v1/results/{result_id}/decisions")
     def submit_decision(result_id: str, body: DecisionRequest,
                         who=Depends(actor)):
-        subject, owner = who
+        subject, owner, tenant_id = who
         store = require_store()
 
         # 1. Owner-scoped row resolution: the durable identity of a visible
         #    row must equal the requested result_id, else nothing is known
         #    about that stream for this owner (fail closed, leak nothing).
-        row = visible_row(subject, owner, result_id)
+        row = visible_row(subject, owner, tenant_id, result_id)
         if row is None:
             raise ApiError("result_not_registered", "no result for this owner")
 

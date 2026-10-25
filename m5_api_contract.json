@@ -9,7 +9,7 @@
     "storage_target": "Supabase Postgres (+ private object storage for snapshots)",
     "provisioned": false,
     "deployed": false,
-    "note": "This document is a PROPOSAL. No FastAPI dependency exists in requirements.txt and none is added by this PR. No endpoint here is served by any running process. Every failure code is drawn from the existing source vocabulary; no code is invented."
+    "note": "The per-endpoint `implemented` flags are authoritative: they mark the routes served in-process by the dev API (tests drive it with fastapi.testclient behind opt-in development stores). spec.status stays SPEC_NOT_IMPLEMENTED because the sign-off endpoint and the deployment posture are not implemented. No FastAPI dependency exists in requirements.txt (it stays test-only), nothing is provisioned or deployed, and every failure code is drawn from the existing source vocabulary - no code is invented."
   },
 
   "error_envelope": {
@@ -46,7 +46,7 @@
       "method": "POST",
       "path": "/v1/results",
       "purpose": "Register one reviewed result and its immutable original AI output.",
-      "implemented": false,
+      "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
       "request": {
@@ -93,7 +93,7 @@
       "method": "POST",
       "path": "/v1/results/{result_id}/decisions",
       "purpose": "Atomically commit one accepted teacher question-level decision together with its audit event.",
-      "implemented": false,
+      "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
       "idempotent": true,
@@ -145,7 +145,7 @@
       "method": "GET",
       "path": "/v1/results/{result_id}/events",
       "purpose": "Ordered, owner-scoped audit event history for one result stream.",
-      "implemented": false,
+      "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
       "response_200": {
@@ -163,7 +163,7 @@
       "method": "GET",
       "path": "/v1/results/{result_id}/projection",
       "purpose": "Derived current-state projection. NOT an independently editable grade source.",
-      "implemented": false,
+      "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
       "response_200": {
@@ -212,7 +212,7 @@
       "method": "GET",
       "path": "/v1/healthz",
       "purpose": "Liveness/readiness probe. No data access.",
-      "implemented": false,
+      "implemented": true,
       "auth_required": false,
       "tenant_scoped": false,
       "response_200": {
@@ -221,12 +221,119 @@
         "properties": { "status": { "enum": ["ok"] } }
       },
       "error_codes": []
+    },
+    {
+      "method": "POST",
+      "path": "/v1/documents",
+      "purpose": "Upload one PDF as a raw application/pdf body. The server computes the sha256 document_digest (the client never chooses the key) and stores the bytes in the owner+tenant scoped development document store.",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "dev_only_storage": true,
+      "request": {
+        "body": "raw application/pdf bytes, bounded by document_limits",
+        "query": { "filename": { "type": "string", "maxLength": 256 } }
+      },
+      "response_201": {
+        "type": "object",
+        "required": ["document_digest", "owner", "bytes", "stored"],
+        "properties": {
+          "document_digest": { "type": "string" },
+          "owner": { "type": "string" },
+          "bytes": { "type": "integer" },
+          "pages": { "type": ["integer", "null"] },
+          "kind": { "type": "string" },
+          "stored": { "type": "boolean" }
+        },
+        "note": "An identical re-upload answers 200 with stored:false (content-addressed idempotency)."
+      },
+      "error_codes": ["payload_invalid", "document_too_large", "invalid_pdf", "encrypted_pdf", "too_many_pages", "unsupported_type", "dev_opt_in_required", "store_unusable"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/documents/{document_digest}",
+      "purpose": "Owner+tenant-scoped private read of the stored PDF bytes: application/pdf with private no-store and nosniff. No anonymous or signed-URL route exists.",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "dev_only_storage": true,
+      "response_200": { "type": "string", "format": "binary" },
+      "error_codes": ["result_not_registered", "dev_opt_in_required", "store_unusable"]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/jobs",
+      "purpose": "Create (or idempotently replay) one durable marking job for a document this owner already uploaded. job_id is minted server-side; the client supplies only the idempotency key and the document digest.",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "dev_only_storage": true,
+      "idempotent": true,
+      "request": {
+        "type": "object",
+        "required": ["idempotency_key", "document_digest"],
+        "properties": {
+          "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 128 },
+          "document_digest": { "type": "string", "minLength": 64, "maxLength": 64 }
+        }
+      },
+      "response_201": { "$ref_job_payload": "see /v1/jobs/{job_id} response_200" },
+      "response_200": { "$ref_job_payload": "replay: same job, current state, created:false" },
+      "error_codes": ["payload_invalid", "result_not_registered", "idempotency_key_payload_mismatch", "dev_opt_in_required", "store_unusable"]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/jobs/{job_id}",
+      "purpose": "Owner+tenant-scoped durable job status. A succeeded job also carries its question results as the marks-only projection (question number + awarded marks); student answers never appear on a status payload.",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "dev_only_storage": true,
+      "response_200": {
+        "type": "object",
+        "required": ["job_id", "status", "attempts", "max_attempts", "document_digest", "result_id", "error_code"],
+        "properties": {
+          "job_id": { "type": "string" },
+          "status": { "enum": ["queued", "running", "succeeded", "failed"] },
+          "attempts": { "type": "integer" },
+          "max_attempts": { "type": "integer" },
+          "document_digest": { "type": "string" },
+          "result_id": { "type": ["string", "null"] },
+          "error_code": { "type": ["string", "null"] },
+          "questions": {
+            "type": "array",
+            "description": "SUCCEEDED jobs only, when the marks-only projection is readable; omitted otherwise rather than guessed.",
+            "items": {
+              "type": "object",
+              "required": ["question_number", "awarded_marks"],
+              "properties": {
+                "question_number": { "type": "string" },
+                "awarded_marks": { "type": ["number", "null"] }
+              }
+            }
+          }
+        }
+      },
+      "error_codes": ["result_not_registered", "dev_opt_in_required", "store_unusable"]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/jobs/{job_id}/run",
+      "purpose": "Synchronously execute one claimable job: lease-guarded claim, marking engine, then the SAME registration path as POST /v1/results. Development/demo executor only; a background worker is the production shape and is absent by design for the beta.",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "dev_only_storage": true,
+      "response_200": { "$ref_job_payload": "see /v1/jobs/{job_id} response_200" },
+      "error_codes": ["result_not_registered", "model_unavailable", "manual_document_provenance_required", "original_output_invalid", "service_unavailable", "dev_opt_in_required", "store_unusable"]
     }
   ],
 
   "absent_by_design": {
     "grade_publication": "No POST/PUT/PATCH/DELETE to Classroom or Drive exists in the application. All five classroom_request call sites pass GET. Scores surface to the teacher for manual entry.",
     "payments": "Not in scope; separately gated.",
-    "public_signups": "Not in scope; brand/claims/privacy gate is separate."
+    "public_signups": "Not in scope; brand/claims/privacy gate is separate.",
+    "production_marking_worker": "POST /v1/jobs/{job_id}/run executes a job synchronously inside the request as the development/demo executor. A background worker that polls and claims jobs is the production shape and does not exist yet; no claim is made that jobs run anywhere today.",
+    "paid_engine_calls": "The real engine (marking_engine.build_engine) activates only behind AI_MARKER_ENGINE_REAL=1 with an API key and a configured mark scheme. No test, CI job or deployment spends provider tokens by default."
   }
 }
