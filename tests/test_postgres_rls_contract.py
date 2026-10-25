@@ -201,6 +201,17 @@ class TenantRlsContractTests(unittest.TestCase):
         self.addCleanup(connection.close)
         return connection
 
+    def _database_admin(self):
+        """Privileged connection INSIDE the throwaway test database.
+
+        The class-level ``cls.admin`` connection points at the cluster's
+        default database, where the v1 tables do not exist; catalog checks
+        about the test schema must use this one.
+        """
+        connection = psycopg.connect(_dsn(), autocommit=True)
+        self.addCleanup(connection.close)
+        return connection
+
     def _bound(self, connection, tenant: str = TENANT):
         """Open a transaction bound to one tenant (the app's normal shape)."""
         return connection.transaction()
@@ -355,12 +366,13 @@ class TenantRlsContractTests(unittest.TestCase):
         # The complement of the test above, on the real tables: a privileged
         # connection sees every tenant. Tenant authorisation for such a path is
         # the application's job (explicit tenant_id predicates), not RLS's.
-        rolsuper, rolbypass = self.admin.execute(
+        database = self._database_admin()
+        rolsuper, rolbypass = database.execute(
             "SELECT rolsuper, rolbypassrls FROM pg_roles"
             " WHERE rolname = current_user").fetchone()
         if not (rolsuper or rolbypass):
             self.skipTest("admin role is neither superuser nor BYPASSRLS")
-        tenants = {row[0] for row in self.admin.execute(
+        tenants = {row[0] for row in database.execute(
             "SELECT tenant_id FROM results").fetchall()}
         self.assertEqual(tenants, {TENANT, OTHER_TENANT})
 
@@ -418,14 +430,15 @@ class TenantRlsContractTests(unittest.TestCase):
         for role in ("marker_app", "marker_worker"):
             with self.subTest(role=role):
                 self.assertEqual(
-                    self.admin.execute(query, (role,)).fetchall(), [])
+                    self._database_admin().execute(query, (role,)).fetchall(),
+                    [])
 
     def test_no_security_definer_function_can_manufacture_a_tenant(self):
         # SECURITY DEFINER runs with the owner's rights, so a function could
         # set app.tenant_id on the caller's behalf. The application schema must
         # contain none; re-run this inventory on the real project (extensions
         # and Supabase's autoRLS helper live outside public).
-        rows = self.admin.execute(
+        rows = self._database_admin().execute(
             "SELECT p.proname FROM pg_proc p"
             " JOIN pg_namespace n ON n.oid = p.pronamespace"
             " WHERE p.prosecdef AND n.nspname = 'public'"
