@@ -9,6 +9,7 @@ with expired-lease crash recovery, cross-owner/tenant indistinguishable 404s,
 fail-closed unconfigured stores, and no-engine refusal.
 """
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -132,6 +133,16 @@ class JobApiTests(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded", ran.text)
         self.assertEqual(state["attempts"], 1)
         self.assertTrue(state["result_id"].startswith("manual:"), state)
+        # Question results ride on the succeeded status payload as the
+        # MARKS-ONLY projection: question number + awarded marks, never the
+        # student's answers or working text.
+        self.assertEqual(
+            state["questions"],
+            [{"question_number": "1", "awarded_marks": 2},
+             {"question_number": "2", "awarded_marks": 1}])
+        raw = json.dumps(state)
+        self.assertNotIn("student_answer", raw)
+        self.assertNotIn("SYNTHETIC-ANSWER", raw)
         # The result is immediately readable through the contract projection.
         projection = self.client.get(f"/v1/results/{state['result_id']}/projection",
                                      headers=self._headers())
@@ -168,6 +179,9 @@ class JobApiTests(unittest.TestCase):
                          ["queued", "queued", "failed"])
         self.assertEqual([o["attempts"] for o in outcomes], [1, 2, 3])
         self.assertEqual(outcomes[-1]["error_code"], "service_unavailable")
+        # A non-succeeded job never advertises question results.
+        for outcome in outcomes:
+            self.assertNotIn("questions", outcome)
         # Exhausted: no fourth execution attempt is ever made.
         self.engine = engine_output
         self.assertEqual(self._run(job_id, client=client).json()["status"],
@@ -336,6 +350,33 @@ class JobApiTests(unittest.TestCase):
         self.assertEqual(state["status"], "queued")
         self.assertEqual(state["error_code"], "original_output_invalid")
         self.assertEqual(state["attempts"], 1)
+
+    def test_default_engine_wiring_is_fail_closed_without_opt_in(self):
+        """create_app() with NO engine argument builds the REAL wiring path.
+
+        With no AI_MARKER_ENGINE_REAL opt-in (and no key/mark scheme) that
+        path yields no engine, so the runner refuses 503 model_unavailable
+        and the job stays untouched - the default can never fabricate work.
+        """
+        for name in ("AI_MARKER_ENGINE_REAL", "AI_MARKER_MARK_SCHEME",
+                     "GEMINI_API_KEY", "AI_MARKER_ENGINE_AUDIT"):
+            prior = os.environ.pop(name, None)
+            if prior is not None:
+                self.addCleanup(os.environ.__setitem__, name, prior)
+            else:
+                self.addCleanup(os.environ.pop, name, None)
+        client = TestClient(create_app(
+            verify_token=TOKENS.get,
+            membership_resolver=lambda subject: Membership(
+                subject, TENANT, "teacher"),
+            manual_document_provenance_ok=lambda row: True))
+        job_id = self._create(client=client).json()["job_id"]
+        refused = self._run(job_id, client=client)
+        self.assertEqual(refused.status_code, 503, refused.text)
+        self.assertEqual(refused.json()["error"]["code"], "model_unavailable")
+        state = client.get(f"/v1/jobs/{job_id}",
+                           headers=self._headers()).json()
+        self.assertEqual((state["status"], state["attempts"]), ("queued", 0))
 
     def test_no_engine_is_refused_not_faked(self):
         client = self._client(TENANT, engine_marker=None)

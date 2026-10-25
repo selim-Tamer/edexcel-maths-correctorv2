@@ -54,10 +54,32 @@ def _auth_codes() -> set[str]:
                           _source("teacher_authorization.py")))
 
 
+def _served_route_codes() -> set[str]:
+    """Vocabulary of the modules the served routes actually draw from.
+
+    Added with the contract/FCM alignment slice: ``POST/GET /v1/documents``
+    and the ``/v1/jobs`` routes emit codes from ``api/app.py``,
+    ``document_limits.py``, ``job_store.py``, ``document_store.py``,
+    ``ingest_registry.py``, ``membership_store.py`` and
+    ``marking_requests.py``. Matched case-insensitively and lowercased,
+    because the API lowers the ``document_limits`` constants at the raise
+    site (``failure.code.lower()``).
+    """
+    files = ("api/app.py", "document_limits.py", "job_store.py",
+             "document_store.py", "ingest_registry.py",
+             "membership_store.py", "marking_requests.py")
+    codes: set[str] = set()
+    for path in files:
+        codes.update(token.lower() for token in
+                     re.findall(r'"([A-Za-z][A-Za-z_]{2,})"', _source(path)))
+    return codes
+
+
 def _known_codes() -> set[str]:
     """Every failure code the real source can actually emit."""
     return (_store_codes() | _app_audit_codes()
-            | _question_review_codes() | _auth_codes())
+            | _question_review_codes() | _auth_codes()
+            | _served_route_codes())
 
 
 class ContractParseTests(unittest.TestCase):
@@ -125,6 +147,20 @@ class BoundaryAndInvariantTests(unittest.TestCase):
         self.assertIn("atomicity_invariant", decision)
         self.assertIn("No successful correction is persisted if its audit "
                       "write fails", decision["atomicity_invariant"])
+
+    def test_implemented_flags_match_the_real_route_inventory(self):
+        """Slice 2c alignment: flags may only claim what api/app.py serves."""
+        contract = _load_contract()
+        routes = set(re.findall(r'@app\.(?:get|post)\("([^"]+)"',
+                                _source("api/app.py")))
+        flagged = {e["path"] for e in contract["endpoints"]
+                   if e["implemented"]}
+        self.assertEqual(flagged, routes,
+                         "implemented flags must equal the served routes")
+        # Every served route must also be documented in the contract.
+        documented = {e["path"] for e in contract["endpoints"]}
+        self.assertEqual(routes - documented, set(),
+                         "a served route is missing from the contract")
 
     def test_no_grade_publication_endpoint_exists(self):
         """Honest inventory: the app performs zero mutating Classroom/Drive calls."""
