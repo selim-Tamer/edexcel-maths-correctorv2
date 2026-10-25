@@ -12,9 +12,11 @@ mark scheme only.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 import marking_engine
@@ -148,6 +150,71 @@ class EngineWiringTests(unittest.TestCase):
         self.assertEqual(self.clients, [])
         self.assertEqual(self.uploads, [])
         self.assertEqual(self.grades, [])
+
+
+class RealGradeSignatureTests(unittest.TestCase):
+    """IR's PR60 finding: the grade argument names must match engine().
+
+    A mismatch only surfaces on a CONFIGURED run - after the paid provider
+    uploads - so it is pinned here instead: the exact keyword arguments
+    ``engine()`` passes must bind to the default real grade, and the default
+    wiring must actually reach that function.
+    """
+
+    ENGINE_CALL = {"client": object(), "student_file": "file:submission.pdf",
+                   "mark_scheme_file": "file:scheme.pdf"}
+
+    def test_engine_call_kwargs_bind_to_the_real_grade(self):
+        signature = inspect.signature(marking_engine._real_grade)
+        bound = signature.bind(**self.ENGINE_CALL)
+        self.assertEqual(list(bound.arguments),
+                         ["client", "student_file", "mark_scheme_file"])
+        # audit_enabled is supplied by build_engine as a partial keyword.
+        bound.apply_defaults()
+        self.assertIs(bound.arguments["audit_enabled"], False)
+
+    def test_default_wiring_reaches_the_real_grade_with_those_kwargs(self):
+        calls = {}
+
+        class FakeApp(types.ModuleType):
+            def mark_one_submission(self, *args, **kwargs):
+                calls["args"] = args
+                calls["kwargs"] = kwargs
+                return {"result": questions_output(), "audit_model": "stub"}
+
+        stub = FakeApp("app5_1_automated")
+        prior = sys.modules.get("app5_1_automated")
+        sys.modules["app5_1_automated"] = stub
+        try:
+            if prior is None:
+                self.addCleanup(sys.modules.pop, "app5_1_automated", None)
+            else:
+                self.addCleanup(sys.modules.__setitem__, "app5_1_automated",
+                                prior)
+            scheme = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            scheme.write(b"%PDF-1.4 synthetic mark scheme")
+            scheme.close()
+            self.addCleanup(os.unlink, scheme.name)
+            for name, value in ((marking_engine.REAL_ENV, "1"),
+                                (marking_engine.KEY_ENV, "test-key"),
+                                (marking_engine.SCHEME_ENV, scheme.name)):
+                os.environ[name] = value
+                self.addCleanup(os.environ.pop, name, None)
+
+            engine = marking_engine.build_engine(
+                client_factory=lambda key: "client",
+                upload=lambda client, data, filename: "file:" + filename)
+            self.assertIsNotNone(engine)
+            output = engine(b"%PDF-submission")
+        except TypeError as failure:  # the exact regression under test
+            self.fail(f"default grade wiring rejected engine kwargs: {failure}")
+        self.assertEqual([q["awarded_marks"] for q in output["questions"]],
+                         [2, 1])
+        self.assertEqual(
+            calls["args"][:5],
+            ("client", "", "file:submission.pdf", "file:" + os.path.basename(
+                scheme.name), None))
+        self.assertIn("audit_enabled", calls["kwargs"])
 
 
 if __name__ == "__main__":

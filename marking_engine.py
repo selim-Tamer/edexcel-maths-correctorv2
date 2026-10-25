@@ -28,6 +28,7 @@ real path above.
 """
 from __future__ import annotations
 
+import functools
 import os
 import time
 
@@ -58,6 +59,23 @@ def _configured() -> tuple:
     return True, key, scheme, os.path.basename(path)
 
 
+def _real_grade(client, student_file, mark_scheme_file, *, audit_enabled=False):
+    """The existing marking path, called exactly as ``engine()`` calls it.
+
+    Parameter names are load-bearing: ``engine()`` passes ``client``,
+    ``student_file`` and ``mark_scheme_file`` by keyword, and a mismatch would
+    only surface on a configured run - after the provider uploads were
+    already paid for. ``tests/test_marking_engine.py`` pins this signature.
+    The import is lazy because the app module is Streamlit-side and is only
+    ever loaded when a real engine has been explicitly enabled.
+    """
+    import app5_1_automated as app
+    wrapper = app.mark_one_submission(client, "", student_file,
+                                      mark_scheme_file, None,
+                                      audit_enabled=bool(audit_enabled))
+    return wrapper if isinstance(wrapper, dict) else {}
+
+
 def build_engine(*, client_factory=None, upload=None, grade=None):
     """Return the real marking callable, or ``None`` when not configured.
 
@@ -82,19 +100,14 @@ def build_engine(*, client_factory=None, upload=None, grade=None):
         return document_pipeline.transfer(client, data, filename,
                                           progress=None, clock=time)
 
-    def real_grade(client, student_file, scheme_file):
-        # Lazily import the app module: it is Streamlit-side and only ever
-        # loaded when a real engine has been explicitly enabled.
-        import app5_1_automated as app
-        wrapper = app.mark_one_submission(
-            client, "", student_file, scheme_file, None,
-            audit_enabled=(os.environ.get(AUDIT_ENV) or "").strip() == "1")
-        return wrapper if isinstance(wrapper, dict) else {}
-
     client_factory = client_factory or real_client
     upload = upload or real_upload
-    grade = grade or real_grade
+    # The default grade is the REAL path, exposed as a module-level function
+    # so its signature can be pinned against the exact keyword arguments
+    # ``engine()`` passes (an argument-name mismatch would otherwise only
+    # surface on a configured run, after provider calls were already paid).
     audit_enabled = (os.environ.get(AUDIT_ENV) or "").strip() == "1"
+    grade = grade or functools.partial(_real_grade, audit_enabled=audit_enabled)
     cached_scheme = {"file": None}
 
     def engine(data: bytes) -> dict:
