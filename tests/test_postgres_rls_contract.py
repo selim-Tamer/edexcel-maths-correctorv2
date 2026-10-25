@@ -311,6 +311,43 @@ class TenantRlsContractTests(unittest.TestCase):
                                    (TENANT,))
                 connection.execute("DELETE FROM results")
 
+    def test_audit_trail_cannot_be_rewritten_by_a_runtime_role(self):
+        # The shipped adapter only INSERTs and SELECTs audit_events. An UPDATE
+        # or DELETE grant would let a compromised runtime credential rewrite
+        # verification history, so both are denied by PRIVILEGE - the RLS
+        # policy is not the only thing standing in the way.
+        for role, password in ((APP_ROLE, APP_PASSWORD),
+                               (WORKER_ROLE, WORKER_PASSWORD)):
+            connection = self._connect(role, password)
+            with connection.transaction():
+                connection.execute(
+                    "SELECT set_config('app.tenant_id', %s, true)", (TENANT,))
+                # The granted verbs still work (SELECT and INSERT). The count
+                # is intentionally not pinned: this test owns the privilege
+                # claim, not the row inventory.
+                self.assertGreaterEqual(connection.execute(
+                    "SELECT count(*) FROM audit_events").fetchone()[0], 0)
+            for statement in (
+                    "UPDATE audit_events SET review_status = 'approved'",
+                    "DELETE FROM audit_events"):
+                with self.subTest(role=role, statement=statement):
+                    with self.assertRaises(pg_errors.InsufficientPrivilege):
+                        connection.execute(statement)
+                    connection.rollback()
+
+    def test_no_runtime_role_holds_delete_anywhere(self):
+        # Every DELETE is deferred to the separate elevated purge role in the
+        # retention slice; the runtime and worker roles must hold none.
+        for role, password in ((APP_ROLE, APP_PASSWORD),
+                               (WORKER_ROLE, WORKER_PASSWORD)):
+            connection = self._connect(role, password)
+            for table in ("results", "audit_events", "tenants",
+                          "tenant_membership", "pdf_references"):
+                with self.subTest(role=role, table=table):
+                    with self.assertRaises(pg_errors.InsufficientPrivilege):
+                        connection.execute(f"DELETE FROM {table}")
+                    connection.rollback()
+
     def test_role_without_grants_is_denied(self):
         connection = self._connect(NOBODY_ROLE, NOBODY_PASSWORD)
         with self.assertRaises(pg_errors.InsufficientPrivilege):

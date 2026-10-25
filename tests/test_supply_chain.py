@@ -68,10 +68,15 @@ class ProductionRequirements(TestCase):
         # PyJWT[crypto] ships because auth_oidc.py verifies real OIDC ID
         # tokens in production (IR design review: exact pin, RS256-only,
         # python-jose rejected for algorithm-confusion advisories).
+        # Amended again by the production-composition slice: fastapi/uvicorn
+        # ship because the Cloud Run image is an API process whose entrypoint
+        # is api/server.py. Nothing is deployed by declaring them; their
+        # presence is pinned to a CI-validated window below.
         self.assertEqual(
             {name.lower() for name, _ in self.records},
             {"streamlit", "authlib", "google-genai", "pandas",
-             "requests", "pypdf", "pypdfium2", "pillow", "pyjwt"},
+             "requests", "pypdf", "pypdfium2", "pillow", "pyjwt",
+             "fastapi", "uvicorn"},
         )
 
     def test_pyjwt_is_exact_pinned_with_its_crypto_extra(self):
@@ -99,6 +104,8 @@ class ProductionRequirements(TestCase):
             "pandas": ((2, 0), (4,)),
             "requests": ((2, 31), (3,)),
             "Authlib": ((1, 3, 2), (2,)),
+            "fastapi": ((0, 162), (0, 163)),
+            "uvicorn": ((0, 53), (0, 54)),
         }
         for name, (floor, cap) in expectations.items():
             specifiers = spec_of(self.records, name)

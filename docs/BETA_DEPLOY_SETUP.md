@@ -162,8 +162,9 @@ its transaction helpers; the threat tests live in
 `tests/test_postgres_rls_contract.py` and run against real PostgreSQL in CI
 (bypass-role attributes, cross-tenant read/insert, unbound transaction,
 transaction-local reset, DDL/TRUNCATE denial, worker DELETE denial,
-`SET ROLE` escalation, inherited-privilege check, `SECURITY DEFINER`
-inventory, owner-under-FORCE vs `BYPASSRLS` probe).
+**audit-trail UPDATE/DELETE denial for both runtime roles and no DELETE held by
+any runtime role**, `SET ROLE` escalation, inherited-privilege check,
+`SECURITY DEFINER` inventory, owner-under-FORCE vs `BYPASSRLS` probe).
 
 **What RLS does not do:** `FORCE` binds the table owner, but a superuser or a
 `BYPASSRLS` role always bypasses RLS. No claim is made otherwise: the runtime
@@ -210,7 +211,11 @@ Retention/deletion proposal (for approval with the adapter):
 * a teacher-initiated delete endpoint removes the object and records an audit
   event (no silent hard delete);
 * purge runs as a bounded worker task (Supabase Free has no object lifecycle
-  rules), with a dry-run mode first.
+  rules), with a dry-run mode first;
+* **purge uses a separate elevated role**, created by the retention slice. The
+  runtime roles hold no DELETE on any table (`schema/MIGRATIONS.md` §4.1);
+  widening `marker_app`/`marker_worker` is explicitly rejected, and the app
+  records deletions as audit events rather than hard-deleting history.
 
 ---
 

@@ -11,9 +11,11 @@
 --    Login roles are created separately by the operator with a password that
 --    is stored only in Secret Manager (see docs/BETA_DEPLOY_SETUP.md). No
 --    password ever appears in this repository.
--- 2. Grants least privilege on the v1 tables: USAGE on the schema, DML on the
---    five data tables, SELECT on schema_meta. No DDL, no TRUNCATE, no
---    REFERENCES, no TRIGGER, no ownership.
+-- 2. Grants least privilege on the v1 tables: USAGE on the schema, SELECT on
+--    schema_meta, and only the verbs the shipped adapter issues on results
+--    (SELECT/INSERT/UPDATE) and audit_events (SELECT/INSERT). No DDL, no
+--    TRUNCATE, no DELETE, no audit_events UPDATE, no REFERENCES, no TRIGGER,
+--    no ownership.
 -- 3. Enables ROW LEVEL SECURITY with FORCE on every tenant-bearing table.
 --    FORCE makes the policy apply to the table OWNER too. It does NOT
 --    constrain a superuser or a role with BYPASSRLS - PostgreSQL always
@@ -107,13 +109,23 @@ REVOKE ALL ON TABLE schema_meta, tenants, tenant_membership, results,
 -- schema_meta is read-only at runtime (schema version check only).
 GRANT SELECT ON schema_meta TO marker_app, marker_worker;
 
--- The API may delete (retention/deletion flow); the worker may not.
-GRANT SELECT, INSERT, UPDATE, DELETE ON
-    tenants, tenant_membership, results, audit_events, pdf_references
-    TO marker_app;
-GRANT SELECT, INSERT, UPDATE ON
-    tenants, tenant_membership, results, audit_events, pdf_references
-    TO marker_worker;
+-- Exactly the verbs the SHIPPED adapter issues (postgres_store.py):
+--   results       SELECT, INSERT, UPDATE (result_revision advancement)
+--   audit_events  SELECT, INSERT
+-- Nothing else. In particular there is NO DELETE anywhere and NO UPDATE on
+-- audit_events: the audit trail is append-only, so a compromised runtime
+-- credential must not be able to rewrite verification history.
+--
+-- tenants / tenant_membership / pdf_references get no grant yet: no shipped
+-- PostgreSQL statement touches them (membership and documents are still the
+-- development store). Their slices add their own numbered grants when their
+-- code lands - least privilege for what exists, not for what might.
+--
+-- Retention/purge is NOT a runtime verb. The storage/retention slice must
+-- create a separate elevated role for it (see schema/MIGRATIONS.md §4.1 and
+-- §7); widening marker_app/marker_worker is not an acceptable route.
+GRANT SELECT, INSERT, UPDATE ON results TO marker_app, marker_worker;
+GRANT SELECT, INSERT ON audit_events TO marker_app, marker_worker;
 
 -- 4. Defence in depth for Supabase's API roles, when they exist.
 DO $$

@@ -267,6 +267,30 @@ class MigrationRunbookTests(unittest.TestCase):
         self.assertIn("25 MB", packet)
         self.assertIn("platform ceiling", packet)
 
+    def test_runbook_justifies_every_grant_and_refuses_runtime_deletes(self):
+        # IR finding: an UPDATE/DELETE grant on audit_events would let a
+        # compromised runtime credential rewrite verification history.
+        text = self._runbook()
+        self.assertIn("Per-grant justification", text)
+        self.assertIn("elevated purge role", text)
+        self.assertIn("append-only", text)
+        self.assertIn("audit_events", text)
+
+    def test_migration_grants_no_delete_and_no_audit_update(self):
+        sql = (ROOT / "schema" / "postgres_v2_tenant_rls.sql").read_text(
+            encoding="utf-8")
+        grants = [line.strip() for line in sql.splitlines()
+                  if line.strip().upper().startswith("GRANT")]
+        self.assertEqual(
+            [line for line in grants if "DELETE" in line.upper()], [],
+            "a runtime role must not hold DELETE")
+        audit_grants = [line for line in grants
+                        if "AUDIT_EVENTS" in line.upper()]
+        self.assertTrue(audit_grants, "audit_events lost its grant line")
+        for line in audit_grants:
+            self.assertNotIn("UPDATE", line.upper(),
+                             "audit_events must be append-only at runtime")
+
 
 if __name__ == "__main__":
     unittest.main()

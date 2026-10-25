@@ -137,9 +137,45 @@ order by 1,2;
 ```
 
 Expected evidence after a correct apply: 2 markers, 5 forced tables, 5
-`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, DML-only grants,
-no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
+`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, **exactly 12
+grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT/UPDATE;
+`audit_events` SELECT/INSERT - each for both runtime roles), **zero DELETE
+grants**, no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
 function.
+
+### 4.1 Per-grant justification (every runtime privilege)
+
+IR required every UPDATE/DELETE grant to name a real product code path. The
+shipped adapter (`postgres_store.py`) is the only PostgreSQL client, and its
+statements are the evidence:
+
+| Table | Verb | `marker_app` | `marker_worker` | Product code path |
+|---|---|---|---|---|
+| `schema_meta` | SELECT | yes | yes | `open_store()` reads `schema_version` |
+| `results` | SELECT | yes | yes | `original_record()`, revision/event reads |
+| `results` | INSERT | yes | yes | register the immutable original result |
+| `results` | UPDATE | yes | yes | `UPDATE results SET result_revision` (revision advancement) |
+| `results` | DELETE | **no** | **no** | none shipped - deferred to the elevated purge role |
+| `audit_events` | SELECT | yes | yes | `events()`, `stream_revision()` |
+| `audit_events` | INSERT | yes | yes | `commit()` appends the decision event |
+| `audit_events` | UPDATE | **no** | **no** | none: the audit trail is append-only, and a runtime credential must not rewrite history |
+| `audit_events` | DELETE | **no** | **no** | none - deferred to the elevated purge role |
+| `tenants` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
+| `tenant_membership` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
+| `pdf_references` | any | no | no | no shipped PG statement; the documents slice adds its own grant |
+
+Consequences that are deliberate, not omissions:
+
+* **No DELETE is granted to any runtime role.** `tests/test_postgres_rls_contract.py::test_no_runtime_role_holds_delete_anywhere`
+  asserts the denial on all five tables.
+* **`audit_events` cannot be updated by a runtime role.**
+  `test_audit_trail_cannot_be_rewritten_by_a_runtime_role` asserts the denial
+  for both `marker_app` and `marker_worker`.
+* A future membership or documents slice adds SELECT/INSERT for its own tables
+  in a new numbered migration, with the same evidence standard.
+* **Retention/purge is not a runtime verb.** The storage/retention slice must
+  create a separate elevated role and grant it only what a purge needs. Widening
+  `marker_app`/`marker_worker` back to DELETE is explicitly rejected here.
 
 ---
 
@@ -175,7 +211,9 @@ service:
   cross-tenant read/insert, unbound fail-closed, pooled-request identity leak
   demonstration, `SET ROLE` escalation, inherited-privilege check,
   `SECURITY DEFINER` inventory, DDL/TRUNCATE/worker-DELETE denial,
-  `schema_meta` read-only, rollback-then-re-apply.
+  **audit-trail UPDATE/DELETE denial for both runtime roles**, **no DELETE held
+  by any runtime role on any table**, `schema_meta` read-only,
+  rollback-then-re-apply.
 * `tests/test_postgres_store_contract.py` — the adapter contract on the same
   schema.
 
@@ -197,4 +235,10 @@ by it, and the runbook is what carries those checks to the real project.
    semantics. Not implemented in 0002.
 3. **Private storage adapter.** Bucket/key/validation/retention rules are
    specified in `docs/BETA_DEPLOY_SETUP.md` §4; the adapter is not written yet.
-4. **No live round trip** through Supabase, Cloud Run or Google has run.
+   Its retention/purge path needs a **separate elevated role**: the runtime
+   roles intentionally hold no DELETE (`§4.1`), and adding one back to
+   `marker_app`/`marker_worker` is rejected.
+4. **Membership and documents are still development stores.** They hold no
+   PostgreSQL grant yet; each adds its own numbered migration with the same
+   justification table when its code lands.
+5. **No live round trip** through Supabase, Cloud Run or Google has run.
