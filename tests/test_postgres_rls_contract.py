@@ -317,46 +317,54 @@ class TenantRlsContractTests(unittest.TestCase):
         # verification history, so both are denied by PRIVILEGE - the RLS
         # policy is not the only thing standing in the way. The seed row is a
         # real audit event, and it must be byte-identical afterwards.
-        self.admin.execute(
-            "INSERT INTO audit_events (tenant_id, owner_subject, result_id,"
-            " sequence, event_id, idempotency_key, payload_digest, event_type,"
-            " question_number, action, review_status, expected_revision,"
-            " resulting_revision, actor) VALUES"
-            " (%s, %s, %s, 1, 'evt-denial-1', 'idem-denial-1', %s,"
-            " 'decision', '1', 'confirm', 'pending', 0, 1, 'google:teacher-a')",
-            (TENANT, SUBJECT, "manual:tenant-a", "a" * 64))
+        # The seed/snapshot connection must target marker_rls_ci, not the
+        # cluster default database (the class-level admin connection is the
+        # latter - the failure mode fixed at 2077b16).
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            admin.execute(
+                "INSERT INTO audit_events (tenant_id, owner_subject, result_id,"
+                " sequence, event_id, idempotency_key, payload_digest,"
+                " event_type, question_number, action, review_status,"
+                " expected_revision, resulting_revision, actor) VALUES"
+                " (%s, %s, %s, 1, 'evt-denial-1', 'idem-denial-1', %s,"
+                " 'decision', '1', 'confirm', 'pending', 0, 1,"
+                " 'google:teacher-a')",
+                (TENANT, SUBJECT, "manual:tenant-a", "a" * 64))
 
-        def snapshot():
-            return self.admin.execute(
-                "SELECT event_id, review_status, payload_digest, action"
-                " FROM audit_events WHERE tenant_id = %s AND event_id = %s",
-                (TENANT, "evt-denial-1")).fetchone()
+            def snapshot():
+                return admin.execute(
+                    "SELECT event_id, review_status, payload_digest, action"
+                    " FROM audit_events WHERE tenant_id = %s AND event_id = %s",
+                    (TENANT, "evt-denial-1")).fetchone()
 
-        before = snapshot()
-        self.assertEqual(before[1], "pending")
+            before = snapshot()
+            self.assertEqual(before[1], "pending")
 
-        for role, password in ((APP_ROLE, APP_PASSWORD),
-                               (WORKER_ROLE, WORKER_PASSWORD)):
-            connection = self._connect(role, password)
-            with connection.transaction():
-                connection.execute(
-                    "SELECT set_config('app.tenant_id', %s, true)", (TENANT,))
-                # The granted verbs still work (SELECT and INSERT) and the APP
-                # role can see the existing event.
-                self.assertEqual(connection.execute(
-                    "SELECT count(*) FROM audit_events").fetchone()[0], 1)
-            for statement in (
-                    "UPDATE audit_events SET review_status = 'approved'",
-                    "UPDATE audit_events SET payload_digest = 'b' * 64",
-                    "DELETE FROM audit_events",
-                    "DELETE FROM audit_events WHERE event_id = 'evt-denial-1'"):
-                with self.subTest(role=role, statement=statement):
-                    with self.assertRaises(pg_errors.InsufficientPrivilege):
-                        connection.execute(statement)
-                    connection.rollback()
-            # The existing row is untouched by the refused writes.
-            self.assertEqual(snapshot(), before,
-                             f"{role} changed an audit row despite the refusal")
+            for role, password in ((APP_ROLE, APP_PASSWORD),
+                                   (WORKER_ROLE, WORKER_PASSWORD)):
+                connection = self._connect(role, password)
+                with connection.transaction():
+                    connection.execute(
+                        "SELECT set_config('app.tenant_id', %s, true)",
+                        (TENANT,))
+                    # The granted verbs still work (SELECT and INSERT) and the
+                    # APP role can see the existing event.
+                    self.assertEqual(connection.execute(
+                        "SELECT count(*) FROM audit_events").fetchone()[0], 1)
+                for statement in (
+                        "UPDATE audit_events SET review_status = 'approved'",
+                        "UPDATE audit_events SET payload_digest = 'b' * 64",
+                        "DELETE FROM audit_events",
+                        "DELETE FROM audit_events"
+                        " WHERE event_id = 'evt-denial-1'"):
+                    with self.subTest(role=role, statement=statement):
+                        with self.assertRaises(pg_errors.InsufficientPrivilege):
+                            connection.execute(statement)
+                        connection.rollback()
+                # The existing row is untouched by the refused writes.
+                self.assertEqual(
+                    snapshot(), before,
+                    f"{role} changed an audit row despite the refusal")
 
     def test_no_runtime_role_holds_delete_anywhere(self):
         # Every DELETE is deferred to the separate elevated purge role in the
