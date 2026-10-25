@@ -9,7 +9,7 @@
     "storage_target": "Supabase Postgres (+ private object storage for snapshots)",
     "provisioned": false,
     "deployed": false,
-    "note": "The per-endpoint `implemented` flags are authoritative: they mark the routes served in-process by the dev API (tests drive it with fastapi.testclient behind opt-in development stores). spec.status stays SPEC_NOT_IMPLEMENTED because the sign-off endpoint and the deployment posture are not implemented. No FastAPI dependency exists in requirements.txt (it stays test-only), nothing is provisioned or deployed, and every failure code is drawn from the existing source vocabulary - no code is invented."
+    "note": "The per-endpoint `implemented` flags are authoritative: they mark the routes served in-process by the dev API (tests drive it with fastapi.testclient). spec.status stays SPEC_NOT_IMPLEMENTED because the sign-off endpoint and the deployment posture are not implemented. fastapi/uvicorn are now production dependencies because api/server.py is the prepared container entrypoint (nothing is built, provisioned or deployed by this repository state), and every failure code is drawn from the existing source vocabulary - no code is invented. The browser mapping of these routes is contract/minimum_v1.json (PROPOSED, awaiting FCM)."
   },
 
   "error_envelope": {
@@ -102,7 +102,8 @@
         "type": "object",
         "required": ["question_number", "action", "expected_revision", "idempotency_key"],
         "properties": {
-          "question_number": { "type": "string" },
+          "question_number": { "type": ["string", "integer"],
+                              "description": "Canonical identity is the stripped string (\"1\", \"2a\"). An integer is accepted and normalised, never stored as a number." },
           "action": { "enum": ["approve", "correct", "flag"] },
           "review_status": { "type": "string" },
           "old_score": { "type": ["string", "null"] },

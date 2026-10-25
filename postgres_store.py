@@ -57,6 +57,19 @@ MODE_LABEL = ("PostgreSQL adapter (schema v1): CI-service tested, NOT "
               "provisioned; local-dev fallback remains the development-only "
               "SQLite store; NOT school-approved storage")
 
+# Transaction-local tenant binding for the RLS hardening migration
+# (schema/postgres_v2_tenant_rls.sql). The application sets this from the
+# VERIFIED token's membership, never from a request value; with the setting
+# absent the policies match no rows, so an unbound transaction fails closed.
+TENANT_GUC = "app.tenant_id"
+
+
+def _bind_tenant(connection, tenant_id: str) -> None:
+    """Bind the transaction-local tenant used by the RLS policies."""
+    connection.execute("SELECT set_config(%s, %s, true)",
+                       (TENANT_GUC, tenant_id))
+
+
 # Exact column order expected by audit_store._row_to_event (18 fields).
 _EVENT_COLUMNS = (
     "sequence, event_id, idempotency_key, payload_digest, event_type, "
@@ -142,6 +155,7 @@ class PostgresAuditStore:
             if self._closed:
                 raise AuditStoreError("store_closed", "store is closed")
             with self._conn.transaction():
+                _bind_tenant(self._conn, self.tenant_id)
                 yield
 
     @contextmanager
@@ -159,6 +173,7 @@ class PostgresAuditStore:
                                       "store requires an idle dedicated connection")
             with self._conn.transaction():
                 self._fault_point("begin")
+                _bind_tenant(self._conn, self.tenant_id)
                 yield
 
     def close(self) -> None:

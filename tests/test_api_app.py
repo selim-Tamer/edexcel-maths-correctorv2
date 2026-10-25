@@ -160,6 +160,17 @@ class DecisionEndpointTests(ApiTestCase):
             owner=OWNER, result_id=result_id_of(manual_row()))
         self.assertTrue(original)
 
+    def test_the_canvas_integer_question_number_is_accepted_end_to_end(self):
+        # The live frontend types questionNumber as a number. That used to be
+        # a 400 payload_invalid before the request reached the decision core;
+        # the integer is now normalised to the same identity as "1".
+        response = self.decide(question_number=1)
+        self.assertEqual(response.status_code, 200, response.text)
+        events = self.store.events(owner=OWNER,
+                                   result_id=result_id_of(manual_row()))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(str(events[0]["question_number"]), "1")
+
     def test_identical_retry_replays_without_a_second_event(self):
         first = self.decide()
         second = self.decide()
