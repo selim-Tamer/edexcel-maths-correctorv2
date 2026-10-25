@@ -34,6 +34,8 @@ def production_env(**overrides):
         runtime_config.SUPABASE_URL_ENV: "https://abcdefghijklmno.supabase.co",
         runtime_config.SUPABASE_KEY_ENV: SECRET_SUPABASE,
         runtime_config.BUCKET_ENV: "marker-pdfs",
+        runtime_config.ALLOWED_ORIGINS_ENV:
+            "https://marker-beta.pages.dev",
     }
     env.update(overrides)
     return {key: value for key, value in env.items() if value is not None}
@@ -174,6 +176,48 @@ class SecretHygieneTests(unittest.TestCase):
                          {runtime_config.PG_DSN_ENV,
                           runtime_config.SUPABASE_KEY_ENV,
                           runtime_config.GEMINI_KEY_ENV})
+
+
+class BrowserOriginTests(unittest.TestCase):
+    """CORS allowlist is part of the production contract, parsed strictly."""
+
+    def test_production_requires_an_origin_allowlist(self):
+        report = runtime_config.evaluate(production_env(
+            **{runtime_config.ALLOWED_ORIGINS_ENV: None}))
+        self.assertFalse(report["ready"])
+        problems = [p for p in report["problems"]
+                    if p["code"] == "service_unavailable"]
+        self.assertTrue(problems)
+        self.assertIn(runtime_config.ALLOWED_ORIGINS_ENV,
+                      problems[0]["detail"])
+
+    def test_wildcards_paths_and_plain_http_are_refused_in_production(self):
+        for value in ("*", "https://marker.pages.dev/path",
+                      "http://marker.pages.dev", "https://a.pages.dev,",
+                      "https://*.pages.dev"):
+            with self.subTest(value=value):
+                report = runtime_config.evaluate(production_env(
+                    **{runtime_config.ALLOWED_ORIGINS_ENV: value}))
+                self.assertFalse(report["ready"])
+                self.assertIn("service_unavailable",
+                              [p["code"] for p in report["problems"]])
+
+    def test_exact_https_origins_are_lower_cased_and_deduplicated(self):
+        parsed = runtime_config.parse_allowed_origins(
+            "https://Marker.Pages.dev, https://marker.pages.dev,"
+            " https://preview-1.pages.dev:8443", production=True)
+        self.assertEqual(parsed, ("https://marker.pages.dev",
+                                  "https://preview-1.pages.dev:8443"))
+
+    def test_development_allows_loopback_http_only(self):
+        self.assertEqual(
+            runtime_config.parse_allowed_origins("http://localhost:5173"),
+            ("http://localhost:5173",))
+        with self.assertRaises(ValueError):
+            runtime_config.parse_allowed_origins("http://marker.pages.dev")
+
+    def test_an_empty_value_is_not_a_wildcard(self):
+        self.assertEqual(runtime_config.parse_allowed_origins(""), ())
 
 
 class ContractDocumentationTests(unittest.TestCase):

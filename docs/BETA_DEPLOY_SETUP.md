@@ -94,6 +94,7 @@ time and never written to the repository, a message, or a log.
 | `AI_MARKER_ENGINE_REAL` | engine | no | no (`0`/unset = off) | Cloud Run plain env |
 | `AI_MARKER_MARK_SCHEME` | engine | no | only when engine on | image path `/app/scheme.pdf` |
 | `GEMINI_API_KEY` | engine | **yes** | only when engine on | Secret Manager `gemini-api-key` |
+| `AI_MARKER_ALLOWED_ORIGINS` | web (CORS) | no | **yes** | Cloud Run plain env: exact Pages origin(s), comma separated, https only |
 | `PORT` | runtime | no | injected by Cloud Run | platform |
 
 Refused in production (any non-empty value fails startup): the development
@@ -228,10 +229,14 @@ gcloud run deploy marker-api \
   --concurrency 8 --timeout 300 \
   --execution-environment gen2 \
   --service-account marker-runner@<project>.iam.gserviceaccount.com \
-  --set-env-vars AI_MARKER_RUNTIME=production,GOOGLE_OIDC_AUDIENCE=<client-id>,AI_MARKER_SUPABASE_URL=https://<ref>.supabase.co,AI_MARKER_STORAGE_BUCKET=marker-pdfs \
+  --set-env-vars AI_MARKER_RUNTIME=production,GOOGLE_OIDC_AUDIENCE=<client-id>,AI_MARKER_SUPABASE_URL=https://<ref>.supabase.co,AI_MARKER_STORAGE_BUCKET=marker-pdfs,AI_MARKER_ALLOWED_ORIGINS=https://<pages-project>.pages.dev \
   --set-secrets AI_MARKER_PG_DSN=marker-pg-dsn:latest,AI_MARKER_SUPABASE_SERVICE_KEY=marker-supabase-service-key:latest
 ```
 
+* Container command: `uvicorn api.server:application --host 0.0.0.0 --port $PORT`.
+  `api/server.py` calls `runtime_config.require()` at import time, so an
+  incomplete composition fails the revision instead of serving fail-closed
+  503s. `fastapi`/`uvicorn` are in `requirements.txt` for this image.
 * Service account `marker-runner` gets only
   `roles/secretmanager.secretAccessor` on the three secrets. No Editor, no
   Storage Admin (Supabase is external), no Cloud SQL.
@@ -239,10 +244,43 @@ gcloud run deploy marker-api \
   the API performs its own Google ID-token verification, but exposure is a
   separate approval. Until then, use `--no-allow-unauthenticated` plus an
   operator-issued identity token for synthetic acceptance.
-* CORS: the frontend origin must be added explicitly when the Pages URL is
-  known; no wildcard.
-* Startup must call `runtime_config.require()` so a missing component fails the
-  revision instead of serving half-configured.
+* CORS: `AI_MARKER_ALLOWED_ORIGINS` is an **exact-origin allowlist** parsed by
+  `runtime_config.parse_allowed_origins` (`api/app.py` adds Starlette's
+  `CORSMiddleware`). Production requires `https`, refuses a wildcard, a path,
+  a trailing slash or `http`, allows only `GET/POST/OPTIONS` with
+  `Authorization/Content-Type/Accept`, and sends no credentials. A missing or
+  invalid allowlist **fails startup** - there is no wildcard fallback and no
+  silent "allow nothing". Preview origins are refused unless explicitly named.
+  The final Pages origin is supplied by FCM; until then the value is a
+  placeholder.
+* Runtime contract and browser surface are pinned by
+  `tests/test_runtime_config.py`, `tests/test_api_browser_surface.py` and
+  `tests/test_minimum_contract.py`.
+
+---
+
+## 5.1 Browser surface and the shared contract
+
+The live-beta audit found no shared route contract and no CORS, so the browser
+could not reach the API at all. This slice fixes the CM-owned half:
+
+* **CORS is implemented** (`api/app.py`, exact-origin allowlist above) and
+  exercised in-process by `tests/test_api_browser_surface.py`: allowed origin
+  echoed on success *and* on the 401 envelope, another origin refused, no
+  `access-control-allow-credentials`, wildcard/path/http refused at startup.
+* **The runtime entrypoint exists** (`api/server.py`) and refuses an incomplete
+  composition before serving.
+* **The contract is written down once**:
+  [`docs/MINIMUM_CONTRACT.md`](MINIMUM_CONTRACT.md) and its machine-readable
+  twin [`contract/minimum_v1.json`](../contract/minimum_v1.json).
+  `tests/test_minimum_contract.py` fails if the artifact and the real route
+  table diverge, if a live frontend call disappears, if a client-owned call
+  grows a server route, or if an error code is not a real backend code.
+* **Status is `PROPOSED_AWAITING_FCM_CONFIRMATION`.** It becomes `AGREED` only
+  with FCM's confirming message id. The client changes it implies (one upload
+  instead of authorize+confirm, a `POST /v1/jobs` call it does not have today,
+  `question_number` as a string, string question numbers, 403 ≠ expiry,
+  device-local drafts) are in the contract doc, not invented here.
 
 ---
 
@@ -292,4 +330,9 @@ gcloud run deploy marker-api \
 * **Supabase Free has no backups/PITR and pauses after ~1 week of inactivity.**
   The dump in `schema/MIGRATIONS.md` §2 and a user-accepted pause policy are the
   only mitigations; neither is a platform guarantee.
+* **The shared contract is proposed, not agreed.** FCM has not confirmed the
+  mapping, so the client half (one-shot upload, `POST /v1/jobs`, string
+  `question_number`, device-local drafts) is unproven against the real UI.
+* **CORS is proven in-process only.** No Pages origin, browser preflight against
+  Cloud Run, or real GIS token has been exercised.
 * No zero-cost guarantee, no production-readiness claim.

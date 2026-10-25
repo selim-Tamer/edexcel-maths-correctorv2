@@ -96,11 +96,34 @@ class ContractParseTests(unittest.TestCase):
         self.assertFalse(spec["provisioned"])
         self.assertFalse(spec["deployed"])
 
-    def test_no_fastapi_dependency_was_added(self):
-        """This milestone is a contract only: FastAPI must not enter the app manifest."""
+    def test_the_api_runtime_is_in_the_production_manifest(self):
+        """The 'contract only' invariant is superseded by the deploy slice.
+
+        While the API was a contract with no process, FastAPI was deliberately
+        test-only. The production composition now ships an API image whose
+        entrypoint is ``api/server.py``, so the production manifest must carry
+        the server. This test also pins the test manifest to a version inside
+        the production range: otherwise the wire behaviour the contract tests
+        assert is not the wire behaviour the image deploys.
+        """
         requirements = _source("requirements.txt")
-        self.assertNotIn("fastapi", requirements.lower(),
-                         "requirements.txt must stay free of FastAPI at M5")
+        test_requirements = _source("tests/pdf-requirements.txt")
+        lower = requirements.lower()
+        self.assertIn("fastapi", lower)
+        self.assertIn("uvicorn", lower)
+        self.assertIn("api/server.py", requirements)
+
+        def line(source, prefix):
+            return next(item.strip() for item in source.splitlines()
+                        if item.strip().startswith(prefix))
+
+        floor = line(requirements, "fastapi>=")
+        floor = floor.split(">=")[1].split(",")[0]
+        pinned = line(test_requirements, "fastapi==").split("==")[1]
+        self.assertTrue(
+            pinned.startswith(floor + "."),
+            f"test pin fastapi=={pinned} is outside the production floor "
+            f"{floor}")
 
 
 class FailureCodeFidelityTests(unittest.TestCase):

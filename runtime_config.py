@@ -18,17 +18,19 @@ WHAT IT IS NOT
 * It provisions nothing. Deploying/migrating is a separate, explicitly
   approved operator step (see docs/BETA_DEPLOY_SETUP.md).
 
-FAILURE VOCABULARY
-------------------
+PROBLEM CODES
+-------------
 Problem codes are drawn from the application's existing refusal vocabulary
 (``store_unusable``, ``oidc_not_configured``, ``dev_opt_in_required``,
-``model_unavailable``) - no new code is invented. A misconfigured process
-therefore fails closed with the same class of error the endpoints already
-emit.
+``model_unavailable``, and the existing job error code ``service_unavailable``
+for a composed service that cannot serve its browser client) - no new code is
+invented. A misconfigured process therefore fails closed with the same class
+of error the endpoints already emit.
 """
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -45,6 +47,7 @@ ENGINE_REAL_ENV = "AI_MARKER_ENGINE_REAL"
 SCHEME_ENV = "AI_MARKER_MARK_SCHEME"
 GEMINI_KEY_ENV = "GEMINI_API_KEY"
 PORT_ENV = "PORT"
+ALLOWED_ORIGINS_ENV = "AI_MARKER_ALLOWED_ORIGINS"
 
 # Development-only SQLite paths. Any of these being set in the production
 # runtime means the process would serve development storage with production
@@ -88,6 +91,9 @@ CONTRACT: tuple[EnvVar, ...] = (
            "path to the mark-scheme PDF inside the container"),
     EnvVar(GEMINI_KEY_ENV, "engine", True, False,
            "Gemini API key, only read when the engine is opted in"),
+    EnvVar(ALLOWED_ORIGINS_ENV, "web", False, True,
+           "comma-separated EXACT browser origins allowed by CORS "
+           "(https only in production; no wildcard)"),
     EnvVar(PORT_ENV, "runtime", False, False,
            "Cloud Run injects the listen port (default 8080)"),
 )
@@ -125,6 +131,73 @@ def _valid_dsn(value: str) -> bool:
 def _valid_supabase_url(value: str) -> bool:
     value = value.strip().rstrip("/")
     return value.startswith("https://") and value.endswith(".supabase.co")
+
+
+# scheme://host[:port] with no userinfo, path, query, fragment or wildcard.
+# IPv6 literals are deliberately not accepted: the beta frontend is a
+# Cloudflare Pages host, and an unparsed origin is worse than a refused one.
+_ORIGIN_RE = re.compile(
+    r"^(?P<scheme>https?)://"
+    r"(?P<host>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)"
+    r"(?::(?P<port>[0-9]{1,5}))?$")
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1"})
+
+
+def parse_allowed_origins(value: str, *, production: bool = False) -> tuple[str, ...]:
+    """Parse ``AI_MARKER_ALLOWED_ORIGINS`` into exact browser origins.
+
+    The allowlist is the CORS policy, so it is parsed strictly and fails closed:
+
+    * comma-separated; an empty entry is refused rather than ignored;
+    * each entry is exactly ``scheme://host[:port]`` - no wildcard, path,
+      query, fragment, userinfo or trailing slash;
+    * ``https`` is required in production; development additionally accepts
+      ``http`` for a loopback host only (the local Vite dev server);
+    * scheme and host are lower-cased, duplicates collapse;
+    * an empty value is not an error here (the caller decides whether it is
+      required); it parses to ``()`` and therefore no CORS middleware.
+
+    Raises ``ValueError`` with a content-free reason. Callers turn that into a
+    fail-closed refusal; nothing here invents a fallback origin.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ()
+    origins: list[str] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        candidate = entry.strip()
+        if not candidate:
+            raise ValueError("an empty origin entry is not allowed")
+        if "*" in candidate:
+            raise ValueError("wildcard origins are not allowed")
+        match = _ORIGIN_RE.match(candidate)
+        if match is None:
+            raise ValueError(
+                f"{candidate!r} is not an exact scheme://host[:port] origin")
+        scheme = match.group("scheme").lower()
+        host = match.group("host").lower()
+        port = match.group("port")
+        if port is not None:
+            if not 1 <= int(port) <= 65535:
+                raise ValueError(f"{candidate!r} has an invalid port")
+            port = f":{int(port)}"
+        else:
+            port = ""
+        if scheme == "http":
+            if production:
+                raise ValueError(
+                    "production origins must use https, not http")
+            if host not in _LOOPBACK_HOSTS:
+                raise ValueError(
+                    "http origins are only allowed for localhost in "
+                    "development")
+        origin = f"{scheme}://{host}{port}"
+        if origin not in seen:
+            seen.add(origin)
+            origins.append(origin)
+    return tuple(origins)
 
 
 def evaluate(environ: Optional[dict] = None) -> dict:
@@ -206,6 +279,21 @@ def evaluate(environ: Optional[dict] = None) -> dict:
     if not _present(env, BUCKET_ENV):
         problems.append(_problem("store_unusable",
                                  f"{BUCKET_ENV} is required in production"))
+
+    origins = (env.get(ALLOWED_ORIGINS_ENV) or "").strip()
+    if not origins:
+        problems.append(_problem(
+            "service_unavailable",
+            f"{ALLOWED_ORIGINS_ENV} is required in production: the browser "
+            f"client cannot reach this service without an exact-origin "
+            f"allowlist (no wildcard fallback exists)"))
+    else:
+        try:
+            parse_allowed_origins(origins, production=True)
+        except ValueError as failure:
+            problems.append(_problem(
+                "service_unavailable",
+                f"{ALLOWED_ORIGINS_ENV}: {failure}"))
 
     if engine_opted_in:
         missing = [name for name in (GEMINI_KEY_ENV, SCHEME_ENV)

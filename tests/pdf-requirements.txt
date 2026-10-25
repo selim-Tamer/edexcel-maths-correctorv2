@@ -11,9 +11,10 @@ reportlab==5.0.1
 # Python arithmetic only; must match the sympy pin used by CI.
 sympy==1.14.0
 # API slice A (tests/test_api_app.py): the in-process HTTP surface over the
-# session-free decision core. The API is NOT deployed -- no API deployment is
-# authorized -- so fastapi stays out of requirements.txt until one is. httpx
-# is what fastapi.testclient drives. Both are scanned by dependency-audit.
+# session-free decision core. fastapi is now ALSO a production dependency
+# (api/server.py is the container entrypoint); this exact pin is what the
+# offline contract tests resolve, so the wire behaviour they assert is the
+# version the image ships. httpx is what fastapi.testclient drives.
 fastapi==0.162.0
 httpx==0.28.1
 # Auth foundation (tests/test_auth_oidc_verifier.py, test_tenant_membership.py):
