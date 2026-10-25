@@ -14,11 +14,18 @@
 -- 2. Grants least privilege on the v1 tables: USAGE on the schema, DML on the
 --    five data tables, SELECT on schema_meta. No DDL, no TRUNCATE, no
 --    REFERENCES, no TRIGGER, no ownership.
--- 3. Enables ROW LEVEL SECURITY with FORCE on every tenant-bearing table, so
---    even the table owner is subject to the policy. The policy compares
---    tenant_id with the transaction-local setting app.tenant_id, which the
---    application sets from the VERIFIED token's membership - never from a
---    client-supplied value.
+-- 3. Enables ROW LEVEL SECURITY with FORCE on every tenant-bearing table.
+--    FORCE makes the policy apply to the table OWNER too. It does NOT
+--    constrain a superuser or a role with BYPASSRLS - PostgreSQL always
+--    bypasses RLS for those. This migration therefore does not *claim* that
+--    privileged access is constrained: the runtime roles are verified
+--    NOSUPERUSER/NOBYPASSRLS (step 2), and the privileged path is authorised
+--    in application code by explicit tenant_id predicates derived from the
+--    verified membership. tests/test_postgres_rls_contract.py demonstrates
+--    both sides: the table owner under FORCE sees only its bound tenant, a
+--    BYPASSRLS role sees every tenant. The policy compares tenant_id with the
+--    transaction-local setting app.tenant_id, which the application sets from
+--    the VERIFIED token's membership - never from a client-supplied value.
 -- 4. Fails closed when app.tenant_id is unset: current_setting(..., true)
 --    returns NULL, the comparison is not true, and zero rows are visible.
 -- 5. Revokes any Supabase anon/authenticated grants on these tables when
@@ -33,6 +40,10 @@
 --
 -- Rollback: schema/postgres_v2_tenant_rls_rollback.sql (reviewed, exact
 -- inverse; it does NOT restore third-party default grants - disclosed there).
+--
+-- Runbook: schema/MIGRATIONS.md (ordered steps, per-step backout, mandatory
+-- pre-migration pg_dump - Supabase Free has NO platform backups/PITR - and
+-- the SECURITY DEFINER inventory that must be rerun on the real project).
 --
 -- Idempotent: safe to re-run.
 

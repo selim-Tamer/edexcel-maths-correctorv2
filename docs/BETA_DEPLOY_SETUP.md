@@ -19,13 +19,17 @@ OAuth client ID, service URLs) are shown as placeholders, never invented.
 
 | Item | Value | Source (read 2026-10-25) |
 |---|---|---|
-| Cloud Run free tier (request-based billing) | 2,000,000 requests, 180,000 vCPU-seconds, 360,000 GiB-seconds per month | https://cloud.google.com/run/pricing |
+| Cloud Run free tier (request-based billing) | 2,000,000 requests, 180,000 vCPU-seconds, 360,000 GiB-seconds per month, **valued at Tier 1 (us-central1) pricing** | https://cloud.google.com/run/pricing |
 | Cloud Run rates | $0.000024/vCPU-s, $0.0000025/GiB-s, $0.40/M requests (Tier 1 display rates) | https://cloud.google.com/run/pricing |
-| Frankfurt region | `europe-west3`, **Tier 2 pricing** (higher than the Tier 1 rates above) | https://cloud.google.com/run/pricing |
+| Frankfurt region | `europe-west3`, **Tier 2 pricing** (higher than the Tier 1 rates above; region is fixed per service after the first deploy) | https://cloud.google.com/run/pricing |
+| Cloud Run Jobs (the worker shape) | instance-based billing, separate free tier: 240,000 vCPU-seconds + 450,000 GiB-seconds/month (us-central1 basis) | https://cloud.google.com/run/pricing ("Jobs") |
 | Cloud Build | 2,500 free build-minutes/month (e2-standard-2 default pool), then $0.006/min | https://cloud.google.com/build/pricing |
+| Artifact Registry | 0.5 GiB-month free, then $0.000136986/GiB-hour; same-region pulls free | https://cloud.google.com/artifact-registry/pricing |
 | Secret Manager | 6 free active secret versions, 10,000 free access ops/month, then $0.03/10k | https://cloud.google.com/secret-manager/pricing |
-| Supabase Free | $0; 500 MB database, 1 GB file storage, 5 GB egress, 50 MB max upload, project pauses after 1 week of inactivity | https://supabase.com/pricing |
-| Artifact Registry | **not verified in this pass** - image storage is billed separately; confirm the free tier and the pushed image size before deployment | - |
+| Supabase Free quota | $0; 500 MB database (org-level fair use), 1 GB file storage, 5 GB egress, **50 MB** max upload | https://supabase.com/pricing |
+| Supabase Free disk | **fixed 2 GB**, read-only mode at **95 % disk usage**, Postgres stops if the disk fills; WAL shares the disk (`max_wal_size` 1 GB) | https://supabase.com/docs/guides/platform/database-size |
+| Supabase Free compute | Nano: shared CPU, up to 0.5 GB RAM, **60 direct connections**, **200 pooler clients** | https://supabase.com/pricing |
+| Supabase Free durability | **no automatic backups, no PITR** (Pro feature); project **pauses after ~1 week of inactivity** | https://supabase.com/pricing |
 
 Workload assumption used for the estimate below: **100 marking runs/month, one
 1 vCPU / 1 GiB instance, ~60 s per run, 0 minimum instances**. That is
@@ -34,16 +38,39 @@ builds/secrets are inside their free tiers for a single small service.
 
 Honest limits:
 
-* the Cloud Run free tier is applied as a **spending-based discount at Tier 1
-  pricing**, and Frankfurt is a **Tier 2** region, so a non-zero bill is
+* the Cloud Run free tier is applied as a **spending-based discount valued at
+  Tier 1 pricing**, and Frankfurt is a **Tier 2** region, so a non-zero bill is
   possible even at low volume; **no zero-cost promise is made**;
-* Cloud Build, Artifact Registry, egress, Secret Manager access operations and
-  Supabase overage are separate line items;
+* **internet egress is not "same-region" traffic.** Cloud Run → Supabase leaves
+  Google's network and is billed at Premium-tier internet egress from the first
+  byte (the 1 GiB/month free egress allowance is North-America-based). Only
+  Cloud Run ↔ Secret Manager ↔ Artifact Registry in `europe-west3` is free;
+* Cloud Build, Artifact Registry, internet egress, Secret Manager access
+  operations and Supabase overage are separate line items;
 * the Gemini engine is **off by default** and would add per-token charges that
   are out of scope for this packet;
 * the Supabase Free 1 GB storage cap conflicts with 100 × 25 MB PDFs per
-  month, so the retention proposal in section 6 is part of this packet, not an
+  month, so the retention proposal in section 4 is part of this packet, not an
   afterthought.
+
+### 1.1 Billing activation is its own gate
+
+Creating the Cloud Run service or the Artifact Registry repository requires an
+**active billing account on the Google Cloud project**. That is a separate,
+explicit user authorization, not part of code review, and the Cloud Run free
+tier is not a guarantee against a non-zero invoice. Charges that can exist at
+beta scale, each with the assumption that produces them:
+
+| Line item | When it charges | Beta assumption |
+|---|---|---|
+| Cloud Run requests (Tier 2) | above 2M requests / 180k vCPU-s / 360k GiB-s, valued at Tier 1 | 100 runs ≈ 6k vCPU-s → inside free tier |
+| Cloud Run Jobs | above 240k vCPU-s / 450k GiB-s | one worker task per run ≈ 60 s → inside free tier |
+| Cloud Build | above 2,500 min/month | ~5 builds × ~3 min → inside free tier |
+| Artifact Registry | above 0.5 GiB-month | 1–2 images ≈ 0.2–0.4 GiB; prune old revisions |
+| Internet egress to Supabase | from the first byte | ~100 × 25 MB ≈ 2.5 GB/month, **not** covered by same-region free traffic |
+| Secret Manager | above 6 versions / 10k access ops | 3 secrets, 1 version each; ops scale with instance starts |
+| Gemini engine | any call once `AI_MARKER_ENGINE_REAL=1` | **0 in beta**; separate cost decision |
+| Supabase overage | above 500 MB DB / 1 GB storage / 5 GB egress | retention + 25 MB cap keep it inside the free quota |
 
 Record the real figures in the Cloud Billing console after the first
 deployment; do not present this table as a quote.
@@ -92,9 +119,12 @@ Data API disabled, automatic RLS enabled, **no schema applied yet**.
 
 1. Connect as the project `postgres` role (SQL editor or `psql` with the
    database password from the dashboard - never committed).
-2. Apply `schema/postgres_v1.sql` (tables + constraints).
-3. Apply `schema/postgres_v2_tenant_rls.sql` (roles + least privilege + RLS).
-4. Create the runtime login role, password generated once and stored only in
+2. **Take the pre-migration `pg_dump`** described in `schema/MIGRATIONS.md` §2.
+   Supabase Free has **no automatic backups and no PITR**, so the platform is
+   not a backout.
+3. Apply `schema/postgres_v1.sql` (tables + constraints).
+4. Apply `schema/postgres_v2_tenant_rls.sql` (roles + least privilege + RLS).
+5. Create the runtime login role, password generated once and stored only in
    Secret Manager:
 
    ```sql
@@ -105,9 +135,13 @@ Data API disabled, automatic RLS enabled, **no schema applied yet**.
    The migration creates `marker_app` / `marker_worker` as **NOLOGIN** group
    roles, so no credential exists in SQL source.
 
-5. Runtime DSN: Supabase **transaction pooler** (`...pooler.supabase.com:6543`)
+6. Runtime DSN: Supabase **transaction pooler** (`...pooler.supabase.com:6543`)
    with `?sslmode=require`, user `marker_runtime.<project-ref>`.
    Migrations use the session/direct connection, not the pooler.
+
+The ordered steps, per-step backout, verification queries and the executed
+evidence are in **`schema/MIGRATIONS.md`** - that file is the runbook IR
+reviews; this section is only the summary.
 
 Known follow-up (tracked, not hidden): psycopg3 against a transaction pooler
 needs prepared statements disabled (`prepare_threshold=None`);
@@ -126,7 +160,22 @@ returns zero rows (fail closed). `postgres_store` sets the binding in both of
 its transaction helpers; the threat tests live in
 `tests/test_postgres_rls_contract.py` and run against real PostgreSQL in CI
 (bypass-role attributes, cross-tenant read/insert, unbound transaction,
-transaction-local reset, DDL/TRUNCATE denial, worker DELETE denial).
+transaction-local reset, DDL/TRUNCATE denial, worker DELETE denial,
+`SET ROLE` escalation, inherited-privilege check, `SECURITY DEFINER`
+inventory, owner-under-FORCE vs `BYPASSRLS` probe).
+
+**What RLS does not do:** `FORCE` binds the table owner, but a superuser or a
+`BYPASSRLS` role always bypasses RLS. No claim is made otherwise: the runtime
+roles are verified `NOSUPERUSER NOBYPASSRLS`, and the privileged path (operator
+console, migration connection) is authorised by explicit tenant predicates in
+application code. Both directions are exercised by the probe tests.
+
+Free-plan capacity risks that belong to the operator: the disk is fixed at
+**2 GB** and the database switches to **read-only at 95 % usage** (WAL shares
+the disk), the database-size quota is **500 MB**, and the project **pauses
+after ~1 week of inactivity**. A paused or read-only project is recovered in
+the dashboard, not by this runbook; retention (section 4) is what keeps the
+project inside both limits.
 
 ---
 
@@ -138,10 +187,17 @@ transaction-local reset, DDL/TRUNCATE denial, worker DELETE denial).
 * Object key: `<tenant_id>/<owner_subject>/<sha256>.pdf` - server-derived, so
   a client cannot choose or guess another owner's key.
 * Upload validation stays in `document_limits` (signature, size, page cap,
-  encryption) **before** any object write; the Free plan's 50 MB per-file cap
-  is compatible with the existing 25 MB default limit.
+  encryption) **before** any object write. The application cap stays at its
+  existing **25 MB** default (`MARKER_MAX_DOCUMENT_MIB`); the Supabase Free
+  **50 MB** per-file limit is a platform ceiling, **not** a target, and it is
+  never used to relax the application limit. A file above 25 MB is refused by
+  the app before the bucket is touched.
 * Retrieval: owner+tenant-scoped backend read, `Cache-Control: private,
-  no-store`, `X-Content-Type-Options: nosniff`. No browser-visible bucket URL.
+  no-store`, `X-Content-Type-Options: nosniff`. No browser-visible bucket URL,
+  no public object, no long-lived signed URL: any signed access is short-lived,
+  issued only after the same owner+tenant check, and never logged.
+* The 1 GB Free file-storage quota and the 5 GB egress quota are part of the
+  retention design below, not a separate concern.
 * The storage adapter itself is the **next implementation slice**; this packet
   fixes the bucket, key scheme and validation rules it must implement.
 
@@ -207,23 +263,33 @@ gcloud run deploy marker-api \
 ## 7. Order of operations at approval time
 
 1. User supplies: Supabase project ref, OAuth client ID, Pages URL, GCP
-   project ID, and authorizes migration + deploy + billing.
+   project ID, and authorizes migration + deploy + billing (billing activation
+   is its own gate - see §1.1).
 2. Create the 3 secrets (values entered directly in the console/CLI, never in
    chat).
-3. Apply v1, then v2; run the rollback drill on a scratch branch database if
-   the plan allows (Free allows 2 projects).
-4. Create `marker_runtime`, grant `marker_app`, test a read as that role.
-5. Build and push the image; deploy with 0 minimum instances.
-6. Run the synthetic acceptance steps that do not need the paid engine
+3. Take the pre-migration `pg_dump` (`schema/MIGRATIONS.md` §2).
+4. Apply v1, then v2; run the rollback drill on a scratch project first (Free
+   allows 2 projects) and keep the output with the PR.
+5. Create `marker_runtime`, grant `marker_app`, test a read as that role
+   (unbound must return zero rows).
+6. Build and push the image; deploy with 0 minimum instances.
+7. Run the synthetic acceptance steps that do not need the paid engine
    (identity, membership, upload, job, results, correction, audit, restart,
    isolation), with the engine still off.
-7. Only after a separate cost decision: set `AI_MARKER_ENGINE_REAL=1` for one
+8. Only after a separate cost decision: set `AI_MARKER_ENGINE_REAL=1` for one
    synthetic document.
 
 ## 8. What this packet does NOT prove
 
 * No live Supabase/Cloud Run/Google round trip has run; everything above is a
   prepared, reviewable configuration.
-* The private storage adapter and the durable Postgres job store are the next
-  code slice; the current job executor is the development synchronous one.
+* The private storage adapter and the durable Cloud Run Jobs worker are the
+  next code slice; the current job executor is the development synchronous one,
+  and Cloud Run cancels in-flight requests on scale-down.
+* **RLS does not constrain a superuser or a `BYPASSRLS` role.** The runtime
+  roles are verified `NOBYPASSRLS`; the privileged path is authorised in
+  application code, and both directions are tested.
+* **Supabase Free has no backups/PITR and pauses after ~1 week of inactivity.**
+  The dump in `schema/MIGRATIONS.md` §2 and a user-accepted pause policy are the
+  only mitigations; neither is a platform guarantee.
 * No zero-cost guarantee, no production-readiness claim.

@@ -15,6 +15,14 @@ Threats exercised
   the previous tenant's scope into the next request;
 * the worker role cannot DELETE;
 * ``schema_meta`` is read-only at runtime;
+* FORCE RLS binds a NON-superuser table owner (and refuses its cross-tenant
+  write), while a BYPASSRLS role - and the privileged admin path - sees every
+  tenant: the limit of RLS is demonstrated, not claimed away;
+* the runtime role cannot ``SET ROLE`` to a privileged identity, and inherits
+  no privileged membership;
+* no ``SECURITY DEFINER`` function in ``public`` can manufacture a tenant;
+* a session-level tenant binding would leak into the next transaction, while
+  the transaction-local binding used by ``postgres_store`` cannot;
 * the migration is idempotent and the rollback restores the v1 shape.
 
 The login roles created here are throwaway CI roles with random passwords;
@@ -45,6 +53,13 @@ NOBODY_ROLE = "marker_rls_nobody_ci"
 APP_PASSWORD = secrets.token_hex(24)
 WORKER_PASSWORD = secrets.token_hex(24)
 NOBODY_PASSWORD = secrets.token_hex(24)
+# Probe roles for the privileged-path evidence: an plain owner (FORCE RLS must
+# still bind it) and a BYPASSRLS role (RLS cannot bind it - which is exactly
+# why no runtime login is ever granted that attribute).
+PROBE_OWNER_ROLE = "marker_rls_probe_owner_ci"
+PROBE_BYPASS_ROLE = "marker_rls_probe_bypass_ci"
+PROBE_OWNER_PASSWORD = secrets.token_hex(24)
+PROBE_BYPASS_PASSWORD = secrets.token_hex(24)
 
 TENANT = "school-a"
 OTHER_TENANT = "school-b"
@@ -81,12 +96,28 @@ class TenantRlsContractTests(unittest.TestCase):
         cls.admin.execute(f'CREATE DATABASE "{TEST_DB}"')
         for role, password in ((APP_ROLE, APP_PASSWORD),
                                (WORKER_ROLE, WORKER_PASSWORD),
-                               (NOBODY_ROLE, NOBODY_PASSWORD)):
+                               (NOBODY_ROLE, NOBODY_PASSWORD),
+                               (PROBE_OWNER_ROLE, PROBE_OWNER_PASSWORD),
+                               (PROBE_BYPASS_ROLE, PROBE_BYPASS_PASSWORD)):
             cls.admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(
                 sql.Identifier(role)))
+        for role, password in ((APP_ROLE, APP_PASSWORD),
+                               (WORKER_ROLE, WORKER_PASSWORD),
+                               (NOBODY_ROLE, NOBODY_PASSWORD),
+                               (PROBE_OWNER_ROLE, PROBE_OWNER_PASSWORD)):
             cls.admin.execute(
                 sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                     sql.Identifier(role), sql.Literal(password)))
+        cls.bypass_available = True
+        try:
+            cls.admin.execute(
+                sql.SQL("CREATE ROLE {} LOGIN BYPASSRLS PASSWORD {}").format(
+                    sql.Identifier(PROBE_BYPASS_ROLE),
+                    sql.Literal(PROBE_BYPASS_PASSWORD)))
+        except psycopg.Error:
+            # BYPASSRLS needs a superuser; the probe that depends on it skips
+            # with an explicit reason rather than silently passing.
+            cls.bypass_available = False
 
         with psycopg.connect(_dsn(), autocommit=True) as setup:
             _execute_sql_file(setup, "postgres_v1.sql")
@@ -112,6 +143,45 @@ class TenantRlsContractTests(unittest.TestCase):
                     " VALUES (%s, %s, %s, %s, %s, %s)",
                     (tenant, subject, result, "d" * 64, "[]", "e" * 64))
 
+        # Privileged-path probe: a table whose owner is NOT a superuser, so
+        # FORCE RLS has something to actually bind, plus (when the cluster
+        # allows creating it) a BYPASSRLS role to show the limit of RLS.
+        with psycopg.connect(_dsn(), autocommit=True) as probe_setup:
+            probe_setup.execute(sql.SQL(
+                "CREATE SCHEMA rls_probe AUTHORIZATION {}").format(
+                    sql.Identifier(PROBE_OWNER_ROLE)))
+        with psycopg.connect(_dsn(user=PROBE_OWNER_ROLE,
+                                  password=PROBE_OWNER_PASSWORD),
+                             autocommit=True) as owner:
+            owner.execute(
+                "CREATE TABLE rls_probe.docs ("
+                " tenant_id text NOT NULL, doc text NOT NULL)")
+            owner.execute(
+                "ALTER TABLE rls_probe.docs ENABLE ROW LEVEL SECURITY")
+            owner.execute(
+                "ALTER TABLE rls_probe.docs FORCE  ROW LEVEL SECURITY")
+            owner.execute(
+                "CREATE POLICY tenant_isolation ON rls_probe.docs"
+                " USING (tenant_id = NULLIF(current_setting"
+                "('app.tenant_id', true), ''))"
+                " WITH CHECK (tenant_id = NULLIF(current_setting"
+                "('app.tenant_id', true), ''))")
+            for tenant, doc in ((TENANT, "a"), (OTHER_TENANT, "b")):
+                with owner.transaction():
+                    owner.execute(
+                        "SELECT set_config('app.tenant_id', %s, true)",
+                        (tenant,))
+                    owner.execute(
+                        "INSERT INTO rls_probe.docs (tenant_id, doc)"
+                        " VALUES (%s, %s)", (tenant, doc))
+            if cls.bypass_available:
+                owner.execute(sql.SQL(
+                    "GRANT USAGE ON SCHEMA rls_probe TO {}").format(
+                        sql.Identifier(PROBE_BYPASS_ROLE)))
+                owner.execute(sql.SQL(
+                    "GRANT SELECT ON rls_probe.docs TO {}").format(
+                        sql.Identifier(PROBE_BYPASS_ROLE)))
+
     @classmethod
     def tearDownClass(cls):
         try:
@@ -120,7 +190,8 @@ class TenantRlsContractTests(unittest.TestCase):
                 "WHERE datname = %s AND pid <> pg_backend_pid()", (TEST_DB,))
             cls.admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
         finally:
-            for role in (APP_ROLE, WORKER_ROLE, NOBODY_ROLE):
+            for role in (APP_ROLE, WORKER_ROLE, NOBODY_ROLE,
+                         PROBE_OWNER_ROLE, PROBE_BYPASS_ROLE):
                 cls.admin.execute(f'DROP ROLE IF EXISTS "{role}"')
             cls.admin.close()
 
@@ -248,6 +319,118 @@ class TenantRlsContractTests(unittest.TestCase):
                 with self.assertRaises(pg_errors.InsufficientPrivilege):
                     connection.execute(statement)
                 connection.rollback()
+
+    # -- privileged path (FORCE RLS limits) -------------------------------
+    def test_force_rls_binds_the_table_owner(self):
+        owner = self._connect(PROBE_OWNER_ROLE, PROBE_OWNER_PASSWORD)
+        with owner.transaction():
+            self.assertEqual(
+                owner.execute(
+                    "SELECT count(*) FROM rls_probe.docs").fetchone()[0], 0)
+            owner.execute("SELECT set_config('app.tenant_id', %s, true)",
+                          (TENANT,))
+            rows = owner.execute(
+                "SELECT tenant_id FROM rls_probe.docs").fetchall()
+            self.assertEqual([row[0] for row in rows], [TENANT])
+        with self.assertRaises(pg_errors.InsufficientPrivilege):
+            with owner.transaction():
+                owner.execute("SELECT set_config('app.tenant_id', %s, true)",
+                              (TENANT,))
+                owner.execute(
+                    "INSERT INTO rls_probe.docs (tenant_id, doc)"
+                    " VALUES (%s, 'smuggled')", (OTHER_TENANT,))
+
+    def test_bypassrls_role_ignores_the_policy(self):
+        if not self.bypass_available:
+            self.skipTest(
+                "cluster refused a BYPASSRLS role (admin is not superuser); the "
+                "bypass limit is stated in schema/MIGRATIONS.md instead")
+        bypass = self._connect(PROBE_BYPASS_ROLE, PROBE_BYPASS_PASSWORD)
+        rows = bypass.execute("SELECT tenant_id FROM rls_probe.docs").fetchall()
+        # No binding at all, and still both tenants: RLS cannot bind BYPASSRLS.
+        self.assertEqual({row[0] for row in rows}, {TENANT, OTHER_TENANT})
+        bypass.rollback()
+
+    def test_superuser_path_is_not_constrained_by_rls(self):
+        # The complement of the test above, on the real tables: a privileged
+        # connection sees every tenant. Tenant authorisation for such a path is
+        # the application's job (explicit tenant_id predicates), not RLS's.
+        rolsuper, rolbypass = self.admin.execute(
+            "SELECT rolsuper, rolbypassrls FROM pg_roles"
+            " WHERE rolname = current_user").fetchone()
+        if not (rolsuper or rolbypass):
+            self.skipTest("admin role is neither superuser nor BYPASSRLS")
+        tenants = {row[0] for row in self.admin.execute(
+            "SELECT tenant_id FROM results").fetchall()}
+        self.assertEqual(tenants, {TENANT, OTHER_TENANT})
+
+    # -- pooled-request identity isolation --------------------------------
+    def test_session_level_binding_would_leak_but_transaction_local_cannot(self):
+        connection = self._connect(APP_ROLE, APP_PASSWORD)
+        try:
+            connection.execute(
+                "SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+            connection.commit()
+            # A later transaction with no binding still sees tenant A. This is
+            # the pooled-request leak that the transaction-local flag prevents.
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM results").fetchone()[0], 1)
+            connection.rollback()
+        finally:
+            connection.rollback()
+            connection.execute("SELECT set_config('app.tenant_id', '', false)")
+            connection.commit()
+        with connection.transaction():
+            connection.execute("SELECT set_config('app.tenant_id', %s, true)",
+                               (TENANT,))
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM results").fetchone()[0], 1)
+        with connection.transaction():
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM results").fetchone()[0], 0)
+
+    # -- injection / escalation surface -----------------------------------
+    def test_runtime_role_cannot_assume_a_privileged_identity(self):
+        connection = self._connect(APP_ROLE, APP_PASSWORD)
+        for role in ("postgres", "service_role", "authenticated", "anon"):
+            with self.subTest(role=role):
+                with self.assertRaises(psycopg.Error):
+                    connection.execute(f'SET ROLE "{role}"')
+                connection.rollback()
+                self.assertEqual(
+                    connection.execute("SELECT current_user").fetchone()[0],
+                    APP_ROLE)
+
+    def test_runtime_roles_inherit_no_privileged_membership(self):
+        query = (
+            "WITH RECURSIVE reach(roleid) AS ("
+            " SELECT oid FROM pg_roles WHERE rolname = %s"
+            " UNION"
+            " SELECT m.roleid FROM pg_auth_members m"
+            " JOIN reach r ON m.member = r.roleid)"
+            " SELECT rolname FROM pg_roles"
+            " WHERE oid IN (SELECT roleid FROM reach)"
+            " AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole"
+            " OR rolreplication)")
+        for role in ("marker_app", "marker_worker"):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    self.admin.execute(query, (role,)).fetchall(), [])
+
+    def test_no_security_definer_function_can_manufacture_a_tenant(self):
+        # SECURITY DEFINER runs with the owner's rights, so a function could
+        # set app.tenant_id on the caller's behalf. The application schema must
+        # contain none; re-run this inventory on the real project (extensions
+        # and Supabase's autoRLS helper live outside public).
+        rows = self.admin.execute(
+            "SELECT p.proname FROM pg_proc p"
+            " JOIN pg_namespace n ON n.oid = p.pronamespace"
+            " WHERE p.prosecdef AND n.nspname = 'public'"
+            " ORDER BY p.proname").fetchall()
+        self.assertEqual([row[0] for row in rows], [])
 
     # -- rollback ---------------------------------------------------------
     def test_zz_rollback_restores_the_v1_shape(self):

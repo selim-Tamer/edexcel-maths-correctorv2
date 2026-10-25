@@ -187,5 +187,42 @@ class ContractDocumentationTests(unittest.TestCase):
         self.assertEqual(missing, [])
 
 
+class MigrationRunbookTests(unittest.TestCase):
+    """The runbook IR reviews must keep the properties it was approved for."""
+
+    RUNBOOK = ROOT / "schema" / "MIGRATIONS.md"
+
+    def _runbook(self) -> str:
+        self.assertTrue(self.RUNBOOK.is_file(), f"missing {self.RUNBOOK}")
+        return self.RUNBOOK.read_text(encoding="utf-8")
+
+    def test_runbook_names_a_backout_for_the_hardening_step(self):
+        text = self._runbook()
+        self.assertIn("postgres_v2_tenant_rls_rollback.sql", text)
+        self.assertIn("pg_dump", text)
+        # Free has no platform backups: the runbook must not imply otherwise.
+        self.assertIn("no automatic backups", text)
+
+    def test_runbook_documents_that_force_rls_does_not_bind_privileged_roles(self):
+        text = self._runbook()
+        self.assertIn("BYPASSRLS", text)
+        self.assertIn("superuser", text)
+
+    def test_no_artifact_claims_force_rls_constrains_the_owner_beyond_reality(self):
+        # Regression pin for the overclaim IR flagged: FORCE binds the owner but
+        # never a superuser/BYPASSRLS role, so this sentence must not come back.
+        paths = (self.RUNBOOK, PACKET,
+                 ROOT / "schema" / "postgres_v2_tenant_rls.sql")
+        for path in paths:
+            with self.subTest(path=path.name):
+                self.assertNotIn("even the table owner is subject",
+                                 path.read_text(encoding="utf-8"))
+
+    def test_storage_cap_is_the_application_limit_not_the_platform_ceiling(self):
+        packet = PACKET.read_text(encoding="utf-8")
+        self.assertIn("25 MB", packet)
+        self.assertIn("platform ceiling", packet)
+
+
 if __name__ == "__main__":
     unittest.main()
