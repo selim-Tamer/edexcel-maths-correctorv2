@@ -40,14 +40,20 @@ Reuse it; do not recreate it.
 |---|---|---|---|---|
 | 0001 | `schema/postgres_v1.sql` | Creates `schema_meta` + 5 tenant tables, constraints, indexes. Empty initial state. | `schema_meta.schema_version = '1'` | No backout file: v1 is the base. Before any real data, drop the 5 tables in dependency order (`audit_events`, `pdf_references`, `results`, `tenant_membership`, `tenants`, then `schema_meta`); after real data, a dump + approved plan is required. |
 | 0002 | `schema/postgres_v2_tenant_rls.sql` | Creates NOLOGIN group roles `marker_app` / `marker_worker` (attributes **verified**, not altered), least-privilege grants, `anon`/`authenticated` revoke, RLS **ENABLE + FORCE** and `tenant_isolation` on all 5 tenant tables. | `schema_meta.rls_version = '1'` (the adapter's `schema_version` stays `'1'`: table shape unchanged) | `schema/postgres_v2_tenant_rls_rollback.sql` |
+| 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
 Those tables are new to this project and the Data API stays disabled; if that
 ever changes, re-grant explicitly and record why.
 
-There is **no 0003 yet**. The durable job store and the private storage adapter
-are the next slice and will land as new numbered files, not edits to 0002.
+**0003 is a DRAFT artifact** (`schema/postgres_v3_jobs.sql`): the file is
+reviewed code, not an applied change. Applying it needs IR approval of the
+exact SQL **and** separate explicit user authorization, exactly like 0001 and
+0002. Its backout DROPS the job table and every job row in it, so the §2 dump
+and the §2.1 drill are mandatory before it touches a project that holds data.
+The private storage adapter is still a future numbered file, not an edit to
+anything here.
 
 ---
 
@@ -170,7 +176,8 @@ Expected evidence after a correct apply: 2 markers, 5 forced tables, 5
 grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT/UPDATE;
 `audit_events` SELECT/INSERT - each for both runtime roles), **zero DELETE
 grants**, no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
-function.
+function. **With 0003 applied too, the same query returns 18 rows**: the
+`marking_jobs` SELECT/INSERT/UPDATE for each runtime role, still zero DELETE.
 
 ### 4.1 Per-grant justification (every runtime privilege)
 
@@ -192,11 +199,16 @@ statements are the evidence:
 | `tenants` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
 | `tenant_membership` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
 | `pdf_references` | any | no | no | no shipped PG statement; the documents slice adds its own grant |
+| `marking_jobs` (0003) | SELECT | yes | yes | `get_job()`, `find_authorizable_job()`, `claim_job()` |
+| `marking_jobs` (0003) | INSERT | yes | yes | `create_job()` |
+| `marking_jobs` (0003) | UPDATE | yes | yes | `claim_job()` lease/attempt bumps, `succeed_job()`, `settle_failure()` |
+| `marking_jobs` (0003) | DELETE | **no** | **no** | none: job rows are history. Purge belongs to the elevated role. |
 
 Consequences that are deliberate, not omissions:
 
 * **No DELETE is granted to any runtime role.** `tests/test_postgres_rls_contract.py::test_no_runtime_role_holds_delete_anywhere`
-  asserts the denial on all five tables.
+  asserts the denial on all five tables, and
+  `tests/test_postgres_job_store_contract.py` repeats it for `marking_jobs`.
 * **`audit_events` cannot be updated by a runtime role.**
   `test_audit_trail_cannot_be_rewritten_by_a_runtime_role` asserts the denial
   for both `marker_app` and `marker_worker`.
@@ -257,12 +269,23 @@ by it, and the runbook is what carries those checks to the real project.
 ## 7. Known gaps carried into the next slice
 
 1. **Pooler compatibility.** `psycopg` sends prepared statements by default;
-   the Supabase transaction pooler needs `prepare_threshold=None`. The adapter
-   does not pass it yet, and no test claims it works through the pooler.
-2. **Durable worker.** The job executor is still the synchronous development
-   one; Cloud Run cancels in-flight requests on scale-down, so the production
-   shape is Cloud Run Jobs reusing the existing `job_store` lease/attempt
-   semantics. Not implemented in 0002.
+   the Supabase transaction pooler needs `prepare_threshold=None`.
+   `postgres_store.open_store()` now passes exactly that, pinned by
+   `tests/test_postgres_store_contract.py` - offline
+   (`test_open_store_disables_prepared_statements`, the kwarg itself) and on
+   real PostgreSQL (`test_open_store_opens_a_pooler_safe_connection`, the
+   resulting connection). **What is still unverified is the Supabase pooler
+   itself**: no test has run through `pgbouncer` in transaction mode, so no
+   claim is made about a pooled connection until the deployment slice runs
+   one.
+2. **Durable worker.** Job PERSISTENCE is now drafted: `schema/postgres_v3_jobs.sql`
+   (0003) + `postgres_job_store.py` port the lease/attempt semantics onto
+   PostgreSQL, with the contract pinned in
+   `tests/test_postgres_job_store_contract.py`. What is still missing is the
+   worker COMPOSITION: the executable that claims a job, runs the engine and
+   settles it (the production shape is Cloud Run Jobs), plus its
+   discovery/across-tenants loop. `POST /v1/jobs/{id}/run` remains the
+   synchronous dev/demo executor.
 3. **Private storage adapter.** Bucket/key/validation/retention rules are
    specified in `docs/BETA_DEPLOY_SETUP.md` §4; the adapter is not written yet.
    Its retention/purge path needs a **separate elevated role**: the runtime

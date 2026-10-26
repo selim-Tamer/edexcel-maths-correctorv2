@@ -74,6 +74,18 @@ class ContractArtifactTests(unittest.TestCase):
             self.assertTrue(spec["confirmed_by"],
                             "AGREED requires the confirming message id")
 
+    def test_doc_and_artifact_agree_on_the_agreement_state(self):
+        # The prose document and the artifact must never disagree about
+        # whether this contract is agreed or who agreed it.
+        text = DOC.read_text(encoding="utf-8")
+        spec = self.artifact["spec"]
+        if spec["status"] == "AGREED":
+            self.assertIn("Status **AGREED**", text)
+            self.assertIn(spec["confirmed_by"], text)
+            self.assertIn(spec["confirmed_at"], text)
+        else:
+            self.assertIn("PROPOSED_AWAITING_FCM_CONFIRMATION", text)
+
     def test_server_routes_match_the_implemented_app_exactly(self):
         listed = {(entry["method"], entry["path"])
                   for entry in self.artifact["server_routes"]
