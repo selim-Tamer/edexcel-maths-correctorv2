@@ -1,8 +1,12 @@
-# Minimum shared API contract v1 (proposed)
+# Minimum shared API contract v1 (agreed)
 
 Machine-readable source of truth: [`contract/minimum_v1.json`](../contract/minimum_v1.json).
-Status **PROPOSED_AWAITING_FCM_CONFIRMATION** - it becomes `AGREED` only with a
-`confirmed_by` message reference from FCM for this exact version.
+Status **AGREED** on 2026-10-26 - FCM confirmed this exact version in message
+`68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d` (their reconciled
+`work/bolt/docs/FRONTEND_BACKEND_CONTRACT.md`, frontend PR #4 `bc8f3c86`,
+green CI run `40252538314`, aligned with this artifact at backend main
+`584f450`), and CM confirms on the backend side. Any change to a row needs a
+new numbered contract version confirmed by BOTH owners.
 
 This document exists because IFR's live-beta audit found the frontend calling
 9-10 routes that the backend does not serve, and the two sides drifting apart
@@ -33,6 +37,16 @@ Nothing here is deployed, migrated, provisioned or billed.
 `retry` is the only job control the backend has. `cancel`, `pause` and `resume`
 must not be rendered as live actions in the beta, and the client must not call
 `/control` at all.
+
+**Operational note on `POST /v1/jobs/{job_id}/run`** (factual behaviour of the
+endpoint as agreed, not a row change): the executor is synchronous and
+lease-guarded. A second call while the lease is live is refused, so the retry
+control cannot double-execute a job. A client-side timeout (15 s) abandons the
+client's *wait*, not the server-side work; the authoritative state is
+`GET /v1/jobs/{job_id}`, so the client recovers by polling that instead of
+assuming the run failed. When the durable worker lands (the next slice),
+execution moves to the worker and this row will be revised - as a new contract
+version, confirmed by both owners, never unilaterally.
 
 **The client currently has no job-creation call.** `confirmUpload` was expected
 to start marking, but the backend starts marking only through `POST /v1/jobs`
