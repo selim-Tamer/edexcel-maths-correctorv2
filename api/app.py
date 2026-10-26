@@ -55,8 +55,11 @@ from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+import runtime_config
 
 import audit_store
 import decision_core
@@ -138,7 +141,7 @@ class DecisionRequest(BaseModel):
     (server-authoritative, never trusted from the client).
     """
 
-    question_number: str = Field(min_length=1, max_length=256)
+    question_number: str
     action: str = Field(min_length=1, max_length=64)
     expected_revision: int = Field(ge=0)
     idempotency_key: str = Field(min_length=1, max_length=256)
@@ -147,6 +150,29 @@ class DecisionRequest(BaseModel):
     review_status: Optional[str] = Field(default=None, max_length=64)
     old_score: Optional[str] = Field(default=None, max_length=256)
     binding: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("question_number", mode="before")
+    @classmethod
+    def _normalise_question_number(cls, value: Any) -> str:
+        """Accept the canvas's integer form; store the canonical string.
+
+        Question identity is compared as a stripped string everywhere in the
+        decision core (``question_review.question_number_key``). The contract
+        asks clients for a string, but the frontend naturally sends
+        ``questionNumber: 1``; refusing that was a 400 that stopped the whole
+        review flow. Both forms now normalise to ``"1"`` - booleans, floats,
+        empty values and over-long ids are still refused.
+        """
+        if isinstance(value, bool):
+            raise ValueError("question_number must be a string or an integer")
+        if isinstance(value, int):
+            value = str(value)
+        if not isinstance(value, str):
+            raise ValueError("question_number must be a string or an integer")
+        text = value.strip()
+        if not text or len(text) > 256:
+            raise ValueError("question_number must be 1-256 characters")
+        return text
 
 
 class ClassroomIdentity(BaseModel):
@@ -231,7 +257,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                membership_resolver: Optional[Callable[[str], Any]] = None,
                authorize_ingest: Optional[Callable[[str, str, dict], bool]] = None,
                engine: Any = _ENGINE_UNSET,
-               now: Callable[[], str] = _now) -> FastAPI:
+               now: Callable[[], str] = _now,
+               allowed_origins: Optional[Iterable[str]] = None) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
     Defaults are the REAL controls, not a bypass:
@@ -1101,5 +1128,44 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             "replayed": after == before and before > 0,
             "idempotency_key": body.idempotency_key,
         }
+
+    # Browser CORS (IFR audit P0-2): without this every cross-origin JSON or
+    # Authorization request from the Pages deployment fails preflight. The
+    # allowlist is EXACT origins from AI_MARKER_ALLOWED_ORIGINS - no wildcard,
+    # no credentials, and a missing origin is refused rather than defaulted.
+    # Added last so it is the outermost middleware: error envelopes and the
+    # body-size refusal carry the same CORS decision as a success response.
+    production = ((os.environ.get(runtime_config.RUNTIME_ENV) or "")
+                  .strip().lower() == runtime_config.RUNTIME_PRODUCTION)
+    try:
+        origins = runtime_config.parse_allowed_origins(
+            ",".join(allowed_origins) if allowed_origins is not None
+            else (os.environ.get(runtime_config.ALLOWED_ORIGINS_ENV) or ""),
+            production=production)
+    except ValueError as failure:
+        raise runtime_config.RuntimeConfigError(
+            "service_unavailable",
+            [{"code": "service_unavailable",
+              "detail": f"{runtime_config.ALLOWED_ORIGINS_ENV}: {failure}"}])
+    if production and not origins:
+        # A production process with no browser origin can serve no browser
+        # client; refuse rather than deploy a service that fails every
+        # preflight. ``api/server.py`` checks this too - this covers direct
+        # create_app() callers.
+        raise runtime_config.RuntimeConfigError(
+            "service_unavailable",
+            [{"code": "service_unavailable",
+              "detail": f"{runtime_config.ALLOWED_ORIGINS_ENV} is required in "
+                        f"production"}])
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Accept"],
+            expose_headers=[],
+            max_age=600,
+        )
 
     return app

@@ -34,3 +34,10 @@ Pillow==13.0.0
 # rejected for its algorithm-confusion advisory history). Ships with the
 # verifier slice; audited by the dependency-audit job.
 PyJWT[crypto]==2.15.1
+# API runtime for the container entrypoint (api/server.py, served as
+# `uvicorn api.server:application`). Added with the production-composition
+# slice: the Cloud Run image IS an API process, so the production manifest
+# must carry its server. Bounded ranges like every other direct dependency;
+# the exact resolved version is what the in-process contract tests drive.
+fastapi>=0.162,<0.163
+uvicorn>=0.53,<0.54

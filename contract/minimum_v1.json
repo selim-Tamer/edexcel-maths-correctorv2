@@ -1,0 +1,275 @@
+{
+  "spec": {
+    "name": "ai-maths-marker-minimum-v1",
+    "version": "1.0.0-proposed",
+    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
+    "confirmed_by": null,
+    "owners": {
+      "runtime_routes_cors": "CM",
+      "browser_client": "FCM"
+    },
+    "backend_commit": "2077b16 (route table unchanged by this contract slice)",
+    "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
+    "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
+    "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
+    "sources": [
+      "src/api/fetchClient.ts and src/api/types.ts in the frontend clone (the actual live calls)",
+      "api/app.py route table at this backend commit",
+      "IFR live-beta integration audit 48e7e28 (P0/P1 list)"
+    ]
+  },
+
+  "principles": [
+    "Errors use the existing backend vocabulary; the frontend maps codes, it does not invent response shapes.",
+    "The client never chooses a job id, result id, owner or tenant.",
+    "A retry is the same job: no new idempotency key and no new document digest.",
+    "Server-owned state is limited to documents, jobs, results, decisions and events. Assignment/draft/queue UI state stays on the device.",
+    "No wildcard CORS, no browser-visible bucket URL, no signed URL in the beta slice.",
+    "No deployment, migration, cloud activation or paid engine call is part of this contract."
+  ],
+
+  "server_routes": [
+    {
+      "method": "GET",
+      "path": "/v1/healthz",
+      "implemented": true,
+      "auth": "public",
+      "purpose": "Liveness only; content-free."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/documents",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Private PDF upload. Raw bytes in the body, ?filename= for the display name. Validates signature/size/pages/encryption, computes sha256 server-side, stores owner+tenant scoped. 201 stored, 200 identical replay. Returns document_digest."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/documents/{document_digest}",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Owner+tenant scoped private read. Unknown/foreign/malformed digest is the same 404."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/jobs",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest}. The document must already belong to this owner+tenant."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/jobs/{job_id}",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Job state: job_id, status, attempts, max_attempts, document_digest, result_id, error_code; a succeeded job also carries marks-only questions."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/jobs/{job_id}/run",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Retry/execute the same job. This is the ONLY control action in beta."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/results",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Register a reviewed result. Not on the current frontend path; kept for the reconciled submission flow."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/results/{result_id}/projection",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Marks-safe view: result_id, result_revision, questions, totals. The read model for a submission."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/results/{result_id}/decisions",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Approve/correct/flag one question with optimistic revision + idempotency key."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/results/{result_id}/events",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Append-only decision stream for one result."
+    }
+  ],
+
+  "frontend_calls": [
+    {
+      "client_method": "createAssignment",
+      "client_route": "POST /v1/assignments",
+      "disposition": "client_owned",
+      "server_route": null,
+      "justification": "No assignment resource exists server-side and beta does not add one. The Assignment object is local state with a client-generated id."
+    },
+    {
+      "client_method": "authorizeUpload",
+      "client_route": "POST /v1/assignments/{assignmentId}/uploads",
+      "disposition": "replaced",
+      "server_route": {
+        "method": "POST",
+        "path": "/v1/documents"
+      },
+      "justification": "Collapsed into one authenticated upload of the raw PDF. fileId is the returned document_digest. This needs no signed URL, no bucket credential in the browser and no new storage adapter."
+    },
+    {
+      "client_method": "confirmUpload",
+      "client_route": "POST /v1/uploads/{fileId}/confirm",
+      "disposition": "removed",
+      "server_route": null,
+      "justification": "The upload validates and stores atomically, so there is nothing to confirm. A local no-op may keep the UI state machine intact; it must not be HTTP."
+    },
+    {
+      "client_method": "createJob",
+      "client_route": "POST /v1/jobs",
+      "disposition": "required_addition",
+      "server_route": {
+        "method": "POST",
+        "path": "/v1/jobs"
+      },
+      "justification": "The current ApiClient has NO job-creation call - confirmUpload was expected to start marking. After the upload returns document_digest the client must call POST /v1/jobs once per (assignment, student, document). No backend route is added."
+    },
+    {
+      "client_method": "controlJob(retry)",
+      "client_route": "POST /v1/jobs/{jobId}/control",
+      "disposition": "mapped",
+      "server_route": {
+        "method": "POST",
+        "path": "/v1/jobs/{job_id}/run"
+      },
+      "justification": "retry maps to /run. cancel/pause/resume have no backend route in beta and must not be rendered as live actions."
+    },
+    {
+      "client_method": "getMarkingQueue",
+      "client_route": "GET /v1/assignments/{assignmentId}/jobs",
+      "disposition": "client_owned",
+      "server_route": null,
+      "justification": "A server-side queue needs the assignment resource. The client keeps its job ids per assignment and polls GET /v1/jobs/{job_id}, or renders last-known state."
+    },
+    {
+      "client_method": "saveDraft",
+      "client_route": "POST /v1/drafts",
+      "disposition": "client_owned",
+      "server_route": null,
+      "justification": "Drafts are device state keyed by Google sub + assignment + student ref. Storing them server-side would need new authorization semantics and is not in beta scope."
+    },
+    {
+      "client_method": "finalizeDraft",
+      "client_route": "POST /v1/drafts/{studentId}/finalize",
+      "disposition": "client_owned",
+      "server_route": null,
+      "justification": "Finalisation is the set of per-question decisions. There is no server finalize verb in beta; the score is computed from the decision responses and the projection."
+    },
+    {
+      "client_method": "getSubmissionResults",
+      "client_route": "GET /v1/submissions/{submissionId}",
+      "disposition": "mapped",
+      "server_route": {
+        "method": "GET",
+        "path": "/v1/results/{result_id}/projection"
+      },
+      "justification": "submissionId is the result_id the job returns. The projection supplies questions and totals; no student answer text is served."
+    },
+    {
+      "client_method": "recordDecision",
+      "client_route": "POST /v1/results/{resultId}/decisions",
+      "disposition": "mapped",
+      "server_route": {
+        "method": "POST",
+        "path": "/v1/results/{result_id}/decisions"
+      },
+      "justification": "1:1. The client must send question_number as a string; the backend now also accepts an integer and normalises it, so the integer form is no longer a 422."
+    },
+    {
+      "client_method": "getResultEvents",
+      "client_route": "GET /v1/results/{resultId}/events",
+      "disposition": "mapped",
+      "server_route": {
+        "method": "GET",
+        "path": "/v1/results/{result_id}/events"
+      },
+      "justification": "1:1."
+    }
+  ],
+
+  "identity": {
+    "token": "Google ID token in Authorization: Bearer; verified server-side against GOOGLE_OIDC_AUDIENCE.",
+    "tenant_and_owner": "Derived only from verified subject + active membership. Never accepted from the client.",
+    "question_number_wire_type": "string",
+    "question_number_backend_accepts": ["string", "integer"],
+    "question_number_normalisation": "stripped string; booleans, empty and >256 characters are refused",
+    "submission_identity": "submissionId == result_id returned by the job"
+  },
+
+  "idempotency": {
+    "job_key_rule": "job-<first 32 hex chars of sha256(assignmentId + '|' + studentRef + '|' + document_digest)>",
+    "regenerate_only_when": "document_digest changes (a new upload is a new job)",
+    "retry_rule": "a retry is POST /v1/jobs/{job_id}/run with no new key",
+    "decision_key_rule": "client-generated per (result_id, question_number, intended payload); replaying the same key with a different payload is refused with idempotency_key_payload_mismatch"
+  },
+
+  "error_contract": {
+    "envelope": {
+      "error": {
+        "code": "string",
+        "message": "string",
+        "detail": "optional string"
+      }
+    },
+    "auth": {
+      "401": ["authentication_required"],
+      "403": ["tenant_membership_required", "manual_document_provenance_required"],
+      "rule": "403 tenant_membership_required is a membership problem, NOT an expired session. The client must not sign the user out or treat it as a retryable auth error."
+    },
+    "conflict_codes": [
+      "stale_revision",
+      "review_question_ambiguous",
+      "override_write_rejected",
+      "idempotency_key_payload_mismatch",
+      "original_output_immutable"
+    ],
+    "not_found_codes": [
+      "result_not_registered",
+      "review_context_unavailable",
+      "review_question_unavailable"
+    ],
+    "conflict_recovery": "On stale_revision refetch GET /v1/results/{result_id}/projection, take result_revision, and re-apply the teacher's unchanged decision. review_question_ambiguous and review_question_unavailable also mean 'refetch the projection', never 'retry the same body'. Everything else is shown to the teacher; nothing is retried blindly.",
+    "validation": "400 payload_invalid (server cap 32 KiB for non-upload writes); 413 payload_invalid / document_too_large for uploads.",
+    "runtime_codes": {
+      "note": "Startup-log problem codes and job error_code values, NOT HTTP error-envelope codes. A process that cannot compose itself fails the revision; an unconfigured request path still answers with authentication_required (401, detail oidc_not_configured) or store_unusable / dev_opt_in_required / model_unavailable (503).",
+      "values": [
+        "store_unusable",
+        "oidc_not_configured",
+        "dev_opt_in_required",
+        "model_unavailable",
+        "service_unavailable"
+      ]
+    }
+  },
+
+  "cors": {
+    "env": "AI_MARKER_ALLOWED_ORIGINS",
+    "origins": "exact scheme://host[:port], comma separated",
+    "wildcard": false,
+    "credentials": false,
+    "methods": ["GET", "POST", "OPTIONS"],
+    "headers": ["Authorization", "Content-Type", "Accept"],
+    "production_scheme": "https only",
+    "note": "The production and any preview origin must be named explicitly. There is no wildcard fallback and an invalid allowlist fails startup."
+  },
+
+  "client_owned_state": {
+    "assignment": "local object, client-generated id",
+    "drafts": "device storage keyed by Google sub + assignmentId + studentRef; never uploaded; never rendered for a different sub",
+    "queue": "local list of job ids per assignment, refreshed through GET /v1/jobs/{job_id}",
+    "finalize": "computed from decision responses + projection",
+    "logout": "stop rendering the previous sub's drafts; the bytes stay on the device under that sub key until the user discards them"
+  }
+}
