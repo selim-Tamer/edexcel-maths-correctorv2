@@ -257,8 +257,15 @@ by it, and the runbook is what carries those checks to the real project.
 ## 7. Known gaps carried into the next slice
 
 1. **Pooler compatibility.** `psycopg` sends prepared statements by default;
-   the Supabase transaction pooler needs `prepare_threshold=None`. The adapter
-   does not pass it yet, and no test claims it works through the pooler.
+   the Supabase transaction pooler needs `prepare_threshold=None`.
+   `postgres_store.open_store()` now passes exactly that, pinned by
+   `tests/test_postgres_store_contract.py` - offline
+   (`test_open_store_disables_prepared_statements`, the kwarg itself) and on
+   real PostgreSQL (`test_open_store_opens_a_pooler_safe_connection`, the
+   resulting connection). **What is still unverified is the Supabase pooler
+   itself**: no test has run through `pgbouncer` in transaction mode, so no
+   claim is made about a pooled connection until the deployment slice runs
+   one.
 2. **Durable worker.** The job executor is still the synchronous development
    one; Cloud Run cancels in-flight requests on scale-down, so the production
    shape is Cloud Run Jobs reusing the existing `job_store` lease/attempt

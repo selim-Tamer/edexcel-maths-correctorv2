@@ -14,12 +14,16 @@ What is pinned here (the security contract, engine-translated):
 * chain/evidence tamper detection through the shared audit_store helpers,
 * schema version fail-closed (no auto-migration), pdf REFERENCES-only shape.
 """
+import contextlib
 import json
 import os
+import sys
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from pathlib import Path
+from unittest import mock
 
 try:
     import psycopg
@@ -43,6 +47,64 @@ requires_pg = unittest.skipUnless(
     psycopg is not None and DSN,
     "PostgreSQL DSN not configured - local-dev fallback: the Postgres "
     "contract runs in the CI postgres-tests job only")
+
+
+class _FakeResult:
+    def fetchone(self):
+        return ("1",)
+
+
+class _FakeConnection:
+    """Just enough of a psycopg connection for ``PostgresAuditStore.__init__``."""
+
+    @contextlib.contextmanager
+    def transaction(self):
+        yield self
+
+    def execute(self, *_args, **_kwargs):
+        return _FakeResult()
+
+    def close(self):
+        pass
+
+
+class OpenStoreConnectionKwargsTests(unittest.TestCase):
+    """Pooler compatibility is pinned WITHOUT needing any server.
+
+    Supabase's transaction pooler replays one client session across different
+    server backends: a prepared statement created on one backend is simply gone
+    on the next (SQLSTATE 26000). The documented psycopg3 remedy is
+    ``prepare_threshold=None``, so the opener must pass it. A regression here
+    would only surface in production, which is exactly why it is pinned offline
+    as well as against real PostgreSQL.
+    """
+
+    def test_open_store_disables_prepared_statements(self):
+        calls = {}
+        fake = types.ModuleType("psycopg")
+
+        def connect(dsn, **kwargs):
+            calls["dsn"] = dsn
+            calls["kwargs"] = kwargs
+            return _FakeConnection()
+
+        fake.connect = connect
+        with mock.patch.dict(sys.modules, {"psycopg": fake}):
+            store = postgres_store.open_store(
+                "  postgresql://pooler.example:6543/postgres  ",
+                tenant_id=TENANT)
+        self.assertEqual(calls["dsn"],
+                         "postgresql://pooler.example:6543/postgres")
+        self.assertIn("prepare_threshold", calls["kwargs"])
+        self.assertIsNone(calls["kwargs"]["prepare_threshold"])
+        self.assertEqual(store.tenant_id, TENANT)
+
+    def test_open_store_still_fails_closed_on_a_missing_dsn(self):
+        for bad in ("", "   ", None):
+            with self.subTest(dsn=bad):
+                with self.assertRaises(audit_store.AuditStoreError) as caught:
+                    postgres_store.open_store(bad, tenant_id=TENANT)
+                self.assertEqual(caught.exception.code, "store_unusable")
 
 
 @requires_pg
@@ -76,6 +138,15 @@ class PostgresStoreContractTests(unittest.TestCase):
         self.store = postgres_store.PostgresAuditStore(
             self.conn, tenant_id=TENANT)
         self.addCleanup(self.store.close)
+
+    def test_open_store_opens_a_pooler_safe_connection(self):
+        # Real-service half of the pooler contract: the connection the opener
+        # creates must carry prepare_threshold=None (server-side prepared
+        # statements off), which is what Supabase's transaction pooler needs.
+        # This proves the kwarg reaches psycopg - it does NOT prove the pooler.
+        store = postgres_store.open_store(DSN, tenant_id=TENANT)
+        self.addCleanup(store.close)
+        self.assertIsNone(store._conn.prepare_threshold)
 
     def register(self, store=None, result_id=RESULT, output=ORIGINAL,
                  owner=SUBJECT):
