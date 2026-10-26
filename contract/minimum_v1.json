@@ -1,11 +1,11 @@
 {
   "spec": {
     "name": "ai-maths-marker-minimum-v1",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "status": "AGREED",
-    "confirmed_by": "68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d",
+    "confirmed_by": "2d206cc3-69d8-4b22-8859-cd08d6634612",
     "confirmed_at": "2026-10-26",
-    "confirmed_scope": "FCM accepted this exact artifact - their reconciled work/bolt/docs/FRONTEND_BACKEND_CONTRACT.md (frontend PR #4 bc8f3c86ef4aae692d5ff132e68b58627d6793d0, green CI run 40252538314) is aligned with this file at backend main 584f450; CM confirms here. Any change to a row needs a new numbered contract version confirmed by BOTH owners.",
+    "confirmed_scope": "v1.1: FCM confirmed the durable-worker trigger wording in message 2d206cc3-69d8-4b22-8859-cd08d6634612: row 5 (POST /v1/jobs/{job_id}/run, synchronous and lease-guarded) is kept exactly as agreed in v1.0 (confirmed_by 68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d); the added clarification states that a queued job is executed by the durable worker when triggered (operator or scheduler: Cloud Scheduler -> gcloud run jobs execute marker-worker) and that the client's recovery path is polling GET /v1/jobs/{job_id} with backoff 1s, 2s, 4s, then 5s, stopping at ~2 minutes and rendering last-known state. Self-trigger (alternative a) and no-trigger (alternative b) were explicitly rejected by FCM. No route was added, removed or changed by v1.1. Any change to a row needs a new numbered contract version confirmed by BOTH owners.",
     "owners": {
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
@@ -200,6 +200,14 @@
       "justification": "1:1."
     }
   ],
+
+  "durable_worker_trigger": {
+    "row_5_unchanged": "v1.1 changes no row: browser retry still drives the synchronous, lease-guarded POST /v1/jobs/{job_id}/run. A second call while the lease is live is refused.",
+    "executor": "A queued job is executed by the durable worker (worker.py, one job per Cloud Run Jobs invocation) when triggered by the operator or a scheduler: Cloud Scheduler -> gcloud run jobs execute marker-worker. The trigger is operator infrastructure; it is not a client responsibility and not a server route.",
+    "client_recovery": "The client's recovery path is always polling GET /v1/jobs/{job_id} with backoff 1s, 2s, 4s, then 5s, stopping at approximately 2 minutes and rendering the last-known state. A client timeout abandons the wait, never the job.",
+    "rejected_alternatives": "Self-trigger from the API (a) and no operational trigger (b) are not part of this contract; FCM explicitly refused both.",
+    "confirmed_by": "2d206cc3-69d8-4b22-8859-cd08d6634612"
+  },
 
   "identity": {
     "token": "Google ID token in Authorization: Bearer; verified server-side against GOOGLE_OIDC_AUDIENCE.",
