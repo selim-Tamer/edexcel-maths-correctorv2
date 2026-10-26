@@ -1,14 +1,16 @@
 {
   "spec": {
     "name": "ai-maths-marker-minimum-v1",
-    "version": "1.0.0-proposed",
-    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
-    "confirmed_by": null,
+    "version": "1.0.0",
+    "status": "AGREED",
+    "confirmed_by": "68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d",
+    "confirmed_at": "2026-10-26",
+    "confirmed_scope": "FCM accepted this exact artifact - their reconciled work/bolt/docs/FRONTEND_BACKEND_CONTRACT.md (frontend PR #4 bc8f3c86ef4aae692d5ff132e68b58627d6793d0, green CI run 40252538314) is aligned with this file at backend main 584f450; CM confirms here. Any change to a row needs a new numbered contract version confirmed by BOTH owners.",
     "owners": {
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
     },
-    "backend_commit": "2077b16 (route table unchanged by this contract slice)",
+    "backend_commit": "584f450 (route table unchanged since 2077b16)",
     "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
     "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
     "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
