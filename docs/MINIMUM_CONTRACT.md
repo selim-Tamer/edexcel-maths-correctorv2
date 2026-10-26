@@ -2,11 +2,12 @@
 
 Machine-readable source of truth: [`contract/minimum_v1.json`](../contract/minimum_v1.json).
 Status **AGREED** on 2026-10-26 - FCM confirmed this exact version in message
-`68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d` (their reconciled
+`2d206cc3-69d8-4b22-8859-cd08d6634612` (contract **v1.1**: the durable-worker
+trigger wording below; row 5 unchanged from v1.0, which FCM confirmed in
+message `68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d` - their reconciled
 `work/bolt/docs/FRONTEND_BACKEND_CONTRACT.md`, frontend PR #4 `bc8f3c86`,
-green CI run `40252538314`, aligned with this artifact at backend main
-`584f450`), and CM confirms on the backend side. Any change to a row needs a
-new numbered contract version confirmed by BOTH owners.
+green CI run `40252538314`), and CM confirms on the backend side. Any change
+to a row needs a new numbered contract version confirmed by BOTH owners.
 
 This document exists because IFR's live-beta audit found the frontend calling
 9-10 routes that the backend does not serve, and the two sides drifting apart
@@ -44,9 +45,19 @@ lease-guarded. A second call while the lease is live is refused, so the retry
 control cannot double-execute a job. A client-side timeout (15 s) abandons the
 client's *wait*, not the server-side work; the authoritative state is
 `GET /v1/jobs/{job_id}`, so the client recovers by polling that instead of
-assuming the run failed. When the durable worker lands (the next slice),
-execution moves to the worker and this row will be revised - as a new contract
-version, confirmed by both owners, never unilaterally.
+assuming the run failed.
+
+**Durable worker trigger (contract v1.1, confirmed by both owners).** Row 5 is
+unchanged: browser retry still drives the synchronous, lease-guarded
+`POST /v1/jobs/{job_id}/run`. What v1.1 settles is who *executes* a queued
+job: the durable worker (`worker.py`, one job per Cloud Run Jobs invocation)
+when triggered by the operator or a scheduler - concretely
+`Cloud Scheduler -> gcloud run jobs execute marker-worker`. The trigger is
+operator infrastructure, not a client responsibility and not a server route.
+Self-trigger from the API and "no trigger" were explicitly rejected. The
+client's recovery path is always polling `GET /v1/jobs/{job_id}` with backoff
+**1 s, 2 s, 4 s, then 5 s, stopping at ~2 minutes** and rendering the
+last-known state (FCM enforces this schedule in `src/polling.ts`).
 
 **The client currently has no job-creation call.** `confirmUpload` was expected
 to start marking, but the backend starts marking only through `POST /v1/jobs`
