@@ -42,6 +42,7 @@ Reuse it; do not recreate it.
 | 0002 | `schema/postgres_v2_tenant_rls.sql` | Creates NOLOGIN group roles `marker_app` / `marker_worker` (attributes **verified**, not altered), least-privilege grants, `anon`/`authenticated` revoke, RLS **ENABLE + FORCE** and `tenant_isolation` on all 5 tenant tables. | `schema_meta.rls_version = '1'` (the adapter's `schema_version` stays `'1'`: table shape unchanged) | `schema/postgres_v2_tenant_rls_rollback.sql` |
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
+| 0005 | `schema/postgres_v5_membership_access.sql` | Production membership **resolution**: a second SELECT-only RLS policy on `tenant_membership` keyed by `app.subject`, plus column-level `SELECT` (five columns) for `marker_app`. **No INSERT/UPDATE/DELETE** on membership rows for any runtime role - the API cannot grant itself a tenant. | `schema_meta.membership_access_version = '1'` | `schema/postgres_v5_membership_access_rollback.sql` (drops the policy + grant, leaves membership rows intact) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
@@ -148,7 +149,8 @@ from pg_class
 where relname in ('tenants','tenant_membership','results','audit_events','pdf_references')
 order by relname;
 
--- Exactly one policy per table, and it is the tenant predicate.
+-- Exactly one policy per tenant table, plus the 0005 subject-scoped SELECT
+-- policy on tenant_membership (six rows total when 0005 is applied).
 select tablename, policyname, cmd, qual is not null as has_using
 from pg_policies where schemaname = 'public' order by tablename;
 
@@ -184,9 +186,13 @@ function. **With 0003 applied too, the same query returns 18 rows**: the
 `marking_jobs` SELECT/INSERT/UPDATE for each runtime role, still zero DELETE.
 **With 0004 as well, 22 rows**: plus `pdf_references` SELECT/INSERT for each
 runtime role - and the separate `marker_purge` role (queried by grantee) holds
-exactly `pdf_references` SELECT + UPDATE and nothing else. **No role in the
-schema holds any DELETE at all**: purge tombstones the row and removes the
-object, so history cannot be trimmed.
+exactly `pdf_references` SELECT + UPDATE and nothing else. **With 0005**, the
+table-grant row count is unchanged (the membership grant is column-level, so it
+appears in `information_schema.role_column_grants`, not
+`role_table_grants`), and `pg_policies` shows **6 rows**: the five
+`tenant_isolation` policies plus `membership_self_read` (FOR SELECT) on
+`tenant_membership`. **No role in the schema holds any DELETE at all**: purge
+tombstones the row and removes the object, so history cannot be trimmed.
 
 ### 4.1 Per-grant justification (every runtime privilege)
 
@@ -206,7 +212,8 @@ statements are the evidence:
 | `audit_events` | UPDATE | **no** | **no** | none: the audit trail is append-only, and a runtime credential must not rewrite history |
 | `audit_events` | DELETE | **no** | **no** | none - deferred to the elevated purge role |
 | `tenants` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
-| `tenant_membership` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
+| `tenant_membership` | SELECT (5 columns) | yes | no | `postgres_membership_store.resolve()` reads tenant_id, subject, role, active, updated_at for the verified subject |
+| `tenant_membership` | INSERT/UPDATE/DELETE | **no** | **no** | none: provisioning is an operator/admin step; the API cannot grant itself a tenant |
 | `pdf_references` (0004) | SELECT | yes | yes | `find_document()` / `put_document()` prior-row check in `supabase_document_store` |
 | `pdf_references` (0004) | INSERT | yes | yes | `put_document()` records digest + object key + size after a successful upload |
 | `pdf_references` (0004) | UPDATE | **no** | **no** | none: the metadata row is immutable |
@@ -251,6 +258,13 @@ Consequences that are deliberate, not omissions:
   role sees every tenant.
 * Supabase's "AutoRLS on" and "Data API off" are **not** isolation evidence;
   the policies, grants and tests in this ledger are.
+* **`app.subject` (0005) is a lookup key, not an authenticity proof.** The
+  resolver sets it from the API's verified token subject, transaction-locally.
+  A compromised database credential could set the same GUC and read that
+  subject's membership; RLS narrows what a leaked *runtime* credential can
+  reach, it does not make a stolen credential harmless. The membership test
+  asserts that limit instead of claiming it away, and the credential itself is
+  runtime-only, revocable and never given to a client.
 
 ---
 
@@ -311,7 +325,12 @@ by it, and the runbook is what carries those checks to the real project.
    no real storage round trip has ever run, and the purge task itself is not
    yet scheduled - `delete_document()` is the reviewed verb, its execution is
    an operational step.
-4. **Membership and documents are still development stores.** They hold no
-   PostgreSQL grant yet; each adds its own numbered migration with the same
-   justification table when its code lands.
+4. **Membership resolution is now a PostgreSQL slice, documents are not
+   "development only".** `postgres_membership_store.py` + 0005 give the
+   production composition a subject-scoped resolver; the API selects it
+   whenever `AI_MARKER_PG_DSN` is set and fails closed on a database that has
+   not applied 0005. Documents already have 0004. What remains unproven is
+   operational: no migration has been applied to the real project and no
+   production membership row has ever been provisioned by a supported path
+   (rows are still inserted by an operator).
 5. **No live round trip** through Supabase, Cloud Run or Google has run.
