@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import auth_oidc
 import audit_store
 import decision_core
+import membership_store  # noqa: E402  (real class needed at fixture-creation time)
 from api.app import create_app
 from fastapi.testclient import TestClient
 
@@ -485,8 +486,14 @@ class RealVerifierAttackTests(unittest.TestCase):
     def test_reissued_token_for_another_subject_hijacks_nothing(self):
         # Account switching: Bob's genuine token must not reach Alpha's
         # stream, and the denial must be indistinguishable from absence.
+        # Bob's resolver seam is SUBJECT-FAITHFUL (it returns the real
+        # Membership class for whoever the verified token says), so the
+        # denial comes from the O-1 row gate: Alpha's result simply does
+        # not exist for Bob's owner - a 404, leaking nothing.
         result_id = self.seed_alpha()
-        client = self.client()
+        client = self.client(membership=lambda subject:
+                             membership_store.Membership(
+                                 subject, "tenant-alpha", "teacher"))
         response = client.post(
             f"/v1/results/{result_id}/decisions",
             headers=self.bearer(self.token(sub=SUBJECT_B)),
@@ -498,11 +505,15 @@ class RealVerifierAttackTests(unittest.TestCase):
 
     def test_valid_token_for_one_subject_cannot_read_another_subjects_history(self):
         result_id = self.seed_alpha()
-        client = self.client()
+        subject_faithful = (lambda subject: membership_store.Membership(
+            subject, "tenant-alpha", "teacher"))
+        client = self.client(membership=subject_faithful)
         committed = client.post(
             f"/v1/results/{result_id}/decisions",
             headers=self.bearer(self.token()), json=decision_body())
         self.assertEqual(committed.status_code, 200, committed.text)
+        # Bob's token resolves Bob's own (row-empty) ownership: the shared
+        # result id is invisible to him - 404, NOT a leak.
         stolen = client.get(f"/v1/results/{result_id}/events",
                             headers=self.bearer(self.token(sub=SUBJECT_B)))
         self.assertEqual(stolen.status_code, 404, stolen.text)
@@ -705,23 +716,39 @@ class RealVerifierAttackTests(unittest.TestCase):
 
     def test_membership_cannot_mint_an_owner(self):
         # The resolver is trusted, but even a hostile one must not be able to
-        # move a decision into another tenant's stream: the owner is always
-        # derived from the verified subject.
+        # move a decision into another subject's/tenant's stream. The latest
+        # app contract refuses EVERY hostile resolution AT THE MEMBERSHIP
+        # SEAM, before any owner or row is derived: a look-alike object that
+        # is not the real membership_store.Membership class, AND a real
+        # Membership whose subject does not match the verified token
+        # subject, both end as 403 membership_unavailable. The owner is
+        # still derived from the verified subject alone - nowhere does the
+        # attacker's tenant id leak into a response or a stream.
         result_id = self.seed_alpha()
         self.rows[OWNER_B] = [manual_row(OWNER_B)]
         bob_id = decision_core.durable_result_identity(
             self.rows[OWNER_B][0], "")
-        self.membership_result = _BogusMembership("attacker-tenant")
-        client = self.client()
-        response = client.post(
-            f"/v1/results/{result_id}/decisions",
-            headers=self.bearer(self.token()), json=decision_body())
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["result_revision"], 1)
-        self.assertEqual(
-            len(self.store.events(owner=OWNER_A, result_id=result_id)), 1)
-        self.assertEqual(self.revision(owner=OWNER_B, result_id=bob_id), None)
-        self.assertNotIn("attacker-tenant", response.text)
+        for hostile in (_BogusMembership("attacker-tenant"),
+                        membership_store.Membership(
+                            SUBJECT_B, "attacker-tenant", "teacher")):
+            self.membership_result = hostile
+            client = self.client()
+            response = client.post(
+                f"/v1/results/{result_id}/decisions",
+                headers=self.bearer(self.token()), json=decision_body())
+            self.assertEqual(response.status_code, 403, response.text)
+            self.assertEqual(response.json()["error"]["code"],
+                             "tenant_membership_required")
+            self.assertEqual(response.json()["error"]["detail"],
+                             "membership_unavailable")
+            self.assertNotEqual(self.revision(result_id=result_id), 1,
+                                "a hostile resolver must not move the flow")
+            self.assertNotIn("attacker-tenant", response.text)
+        # Nothing landed anywhere: no revision in Alpha's stream, none in
+        # Bob's (the store even refuses to read an unregistered result).
+        self.assertEqual(self.revision(result_id=result_id), None)
+        self.assertEqual(self.revision(owner=OWNER_B, result_id=bob_id),
+                         None)
 
     def test_membership_of_another_subject_does_not_help(self):
         result_id = self.seed_alpha()
@@ -810,16 +837,26 @@ _RSA_KEY_A = _rsa()
 _RSA_KEY_B = _rsa()
 
 
-class _ActiveMembership:
+class _ActiveMembership(membership_store.Membership):
     """An explicit ACTIVE membership fixture - never a bypass: the resolver
-    still has to return it, and an absent resolver still fails closed."""
+    still has to return it, and an absent resolver still fails closed.
 
-    subject = SUBJECT_A
-    tenant_id = "tenant-alpha"
-    role = "teacher"
+    It IS the real ``membership_store.Membership`` class because the app (as
+    of the latest main) enforces the exact instance type server-side
+    (`isinstance` at the actor seam) - a duck-typed look-alike fails closed
+    with 403 membership_unavailable, which is exactly the ``_BogusMembership``
+    attack below."""
+
+
+    def __init__(self):
+        super().__init__(SUBJECT_A, "tenant-alpha", "teacher")
 
 
 class _BogusMembership:
+    """Attack fixture: deliberately NOT a membership_store.Membership, with a
+    subject that does not match - the server must refuse to let it mint an
+    owner (403 membership_unavailable)."""
+
     def __init__(self, tenant_id):
         self.subject = "not-the-real-subject"
         self.tenant_id = tenant_id

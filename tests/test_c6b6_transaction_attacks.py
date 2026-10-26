@@ -33,9 +33,11 @@ Offline, in-process, synthetic temp SQLite only; no network, no student
 data, no real provider.
 """
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -251,7 +253,7 @@ class TransactionAttackTests(unittest.TestCase):
                                   new_score="2", reason="under tampering",
                                   expected_revision=1,
                                   idempotency_key="t1")
-        self.assertEqual(fresh_attempt.status_code, 400, fresh_attempt.text)
+        self.assertEqual(fresh_attempt.status_code, 409, fresh_attempt.text)
         self.assertEqual(fresh_attempt.json()["error"]["code"],
                          "original_output_immutable")
         self.assertEqual(self.store.current_revision(
@@ -263,7 +265,7 @@ class TransactionAttackTests(unittest.TestCase):
         #    against forged evidence -- history stays exactly as it was.
         replay_attempt = self.post(action="correct", new_score="2",
                                    reason="first truth")
-        self.assertEqual(replay_attempt.status_code, 400)
+        self.assertEqual(replay_attempt.status_code, 409)
         self.assertEqual(replay_attempt.json()["error"]["code"],
                          "original_output_immutable")
 
@@ -320,22 +322,207 @@ class TransactionAttackTests(unittest.TestCase):
 
     # -- unimplemented surface is honestly absent --------------------------
 
-    def test_no_ingestion_or_job_endpoints_exist_yet(self):
-        # The beta brief mentions jobs/retries/timeouts. At the API level
-        # only DECISION delivery duplication is implementable: ingestion
-        # and job endpoints do not exist, and this test pins THAT (a real
-        # 404/405) instead of pretending to test a job engine. It fails
-        # the moment an ingestion route appears WITHOUT its own retry-
-        # duplication attacks being added here.
-        for method, path in (("GET", "/v1/results"),
-                             ("POST", "/v1/results"),
-                             ("GET", "/v1/jobs"),
-                             ("POST", "/v1/jobs"),
-                             ("GET", "/v1/results/%s/progress" % self.rid)):
-            with self.subTest(method=method, path=path):
-                response = getattr(self.client, method.lower())(
-                    path, headers=self.auth())
-                self.assertIn(response.status_code, (404, 405))
+    # -- REAL ingest/registration and job endpoints (post-engine slice) ----
+
+    def test_client_ingest_registration_and_jobs_fail_closed_and_cannot_cross(self):
+        # REPLACES the old ``no_ingestion_or_job_endpoints_exist_yet`` pin:
+        # that absence was true at b782528 but is FALSE since the
+        # engine/results slice merged (POST /v1/results and the /v1/jobs
+        # routes exist). The equally strong attack expectations, against the
+        # REAL endpoints over HTTP, are:
+        #   a. a client-supplied identity+original NEVER registers without
+        #      the server-issued provenance authorization (fail closed);
+        #   b. forged identity shapes are 400 refused before any gate;
+        #   c. a silent SWAP of the pristine output for an identity that is
+        #      already registered is refused 409 original_output_immutable
+        #      through the REAL registration path (not just the decision
+        #      path), leaving the registered original and every prior event
+        #      intact;
+        #   d. an identical identity ingested by ANOTHER verified teacher
+        #      cannot cross into (nor rewrite) the first teacher's stream;
+        #   e. job creation is owner+tenant-AND-document-scoped: an unknown
+        #      document is an indistinguishable 404, reusing one key for a
+        #      different stored document is 409 idempotency_key_payload_
+        #      mismatch, and the honest same-key same-document replay
+        #      returns the SAME job id.
+        # All storage backends are the dev opt-in stores this repo's own
+        # job/document tests use (temp SQLite via env); the ONLY harness
+        # seam is the trusted-provenance authorization, injected explicitly
+        # per case with a disclosure in scope - never bypassed silently.
+        SUBJECT_B = "bob-subject"
+        OWNER_B = "google:" + SUBJECT_B
+        self.assertNotIn(OWNER_B, ("google:" + SUBJECT, ),
+                         "attack fixture sanity")
+        import document_store
+        import job_store
+        import ingest_registry
+        digest_hex = hashlib.sha256(PDF).hexdigest()
+        attacker_pdf = PDF + b"-attacker-tag"
+        attacker_digest = hashlib.sha256(attacker_pdf).hexdigest()
+        env = {document_store.PATH_ENV: str(
+                   Path(self.tmp.name) / "doc.sqlite3"),
+               document_store.ACK_ENV: "1",
+               job_store.PATH_ENV: str(
+                   Path(self.tmp.name) / "jobs.sqlite3"),
+               job_store.ACK_ENV: "1",
+               ingest_registry.PATH_ENV: str(
+                   Path(self.tmp.name) / "ingest.sqlite3"),
+               ingest_registry.ACK_ENV: "1"}
+        original = {"questions": [
+            {"question_number": "1", "awarded_marks": 1, "max_marks": 2},
+            {"question_number": "2", "awarded_marks": 0, "max_marks": 2}]}
+        swapped = {"questions": [
+            {"question_number": "1", "awarded_marks": 2, "max_marks": 2},
+            {"question_number": "2", "awarded_marks": 0, "max_marks": 2}]}
+
+        def ingest_body(digest, swapped_output=False):
+            return {"scope": "manual",
+                    "original_output": swapped if swapped_output
+                    else original,
+                    "manual_identity": {
+                        "document_digest": digest,
+                        "submission_ref": "server-ref-1"}}
+
+        with mock.patch.dict(os.environ, env):
+            documents = document_store.open_store(env[document_store.PATH_ENV])
+            honest_job = document_store.put_document(
+                documents, tenant_id="tenant-c6b6", owner=OWNER,
+                document_digest=digest_hex, filename="work.pdf",
+                page_count=1, content=PDF)
+            self.assertTrue(honest_job, "harness sanity: document stored")
+            # A second, legitimately-stored document for Alpha gives the
+            # idempotency_key_payload_mismatch attack a real target.
+            attacker_stored = document_store.put_document(
+                documents, tenant_id="tenant-c6b6", owner=OWNER,
+                document_digest=attacker_digest, filename="other.pdf",
+                page_count=1, content=attacker_pdf)
+            self.assertTrue(attacker_stored, "harness sanity")
+            documents.commit()
+            documents.close()
+
+            def app_for(trust_ingest):
+                return create_app(
+                    verify_token={"tok": SUBJECT, "tok-b": SUBJECT_B}.get,
+                    rows_for=lambda subject, owner: [r for r in self.rows
+                                                     if r.get("report_owner")
+                                                     == owner],
+                    store_provider=lambda: (self.store, None),
+                    manual_document_provenance_ok=lambda row: True,
+                    membership_resolver=lambda subject:
+                        membership_store.Membership(subject, "tenant-c6b6",
+                                                    "teacher"),
+                    authorize_ingest=(None if not trust_ingest
+                                      else lambda s, t, r: True))
+
+            default_client = TestClient(app_for(False),
+                                        raise_server_exceptions=False)
+            trusted_client = TestClient(app_for(True),
+                                        raise_server_exceptions=False)
+
+            # (a) no provenance -> fail closed, nothing registered.
+            unauthorized = default_client.post(
+                "/v1/results", headers=self.auth(),
+                json=ingest_body(digest_hex))
+            self.assertEqual(unauthorized.status_code, 403, unauthorized.text)
+            self.assertEqual(unauthorized.json()["error"]["code"],
+                             "manual_document_provenance_required")
+            self.assertEqual(unauthorized.json()["error"]["detail"],
+                             "ingest_authorization_required")
+
+            # (b) forged identity shapes -> 400 before any gate/store.
+            for forged in ("z" * 63, "GG" * 32, PDF.hex() + "00"):
+                body = ingest_body(forged)
+                raw = self.auth()
+                forged_response = default_client.post(
+                    "/v1/results", headers=raw,
+                    json={"scope": "manual",
+                          "original_output": original,
+                          "manual_identity": {
+                              "document_digest": forged,
+                              "submission_ref": "server-ref-1"}})
+                self.assertEqual(forged_response.status_code, 400,
+                                 forged_response.text)
+                self.assertEqual(forged_response.json()["error"]["code"],
+                                 "payload_invalid")
+                self.assertEqual(self.store.current_revision(
+                    owner=OWNER, result_id="manual:" + forged[:16]
+                    + ":server-ref-1"), None)
+            slash_ref = {**ingest_body(digest_hex),
+                         "manual_identity": {"document_digest": digest_hex,
+                                             "submission_ref": "a/b"}}
+            forged_ref = default_client.post(
+                "/v1/results", headers=self.auth(), json=slash_ref)
+            self.assertEqual(forged_ref.status_code, 400, forged_ref.text)
+
+            # (c) authorized first ingest, then a silent output swap on the
+            # SAME identity: the REAL registration path refuses 409 and the
+            # registered original stays exactly what it was.
+            first = trusted_client.post("/v1/results", headers=self.auth(),
+                                        json=ingest_body(digest_hex))
+            self.assertEqual(first.status_code, 201, first.text)
+            self.assertTrue(first.json()["result_id"].startswith("manual:"))
+            self.assertEqual(self.store.current_revision(
+                owner=OWNER, result_id=first.json()["result_id"]), 0)
+            swap = trusted_client.post(
+                "/v1/results", headers=self.auth(),
+                json=ingest_body(digest_hex, swapped_output=True))
+            self.assertEqual(swap.status_code, 409, swap.text)
+            self.assertEqual(swap.json()["error"]["code"],
+                             "original_output_immutable")
+            kept = self.store.original_record(
+                owner=OWNER, result_id=first.json()["result_id"])
+            self.assertEqual(kept["original_scores"],
+                             [["1", 1], ["2", 0]])
+            self.assertEqual(self.store.events(
+                owner=OWNER, result_id=first.json()["result_id"]), [])
+
+            # (d) another verified teacher, identical identity: the minted
+            # result id is the same STRING, but it lives under Bob's owner
+            # only - Alpha's original/revision/event stream is untouched.
+            follower = trusted_client.post(
+                "/v1/results",
+                headers={"Authorization": "Bearer tok-b"},
+                json=ingest_body(digest_hex, swapped_output=True))
+            self.assertEqual(follower.status_code, 201, follower.text)
+            self.assertEqual(
+                self.store.current_revision(
+                    owner=OWNER, result_id=first.json()["result_id"]), 0,
+                "Bob's trusted ingest must not touch Alpha's stream")
+            bob_record = self.store.original_record(
+                owner=OWNER_B, result_id=follower.json()["result_id"])
+            self.assertEqual(bob_record["original_scores"],
+                             [["1", 2], ["2", 0]])
+
+            # (e) jobs: unknown document is an indistinguishable 404 for
+            # Bob (the digest is Alpha's), then the honest key replay and
+            # the key-mismatch refusal for Alpha.
+            other_teacher = default_client.post(
+                "/v1/jobs", headers={"Authorization": "Bearer tok-b"},
+                json={"idempotency_key": "job-key-0001",
+                      "document_digest": digest_hex})
+            self.assertEqual(other_teacher.status_code, 404,
+                             other_teacher.text)
+            self.assertEqual(other_teacher.json()["error"]["code"],
+                             "result_not_registered")
+            created = trusted_client.post(
+                "/v1/jobs", headers=self.auth(),
+                json={"idempotency_key": "job-key-0001",
+                      "document_digest": digest_hex})
+            self.assertEqual(created.status_code, 201, created.text)
+            replay = trusted_client.post(
+                "/v1/jobs", headers=self.auth(),
+                json={"idempotency_key": "job-key-0001",
+                      "document_digest": digest_hex})
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json()["job_id"], created.json()["job_id"],
+                             "same key + same document must replay one job")
+            reuse = trusted_client.post(
+                "/v1/jobs", headers=self.auth(),
+                json={"idempotency_key": "job-key-0001",
+                      "document_digest": attacker_digest})
+            self.assertNotEqual(reuse.status_code, 201, reuse.text)
+            self.assertEqual(reuse.json()["error"]["code"],
+                             "idempotency_key_payload_mismatch")
 
 
 if __name__ == "__main__":
