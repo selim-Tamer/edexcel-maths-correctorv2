@@ -449,6 +449,15 @@ def open_store(dsn: str, *, tenant_id: str) -> PostgresAuditStore:
 
     The DDL is applied by an explicit operator/CI step; this opener fails
     closed on a missing or unsupported schema version - no auto-migration.
+
+    ``prepare_threshold=None`` disables server-side prepared statements.
+    Supabase's transaction pooler replays one client "session" across
+    DIFFERENT server backends, where a statement prepared by a previous pooled
+    connection fails with SQLSTATE 26000 ("prepared statement ... does not
+    exist"). psycopg3's documented remedy is to turn preparation off, which is
+    what this opener does for every production connection. This is asserted by
+    tests, but the real Supabase pooler itself remains unverified - see
+    schema/MIGRATIONS.md 7.
     """
     import psycopg  # lazy: only the Postgres path needs the driver
 
@@ -456,7 +465,7 @@ def open_store(dsn: str, *, tenant_id: str) -> PostgresAuditStore:
         raise AuditStoreError("store_unusable",
                               "a PostgreSQL DSN is required (none configured)")
     try:
-        connection = psycopg.connect(dsn.strip())
+        connection = psycopg.connect(dsn.strip(), prepare_threshold=None)
     except Exception as error:
         raise AuditStoreError("store_unusable",
                               "cannot connect to PostgreSQL") from error

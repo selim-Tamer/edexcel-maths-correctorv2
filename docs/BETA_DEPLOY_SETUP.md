@@ -149,9 +149,12 @@ reviews; this section is only the summary.
 
 Known follow-up (tracked, not hidden): psycopg3 against a transaction pooler
 needs prepared statements disabled (`prepare_threshold=None`);
-`postgres_store.open_store()` does not pass it yet. That belongs to the next
-slice (job store + worker), and this packet does not claim pooler
-compatibility until a test proves it.
+`postgres_store.open_store()` now passes exactly that, pinned by
+`tests/test_postgres_store_contract.py` (offline kwarg test + a real
+PostgreSQL connection-kwargs test). The real Supabase transaction pooler is
+still **unverified**: nothing has run through `pgbouncer` in transaction mode,
+and this packet does not claim pooler compatibility until the deployment slice
+does.
 
 Rollback (reviewed exact inverse):
 `schema/postgres_v2_tenant_rls_rollback.sql`. Disclosed asymmetry: it does not
