@@ -169,12 +169,19 @@ class PostgresJobStoreContractTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        # Drop our login role and its membership: the RLS suite's own backout
-        # refuses to drop a group role that still has dependents.
+        # Drop our login role and its membership, AND our database: the 0003
+        # grants on marking_jobs live in marker_jobs_ci, and while they exist
+        # the RLS suite's backout refuses to drop the group roles ("still has
+        # dependent grants/memberships"). Dropping the database removes them,
+        # so this suite can never block another suite's rollback.
         cls.admin.execute(sqlmod.SQL("REVOKE marker_app FROM {}").format(
             sqlmod.Identifier(APP_ROLE)))
         cls.admin.execute(sqlmod.SQL("DROP ROLE IF EXISTS {}").format(
             sqlmod.Identifier(APP_ROLE)))
+        cls.admin.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()", (TEST_DB,))
+        cls.admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
         cls.admin.close()
 
     def setUp(self):
