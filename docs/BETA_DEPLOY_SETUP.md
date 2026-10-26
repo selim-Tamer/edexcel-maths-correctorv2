@@ -95,6 +95,7 @@ time and never written to the repository, a message, or a log.
 | `AI_MARKER_MARK_SCHEME` | engine | no | only when engine on | image path `/app/scheme.pdf` |
 | `GEMINI_API_KEY` | engine | **yes** | only when engine on | Secret Manager `gemini-api-key` |
 | `AI_MARKER_ALLOWED_ORIGINS` | web (CORS) | no | **yes** | Cloud Run plain env: exact Pages origin(s), comma separated, https only |
+| `AI_MARKER_WORKER_TENANTS` | worker | no | only for the worker | Cloud Run Jobs plain env: comma-separated tenant ids the worker serves (or repeat `--tenant`); discovery stays explicit |
 | `PORT` | runtime | no | injected by Cloud Run | platform |
 
 Refused in production (any non-empty value fails startup): the development
@@ -292,6 +293,40 @@ could not reach the API at all. This slice fixes the CM-owned half:
   instead of authorize+confirm, a `POST /v1/jobs` call it does not have today,
   `question_number` as a string, string question numbers, 403 ≠ expiry,
   device-local drafts) are in the contract doc, not invented here.
+
+---
+
+## 5.2 Cloud Run Jobs worker (prepared command, not run)
+
+The durable worker is `worker.py`: one job per invocation (`--once`, the Jobs
+task shape), executing each job through the API's own reviewed handler
+(`app.state.run_marking_job`), so claim/lease/attempts/registration are the
+same code as `POST /v1/jobs/{job_id}/run`. Prepared, never executed:
+
+```bash
+gcloud run jobs create marker-worker \
+  --image europe-west3-docker.pkg.dev/<project>/marker/marker-api:<sha> \
+  --region europe-west3 \
+  --set-env-vars "AI_MARKER_RUNTIME=production,GOOGLE_OIDC_AUDIENCE=<web-client-id>,AI_MARKER_ALLOWED_ORIGINS=<exact-pages-origin>,AI_MARKER_WORKER_TENANTS=<tenant-a,tenant-b>" \
+  --set-secrets "AI_MARKER_PG_DSN=marker-pg-dsn:latest,AI_MARKER_SUPABASE_SERVICE_KEY=marker-supabase-service-key:latest" \
+  --max-retries 0 \
+  --task-timeout 900 \
+  --parallelism 1 \
+  --cpu 1 --memory 512Mi \
+  --command python --args worker.py,--once
+```
+
+* `--max-retries 0`: retries are the job row's `attempts`/`max_attempts`
+  business, not the platform's. A failed attempt settles in the store and is
+  requeued there; the platform must not stack a second retry policy on top.
+* `--parallelism 1`: one job at a time per task. The lease already prevents
+  double execution across tasks; parallelism is a cost knob, not a safety one.
+* `AI_MARKER_WORKER_TENANTS` is required (or repeated `--tenant`): discovery
+  is tenant-scoped and explicit. The worker is deliberately not given a
+  privileged cross-tenant read, so it needs **no extra database grant**.
+* Triggering (`gcloud run jobs execute marker-worker`) is an operator action
+  scheduled outside this packet - a Cloud Scheduler trigger is NOT set up
+  here and would be its own reviewed step with its own cost line.
 
 ---
 

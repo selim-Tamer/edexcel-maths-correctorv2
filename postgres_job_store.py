@@ -33,11 +33,13 @@ Differences from the development store, deliberate:
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Optional
 
 from job_store import (DEFAULT_LEASE_SECONDS, DEFAULT_MAX_ATTEMPTS,
                        JobStoreError, mint_job_id)
+from runtime_config import PG_DSN_ENV
 
 TENANT_GUC = "app.tenant_id"
 
@@ -88,6 +90,45 @@ def open_store(dsn: str):
             pass
         raise JobStoreError("store_unusable")
     return connection
+
+
+def configured() -> bool:
+    """True when this process is composed with the production job store."""
+    return bool((os.environ.get(PG_DSN_ENV) or "").strip())
+
+
+def require_connection():
+    """Open the production job store from env, failing closed when absent."""
+    dsn = (os.environ.get(PG_DSN_ENV) or "").strip()
+    if not dsn:
+        raise JobStoreError("store_unusable")
+    return open_store(dsn)
+
+
+def find_runnable_job(connection, *, tenant_id: str,
+                      now: Optional[int] = None):
+    """Newest runnable job for this tenant, or ``None`` (worker discovery).
+
+    Runnable = ``queued``, or ``running`` whose lease has EXPIRED (crash
+    recovery). This only identifies a candidate; the claim itself is the
+    atomic ``claim_job`` step, so two workers racing here cannot
+    double-execute. Discovery is tenant-scoped on purpose: the worker is told
+    which tenants it serves (``AI_MARKER_WORKER_TENANTS``) instead of being
+    handed a privileged cross-tenant read.
+    """
+    now = int(time.time()) if now is None else int(now)
+    try:
+        with connection.transaction():
+            _bind_tenant(connection, tenant_id)
+            row = connection.execute(
+                "SELECT " + ", ".join(_JOB_COLUMNS) + " FROM marking_jobs"
+                " WHERE tenant_id = %s AND (status = 'queued' OR"
+                " (status = 'running' AND lease_until <= %s))"
+                " ORDER BY created_at ASC LIMIT 1",
+                (tenant_id, now)).fetchone()
+    except Exception as error:
+        raise JobStoreError("store_unusable") from error
+    return _rows_to_job(row) if row is not None else None
 
 
 def create_job(connection, *, tenant_id: str, owner: str,

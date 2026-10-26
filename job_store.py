@@ -182,6 +182,28 @@ def find_authorizable_job(connection: sqlite3.Connection, *, tenant_id: str,
     return row[0] if row is not None else None
 
 
+def find_runnable_job(connection: sqlite3.Connection, *, tenant_id: str,
+                      now: int = None):
+    """Newest runnable job for this tenant, or None (worker discovery).
+
+    Dev-store twin of ``postgres_job_store.find_runnable_job``: runnable =
+    ``queued`` or ``running`` with an EXPIRED lease. Discovery only - the
+    atomic ``claim_job`` is what actually takes the job.
+    """
+    now = int(time.time()) if now is None else int(now)
+    try:
+        row = connection.execute(
+            "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
+            " document_digest, status, attempts, max_attempts, lease_until,"
+            " result_id, error_code, created_at, updated_at"
+            " FROM marking_jobs WHERE tenant_id = ? AND (status = 'queued' OR"
+            " (status = 'running' AND lease_until <= ?))"
+            " ORDER BY created_at ASC LIMIT 1", (tenant_id, now)).fetchone()
+    except sqlite3.Error as error:
+        raise JobStoreError("store_unusable") from error
+    return _row_to_job(row) if row is not None else None
+
+
 def claim_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
               job_id: str, now: int = None, lease_seconds: int = None):
     """Atomically claim a runnable job. Returns (job, claimed).
