@@ -341,6 +341,46 @@ class DocumentsContractTests(unittest.TestCase):
                     content=b"%PDF-1.4")
         self.assertEqual(log, ["PUT"], "a failed write must never delete")
 
+    def test_an_inflight_winner_is_never_deleted_on_real_postgres(self):
+        # The case a re-SELECT cannot fix (IR/Mr.G): connection A holds an
+        # UNCOMMITTED insert, so under READ COMMITTED our write cannot see it,
+        # blocks on its lock, and with lock_timeout the write FAILS. Even
+        # then nothing may delete: those bytes belong to A's row, which may
+        # commit at any moment. A then rolls back - neither side committed a
+        # reference and the object is an orphan for the retention sweep.
+        in_flight = "d" * 64
+        log = []
+
+        def transport(method, url, headers, body):
+            log.append(method)
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
+
+        holder = psycopg.connect(_dsn())
+        self.addCleanup(holder.close)
+        holder.execute(
+            "INSERT INTO pdf_references (tenant_id, owner_subject,"
+            " document_digest, storage_key, size_bytes)"
+            " VALUES (%s, %s, %s, %s, 8)",
+            (TENANT, OWNER, in_flight,
+             f"objects/{'7' * 40}/{in_flight}.pdf"))
+        try:
+            with psycopg.connect(_dsn()) as connection:
+                connection.execute("SET lock_timeout = '2000'")
+                store = self._store(connection, transport)
+                with self.assertRaises(DocumentStoreError):
+                    supabase_document_store.put_document(
+                        store, tenant_id=TENANT, owner=OWNER,
+                        document_digest=in_flight, filename="", page_count=1,
+                        content=b"%PDF-1.4")
+            self.assertEqual(log, ["PUT"],
+                             "an in-flight winner's object must never be "
+                             "deleted")
+        finally:
+            holder.rollback()
+        self.assertIsNone(self.setup.execute(
+            "SELECT 1 FROM pdf_references WHERE document_digest = %s",
+            (in_flight,)).fetchone())
+
     def test_a_tombstoned_document_is_revived_by_a_reupload(self):
         self.setup.execute(
             "UPDATE pdf_references SET storage_key = '', size_bytes = NULL"

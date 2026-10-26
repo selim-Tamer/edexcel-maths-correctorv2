@@ -220,6 +220,24 @@ class PutDocumentTests(unittest.TestCase):
         self.assertEqual([c["method"] for c in transport.calls], ["PUT"],
                          "the winner's object must survive the loser's write")
 
+    def test_failing_closed_on_a_size_mismatch_deletes_nothing(self):
+        # Ownership-barrier rule (IR/Mr.G): failing closed must never destroy
+        # referenced storage. A visible row whose size disagrees with the new
+        # bytes means the store is inconsistent - we refuse, and touch neither
+        # the object nor the row. (The invisible-race case is covered by the
+        # benign-conflict test: the conflict-safe write yields no row and the
+        # loser keeps everything.)
+        transport = _RecordingTransport(status=201)
+        connection = _FakeConnection(
+            answers=[(storage_key("school-a", "o", DIGEST), 99)])
+        store = make_store(transport, connection)
+        with self.assertRaises(DocumentStoreError):
+            supabase_document_store.put_document(
+                store, tenant_id="school-a", owner="o", document_digest=DIGEST,
+                filename="", page_count=None, content=b"1234567")
+        self.assertEqual(transport.calls, [],
+                         "no DELETE - and no rewrite - of referenced bytes")
+
     def test_a_tombstoned_document_is_revived_by_a_reupload(self):
         # After a purge the row is a tombstone (storage_key = ''). A new
         # upload of the same bytes must re-establish availability instead of
