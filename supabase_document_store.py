@@ -24,7 +24,11 @@ Security posture:
   identity, never from a request field;
 * a failed metadata write after a successful upload is fail-closed: the
   orphaned object is deleted on a best-effort basis and the call reports
-  ``store_unusable`` rather than returning success.
+  ``store_unusable`` rather than returning success. The ONE exception is the
+  benign concurrent-upload race (IR finding): if the row that rejected our
+  INSERT now exists with our size, another upload of identical bytes won and
+  its row references the very object we uploaded - we report ``False`` and
+  never delete it.
 
 NOTHING here is deployed or provisioned: the bucket, its service key and the
 operator roles are created by the reviewed setup packet, not by this code.
@@ -160,6 +164,10 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
     False without rewriting anything. ``filename`` and ``page_count`` are
     accepted for interface parity with the dev store and are deliberately NOT
     stored: ``pdf_references`` keeps digest + key + size only.
+
+    Two concurrent uploads of identical bytes are also resolved safely: the
+    loser of the primary-key race returns False and keeps the winner's object
+    (they are the same bytes), instead of deleting it.
     """
     digest = _valid_digest(document_digest)
     payload = bytes(content)
@@ -181,14 +189,35 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
             if status not in (200, 201):
                 raise DocumentStoreError("store_unusable")
             try:
-                store._conn.execute(
-                    "INSERT INTO pdf_references (tenant_id, owner_subject,"
-                    " document_digest, storage_key, size_bytes)"
-                    " VALUES (%s, %s, %s, %s, %s)",
-                    (tenant_id, owner, digest, key, len(payload)))
+                # Savepoint: a failed INSERT must not abort the outer
+                # transaction, because the race check below still needs to
+                # read.
+                with store._conn.transaction():
+                    store._conn.execute(
+                        "INSERT INTO pdf_references (tenant_id, owner_subject,"
+                        " document_digest, storage_key, size_bytes)"
+                        " VALUES (%s, %s, %s, %s, %s)",
+                        (tenant_id, owner, digest, key, len(payload)))
             except Exception as error:
-                # Fail closed: no success while metadata is missing. The
-                # orphaned object is removed on a best-effort basis.
+                # Concurrent identical upload (IR finding): under READ
+                # COMMITTED a racer can commit the same (tenant, owner,
+                # digest) row after our prior-SELECT and before our INSERT.
+                # The PK then rejects ours - and the bytes both uploads wrote
+                # are the same object the winner's row references. So: if a
+                # row is now there with our size, the race is BENIGN (report
+                # not-created) and the object must NOT be deleted. Only a
+                # genuinely ownerless upload is an orphan worth removing.
+                try:
+                    raced = store._conn.execute(
+                        "SELECT size_bytes FROM pdf_references"
+                        " WHERE tenant_id = %s AND owner_subject = %s"
+                        " AND document_digest = %s",
+                        (tenant_id, owner, digest)).fetchone()
+                except Exception:
+                    raced = None
+                if raced is not None and (raced[0] is None
+                                          or int(raced[0]) == len(payload)):
+                    return False
                 try:
                     store._request("DELETE", key)
                 except Exception:
