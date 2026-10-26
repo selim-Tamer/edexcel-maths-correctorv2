@@ -41,6 +41,7 @@ Reuse it; do not recreate it.
 | 0001 | `schema/postgres_v1.sql` | Creates `schema_meta` + 5 tenant tables, constraints, indexes. Empty initial state. | `schema_meta.schema_version = '1'` | No backout file: v1 is the base. Before any real data, drop the 5 tables in dependency order (`audit_events`, `pdf_references`, `results`, `tenant_membership`, `tenants`, then `schema_meta`); after real data, a dump + approved plan is required. |
 | 0002 | `schema/postgres_v2_tenant_rls.sql` | Creates NOLOGIN group roles `marker_app` / `marker_worker` (attributes **verified**, not altered), least-privilege grants, `anon`/`authenticated` revoke, RLS **ENABLE + FORCE** and `tenant_isolation` on all 5 tenant tables. | `schema_meta.rls_version = '1'` (the adapter's `schema_version` stays `'1'`: table shape unchanged) | `schema/postgres_v2_tenant_rls_rollback.sql` |
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
+| 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
@@ -52,8 +53,11 @@ reviewed code, not an applied change. Applying it needs IR approval of the
 exact SQL **and** separate explicit user authorization, exactly like 0001 and
 0002. Its backout DROPS the job table and every job row in it, so the §2 dump
 and the §2.1 drill are mandatory before it touches a project that holds data.
-The private storage adapter is still a future numbered file, not an edit to
-anything here.
+**0004 is likewise a DRAFT artifact** (`schema/postgres_v4_documents.sql`):
+runtime access to `pdf_references` plus the separate elevated `marker_purge`
+role. Its backout removes ACCESS only - it deletes neither bucket objects nor
+existing metadata rows. Creating the bucket and its service key is operator
+work in `docs/BETA_DEPLOY_SETUP.md`, never code.
 
 ---
 
@@ -178,6 +182,11 @@ grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT/UPDATE;
 grants**, no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
 function. **With 0003 applied too, the same query returns 18 rows**: the
 `marking_jobs` SELECT/INSERT/UPDATE for each runtime role, still zero DELETE.
+**With 0004 as well, 22 rows**: plus `pdf_references` SELECT/INSERT for each
+runtime role - and the separate `marker_purge` role (queried by grantee) holds
+exactly `pdf_references` SELECT + UPDATE and nothing else. **No role in the
+schema holds any DELETE at all**: purge tombstones the row and removes the
+object, so history cannot be trimmed.
 
 ### 4.1 Per-grant justification (every runtime privilege)
 
@@ -198,7 +207,11 @@ statements are the evidence:
 | `audit_events` | DELETE | **no** | **no** | none - deferred to the elevated purge role |
 | `tenants` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
 | `tenant_membership` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
-| `pdf_references` | any | no | no | no shipped PG statement; the documents slice adds its own grant |
+| `pdf_references` (0004) | SELECT | yes | yes | `find_document()` / `put_document()` prior-row check in `supabase_document_store` |
+| `pdf_references` (0004) | INSERT | yes | yes | `put_document()` records digest + object key + size after a successful upload |
+| `pdf_references` (0004) | UPDATE | **no** | **no** | none: the metadata row is immutable |
+| `pdf_references` (0004) | DELETE | **no** | **no** | none: retention runs as the separate elevated `marker_purge` role |
+| `pdf_references` (0004, `marker_purge`) | SELECT, UPDATE | elevated only | - | the retention/purge task: find the tenant's rows and tombstone them (`storage_key = ''`) after the object is deleted. Tenant-bound like everything else; **no DELETE, ever**. |
 | `marking_jobs` (0003) | SELECT | yes | yes | `get_job()`, `find_authorizable_job()`, `claim_job()` |
 | `marking_jobs` (0003) | INSERT | yes | yes | `create_job()` |
 | `marking_jobs` (0003) | UPDATE | yes | yes | `claim_job()` lease/attempt bumps, `succeed_job()`, `settle_failure()` |
@@ -287,11 +300,17 @@ by it, and the runbook is what carries those checks to the real project.
    no worker has ever executed a real job. Discovery is deliberately
    tenant-scoped and explicit (`AI_MARKER_WORKER_TENANTS`), so the worker
    holds no privileged cross-tenant read.
-3. **Private storage adapter.** Bucket/key/validation/retention rules are
-   specified in `docs/BETA_DEPLOY_SETUP.md` §4; the adapter is not written yet.
-   Its retention/purge path needs a **separate elevated role**: the runtime
-   roles intentionally hold no DELETE (`§4.1`), and adding one back to
-   `marker_app`/`marker_worker` is rejected.
+3. **Private storage adapter.** The adapter is drafted:
+   `supabase_document_store.py` keeps bytes in the private bucket and only
+   digest + key + size in `pdf_references`, with schema 0004 granting the
+   runtime roles `SELECT, INSERT` only. Retention runs as the **separate
+   elevated `marker_purge` role** (`SELECT, UPDATE` on `pdf_references` - the
+   tombstone - and nothing else); widening `marker_app`/`marker_worker` stays
+   rejected, and **no role holds any DELETE at all**. What
+   is NOT done: the bucket and its service key are operator work (packet §4),
+   no real storage round trip has ever run, and the purge task itself is not
+   yet scheduled - `delete_document()` is the reviewed verb, its execution is
+   an operational step.
 4. **Membership and documents are still development stores.** They hold no
    PostgreSQL grant yet; each adds its own numbered migration with the same
    justification table when its code lands.

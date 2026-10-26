@@ -68,6 +68,7 @@ import document_store
 import ingest_registry
 import job_store
 import postgres_job_store
+import supabase_document_store
 import marking_engine
 import question_review
 from auth_oidc import OidcError, OidcVerifier
@@ -262,6 +263,18 @@ def _job_api():
     error handling is identical either way.
     """
     return postgres_job_store if postgres_job_store.configured() else job_store
+
+
+def _document_api():
+    """The document store module for THIS process.
+
+    Production: private Supabase Storage + ``pdf_references`` metadata rows
+    (schema 0004) through ``supabase_document_store`` when the bucket
+    composition is configured. Development: the opt-in SQLite store. Per
+    process and per configuration, exactly like ``_job_api``.
+    """
+    return (supabase_document_store if supabase_document_store.configured()
+            else document_store)
 
 
 def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
@@ -751,7 +764,17 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                                           if available else 0.0)}}
 
     def require_document_connection():
-        """Opt-in dev document store, failing closed when unconfigured."""
+        """The document store for THIS process, failing closed when unconfigured.
+
+        Production: the private Supabase Storage adapter (schema 0004) when
+        the bucket composition is configured. Development: the opt-in SQLite
+        store. Neither path creates schema or a bucket.
+        """
+        if supabase_document_store.configured():
+            try:
+                return supabase_document_store.require_connection()
+            except document_store.DocumentStoreError:
+                raise ApiError("store_unusable", "the document store is unusable")
         path = (os.environ.get(document_store.PATH_ENV) or "").strip()
         acknowledged = (os.environ.get(document_store.ACK_ENV) or "").strip() == "1"
         if not path or not acknowledged:
@@ -787,7 +810,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_document_connection()
         try:
             with closing(connection):
-                created = document_store.put_document(
+                created = _document_api().put_document(
                     connection, tenant_id=tenant_id, owner=owner,
                     document_digest=digest, filename=filename or "",
                     page_count=info.get("pages"), content=data)
@@ -816,7 +839,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_document_connection()
         try:
             with closing(connection):
-                content = document_store.find_document(
+                content = _document_api().find_document(
                     connection, tenant_id=tenant_id, owner=owner,
                     document_digest=digest)
         except document_store.DocumentStoreError as failure:
@@ -916,7 +939,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             raise ApiError("payload_invalid",
                            "idempotency_key is not a valid server-safe id")
         with closing(require_document_connection()) as documents:
-            stored = document_store.find_document(
+            stored = _document_api().find_document(
                 documents, tenant_id=tenant_id, owner=owner,
                 document_digest=digest)
         if stored is None:
@@ -979,7 +1002,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                     raise ApiError("model_unavailable",
                                    "no marking engine is configured")
                 with closing(require_document_connection()) as documents:
-                    content = document_store.find_document(
+                    content = _document_api().find_document(
                         documents, tenant_id=tenant_id, owner=owner,
                         document_digest=job["document_digest"])
                 claimed_job, claimed = _job_api().claim_job(

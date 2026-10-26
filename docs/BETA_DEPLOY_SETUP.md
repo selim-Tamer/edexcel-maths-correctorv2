@@ -219,8 +219,10 @@ Retention/deletion proposal (for approval with the adapter):
   event (no silent hard delete);
 * purge runs as a bounded worker task (Supabase Free has no object lifecycle
   rules), with a dry-run mode first;
-* **purge uses a separate elevated role**, created by the retention slice. The
-  runtime roles hold no DELETE on any table (`schema/MIGRATIONS.md` §4.1);
+* **purge uses a separate elevated role**, `marker_purge` (schema 0004,
+  `NOLOGIN` group role with `SELECT, UPDATE` on `pdf_references` only - the
+  tombstone). The runtime roles hold no DELETE on any table
+  (`schema/MIGRATIONS.md` §4.1);
   widening `marker_app`/`marker_worker` is explicitly rejected, and the app
   records deletions as audit events rather than hard-deleting history.
 
