@@ -67,6 +67,7 @@ import document_limits
 import document_store
 import ingest_registry
 import job_store
+import postgres_job_store
 import marking_engine
 import question_review
 from auth_oidc import OidcError, OidcVerifier
@@ -247,6 +248,20 @@ def _default_store_provider() -> Callable[[], Tuple[Optional[object], Optional[s
         return store, None
 
     return provider
+
+
+def _job_api():
+    """The job store module for THIS process.
+
+    Production composition: when ``AI_MARKER_PG_DSN`` is configured, job rows
+    are durable PostgreSQL (schema 0003) through ``postgres_job_store`` - the
+    same lease/attempt semantics and the same error vocabulary as the dev
+    store. Otherwise the opt-in SQLite store is used. The choice is per
+    process and per configuration, never per request, so call sites can use
+    this one facade; both modules share the ``JobStoreError`` class, so the
+    error handling is identical either way.
+    """
+    return postgres_job_store if postgres_job_store.configured() else job_store
 
 
 def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
@@ -490,8 +505,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         if not digest or not owner:
             return False
         try:
-            with closing(job_store.require_connection()) as connection:
-                job_id = job_store.find_authorizable_job(
+            with closing(_job_api().require_connection()) as connection:
+                job_id = _job_api().find_authorizable_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     document_digest=digest)
         except job_store.JobStoreError:
@@ -512,8 +527,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         (finding J-1 prescribed fix, part 2).
         """
         try:
-            with closing(job_store.require_connection()) as connection:
-                job = job_store.get_job(connection, tenant_id=tenant_id,
+            with closing(_job_api().require_connection()) as connection:
+                job = _job_api().get_job(connection, tenant_id=tenant_id,
                                         owner=owner, job_id=job_id)
         except job_store.JobStoreError:
             return False
@@ -813,7 +828,19 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                                  "X-Content-Type-Options": "nosniff"})
 
     def require_job_connection():
-        """Opt-in dev job store, failing closed when unconfigured."""
+        """The job store for THIS process, failing closed when unconfigured.
+
+        Production: durable PostgreSQL (schema 0003) through
+        ``postgres_job_store`` when ``AI_MARKER_PG_DSN`` is configured.
+        Development: the opt-in SQLite store. Neither path creates schema -
+        the operator applies the migrations explicitly - and both keep the
+        store's own fail-closed error codes.
+        """
+        if postgres_job_store.configured():
+            try:
+                return postgres_job_store.require_connection()
+            except job_store.JobStoreError:
+                raise ApiError("store_unusable", "the job store is unusable")
         path = (os.environ.get(job_store.PATH_ENV) or "").strip()
         acknowledged = (os.environ.get(job_store.ACK_ENV) or "").strip() == "1"
         if not path or not acknowledged:
@@ -897,10 +924,10 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_job_connection()
         try:
             with closing(connection):
-                created = job_store.create_job(
+                created = _job_api().create_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     idempotency_key=key, document_digest=digest)
-                current = job_store.get_job(
+                current = _job_api().get_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=created["job_id"])
         except job_store.JobStoreError as failure:
@@ -919,7 +946,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_job_connection()
         try:
             with closing(connection):
-                job = job_store.get_job(connection, tenant_id=tenant_id,
+                job = _job_api().get_job(connection, tenant_id=tenant_id,
                                         owner=owner, job_id=job_id)
         except job_store.JobStoreError as failure:
             raise ApiError(failure.detail, "the job could not be read")
@@ -943,7 +970,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_job_connection()
         try:
             with closing(connection):
-                job = job_store.get_job(connection, tenant_id=tenant_id,
+                job = _job_api().get_job(connection, tenant_id=tenant_id,
                                         owner=owner, job_id=job_id)
                 if job is None:
                     raise ApiError("result_not_registered",
@@ -955,7 +982,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                     content = document_store.find_document(
                         documents, tenant_id=tenant_id, owner=owner,
                         document_digest=job["document_digest"])
-                claimed_job, claimed = job_store.claim_job(
+                claimed_job, claimed = _job_api().claim_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=job_id)
                 if claimed_job is None:
@@ -968,10 +995,10 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                 if content is None:
                     # The store lost the document: settle this attempt with a
                     # static code instead of executing.
-                    job_store.settle_failure(
+                    _job_api().settle_failure(
                         connection, tenant_id=tenant_id, owner=owner,
                         job_id=job_id, error_code="result_not_registered")
-                    return job_payload(job_store.get_job(
+                    return job_payload(_job_api().get_job(
                         connection, tenant_id=tenant_id, owner=owner,
                         job_id=job_id))
                 digest = job["document_digest"]
@@ -985,20 +1012,20 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                         revision="", parts={},
                         runner_job_id=job_id)
                 except ApiError as failure:
-                    job_store.settle_failure(
+                    _job_api().settle_failure(
                         connection, tenant_id=tenant_id, owner=owner,
                         job_id=job_id, error_code=failure.code)
                 except Exception:
                     # Engine/transport failure: static existing-vocabulary
                     # outcome, retried until max_attempts is exhausted.
-                    job_store.settle_failure(
+                    _job_api().settle_failure(
                         connection, tenant_id=tenant_id, owner=owner,
                         job_id=job_id, error_code="service_unavailable")
                 else:
-                    job_store.succeed_job(
+                    _job_api().succeed_job(
                         connection, tenant_id=tenant_id, owner=owner,
                         job_id=job_id, result_id=receipt["result_id"])
-                return job_payload(job_store.get_job(
+                return job_payload(_job_api().get_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=job_id))
         except job_store.JobStoreError as failure:
@@ -1167,5 +1194,11 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             expose_headers=[],
             max_age=600,
         )
+
+    # Internal worker seam, NOT a route: the worker composition executes one
+    # job through this exact reviewed handler - same claim, same engine call,
+    # same registration path, same settle rules - instead of reimplementing
+    # them. Nothing new is exposed over HTTP by this line.
+    app.state.run_marking_job = run_marking_job
 
     return app

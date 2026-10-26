@@ -278,14 +278,15 @@ by it, and the runbook is what carries those checks to the real project.
    itself**: no test has run through `pgbouncer` in transaction mode, so no
    claim is made about a pooled connection until the deployment slice runs
    one.
-2. **Durable worker.** Job PERSISTENCE is now drafted: `schema/postgres_v3_jobs.sql`
-   (0003) + `postgres_job_store.py` port the lease/attempt semantics onto
-   PostgreSQL, with the contract pinned in
-   `tests/test_postgres_job_store_contract.py`. What is still missing is the
-   worker COMPOSITION: the executable that claims a job, runs the engine and
-   settles it (the production shape is Cloud Run Jobs), plus its
-   discovery/across-tenants loop. `POST /v1/jobs/{id}/run` remains the
-   synchronous dev/demo executor.
+2. **Durable worker.** Job PERSISTENCE is drafted (`postgres_v3_jobs.sql` /
+   0003 + `postgres_job_store.py`) and the worker COMPOSITION now exists:
+   `worker.py` claims a job and executes it through the app's own reviewed
+   handler (`app.state.run_marking_job`), so claim/engine/register/settle are
+   one implementation. What remains is operational: the Cloud Run Jobs
+   command in `docs/BETA_DEPLOY_SETUP.md` §5.2 is **prepared, not run**, and
+   no worker has ever executed a real job. Discovery is deliberately
+   tenant-scoped and explicit (`AI_MARKER_WORKER_TENANTS`), so the worker
+   holds no privileged cross-tenant read.
 3. **Private storage adapter.** Bucket/key/validation/retention rules are
    specified in `docs/BETA_DEPLOY_SETUP.md` §4; the adapter is not written yet.
    Its retention/purge path needs a **separate elevated role**: the runtime

@@ -260,6 +260,41 @@ class PostgresJobStoreContractTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reclaimed["attempts"], 2)
 
+    def test_find_runnable_job_picks_queued_and_expired_only(self):
+        job = postgres_job_store.create_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            idempotency_key="key-7", document_digest="a" * 64)
+        found = postgres_job_store.find_runnable_job(
+            self.connection, tenant_id=TENANT, now=1000)
+        self.assertEqual(found["job_id"], job["job_id"])
+        _, claimed = postgres_job_store.claim_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            job_id=job["job_id"], now=1000, lease_seconds=60)
+        self.assertTrue(claimed)
+        # A live lease is not discoverable work.
+        self.assertIsNone(postgres_job_store.find_runnable_job(
+            self.connection, tenant_id=TENANT, now=1030))
+        # An expired lease is: crash recovery.
+        self.assertEqual(postgres_job_store.find_runnable_job(
+            self.connection, tenant_id=TENANT, now=1100)["job_id"],
+            job["job_id"])
+        # And it is invisible to every other tenant.
+        self.assertIsNone(postgres_job_store.find_runnable_job(
+            self.connection, tenant_id=OTHER_TENANT, now=1100))
+
+    def test_env_composed_store_opens_the_production_job_database(self):
+        # The API's job wiring selects postgres_job_store when AI_MARKER_PG_DSN
+        # is configured; prove the selection AND the env opener against real
+        # PostgreSQL (the offline twin is JobApiSelectionTests).
+        from contextlib import closing
+        from api.app import _job_api
+        with mock.patch.dict(os.environ, {"AI_MARKER_PG_DSN": _dsn()}):
+            self.assertIs(_job_api(), postgres_job_store)
+            self.assertTrue(postgres_job_store.configured())
+            with closing(postgres_job_store.require_connection()) as connection:
+                self.assertIsNone(postgres_job_store.find_runnable_job(
+                    connection, tenant_id=TENANT))
+
     def test_claim_of_an_unknown_job_is_not_an_error(self):
         job, ok = postgres_job_store.claim_job(
             self.connection, tenant_id=TENANT, owner=OWNER,

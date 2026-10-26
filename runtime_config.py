@@ -48,6 +48,7 @@ SCHEME_ENV = "AI_MARKER_MARK_SCHEME"
 GEMINI_KEY_ENV = "GEMINI_API_KEY"
 PORT_ENV = "PORT"
 ALLOWED_ORIGINS_ENV = "AI_MARKER_ALLOWED_ORIGINS"
+WORKER_TENANTS_ENV = "AI_MARKER_WORKER_TENANTS"
 
 # Development-only SQLite paths. Any of these being set in the production
 # runtime means the process would serve development storage with production
@@ -96,6 +97,9 @@ CONTRACT: tuple[EnvVar, ...] = (
            "(https only in production; no wildcard)"),
     EnvVar(PORT_ENV, "runtime", False, False,
            "Cloud Run injects the listen port (default 8080)"),
+    EnvVar(WORKER_TENANTS_ENV, "worker", False, False,
+           "comma-separated tenant ids the marking worker serves; discovery "
+           "is explicit - the worker holds no cross-tenant read"),
 )
 
 _SECRET_NAMES = frozenset(item.name for item in CONTRACT if item.secret)
