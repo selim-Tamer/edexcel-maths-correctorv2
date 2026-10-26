@@ -280,39 +280,45 @@ class DocumentsContractTests(unittest.TestCase):
         row write must make the loser a no-op with NO exception, and nothing
         may delete the object the winner's row references.
         """
+        race_digest = "c" * 64
         loser_log = []
         winner_log = []
 
         def winner_transport(method, url, headers, body):
             winner_log.append(method)
-            return 201, b""
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
 
         def loser_transport(method, url, headers, body):
-            with psycopg.connect(_dsn()) as winner_conn:
-                winner = self._store(winner_conn, winner_transport)
-                self.assertTrue(supabase_document_store.put_document(
-                    winner, tenant_id=TENANT, owner=OWNER,
-                    document_digest=DIGEST, filename="", page_count=1,
-                    content=b"%PDF-1.4"))
             loser_log.append(method)
-            return 201, b""
+            if method == "PUT" and not winner_log:
+                # The winner commits its full upload INSIDE our PUT window.
+                with psycopg.connect(_dsn()) as winner_conn:
+                    winner = self._store(winner_conn, winner_transport)
+                    self.assertTrue(supabase_document_store.put_document(
+                        winner, tenant_id=TENANT, owner=OWNER,
+                        document_digest=race_digest, filename="",
+                        page_count=1, content=b"%PDF-1.4"))
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
 
         with psycopg.connect(_dsn()) as loser_conn:
             loser = self._store(loser_conn, loser_transport)
             created = supabase_document_store.put_document(
-                loser, tenant_id=TENANT, owner=OWNER, document_digest=DIGEST,
-                filename="", page_count=1, content=b"%PDF-1.4")
+                loser, tenant_id=TENANT, owner=OWNER,
+                document_digest=race_digest, filename="", page_count=1,
+                content=b"%PDF-1.4")
             self.assertFalse(created)
-            self.assertEqual(loser_log, ["PUT"])
+            self.assertNotIn("DELETE", loser_log + winner_log,
+                             "a race must never delete an object")
             self.assertEqual(winner_log, ["PUT"])
             row = self.setup.execute(
                 "SELECT storage_key, size_bytes FROM pdf_references"
                 " WHERE tenant_id = %s AND document_digest = %s",
-                (TENANT, DIGEST)).fetchone()
+                (TENANT, race_digest)).fetchone()
             self.assertTrue(row[0].startswith("objects/"))
             self.assertEqual(int(row[1]), len(b"%PDF-1.4"))
             found = supabase_document_store.find_document(
-                loser, tenant_id=TENANT, owner=OWNER, document_digest=DIGEST)
+                loser, tenant_id=TENANT, owner=OWNER,
+                document_digest=race_digest)
         self.assertEqual(found, b"%PDF-1.4")
 
     def test_a_metadata_failure_never_deletes_the_object_on_real_postgres(self):
@@ -344,7 +350,7 @@ class DocumentsContractTests(unittest.TestCase):
 
         def transport(method, url, headers, body):
             log.append(method)
-            return 201, b""
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
 
         with psycopg.connect(_dsn()) as connection:
             store = self._store(connection, transport)
