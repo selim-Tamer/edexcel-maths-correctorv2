@@ -140,7 +140,7 @@ class ConfigurationTests(unittest.TestCase):
 class PutDocumentTests(unittest.TestCase):
     def test_put_uploads_then_records_the_metadata_row(self):
         transport = _RecordingTransport(status=201)
-        connection = _FakeConnection(answers=[None])
+        connection = _FakeConnection(answers=[None, ("k",)])
         store = make_store(transport, connection)
         created = supabase_document_store.put_document(
             store, tenant_id="school-a", owner="o", document_digest=DIGEST,
@@ -155,12 +155,15 @@ class PutDocumentTests(unittest.TestCase):
         self.assertNotIn("filename", inserts[0][1])
         self.assertEqual(inserts[0][2][3],
                          storage_key("school-a", "o", DIGEST))
+        # The row write is conflict-safe, not a bare INSERT.
+        self.assertIn("ON CONFLICT", inserts[0][1])
         # The tenant binding comes from the caller, transaction-locally.
         self.assertEqual(connection.bound, ["school-a"])
 
     def test_repeat_upload_is_idempotent_and_touches_nothing(self):
         transport = _RecordingTransport()
-        connection = _FakeConnection(answers=[(7,)])
+        connection = _FakeConnection(
+            answers=[(storage_key("school-a", "o", DIGEST), 7)])
         store = make_store(transport, connection)
         created = supabase_document_store.put_document(
             store, tenant_id="school-a", owner="o", document_digest=DIGEST,
@@ -169,7 +172,8 @@ class PutDocumentTests(unittest.TestCase):
         self.assertEqual(transport.calls, [])
 
     def test_size_mismatch_on_an_existing_row_fails_closed(self):
-        connection = _FakeConnection(answers=[(7,)])
+        connection = _FakeConnection(
+            answers=[(storage_key("school-a", "o", DIGEST), 7)])
         store = make_store(_RecordingTransport(), connection)
         with self.assertRaises(DocumentStoreError):
             supabase_document_store.put_document(
@@ -178,7 +182,7 @@ class PutDocumentTests(unittest.TestCase):
 
     def test_oversized_content_is_refused_before_any_upload(self):
         transport = _RecordingTransport()
-        store = make_store(transport, _FakeConnection(answers=[None]))
+        store = make_store(transport, _FakeConnection(answers=[None, ("k",)]))
         with self.assertRaises(DocumentStoreError) as caught:
             supabase_document_store.put_document(
                 store, tenant_id="school-a", owner="o", document_digest=DIGEST,
@@ -187,50 +191,47 @@ class PutDocumentTests(unittest.TestCase):
         self.assertIn("document_too_large", str(caught.exception))
         self.assertEqual(transport.calls, [])
 
-    def test_a_failed_metadata_write_deletes_the_orphan_and_fails(self):
+    def test_a_failed_metadata_write_never_deletes_the_object(self):
+        # Compensation policy (Mr.G review): a failing row write must NOT
+        # delete the object - a winner may be committing (or invisible) right
+        # now, and deleting its bytes is unrecoverable. Orphan objects are
+        # private garbage for the retention sweep.
         transport = _RecordingTransport(status=201)
-        # prior-SELECT: no row; re-SELECT after the INSERT failure: still no
-        # row - so the upload really is an orphan.
-        connection = _FakeConnection(answers=[None, None],
-                                     fail_on=("INSERT INTO",))
+        connection = _FakeConnection(answers=[None], fail_on=("INSERT INTO",))
         store = make_store(transport, connection)
         with self.assertRaises(DocumentStoreError):
             supabase_document_store.put_document(
                 store, tenant_id="school-a", owner="o", document_digest=DIGEST,
                 filename="", page_count=None, content=b"%PDF-1.4")
-        self.assertEqual([c["method"] for c in transport.calls],
-                         ["PUT", "DELETE"])
+        self.assertEqual([c["method"] for c in transport.calls], ["PUT"],
+                         "no compensation delete is ever allowed")
 
     def test_a_concurrent_identical_upload_is_benign_and_keeps_the_object(self):
-        # IR finding: under READ COMMITTED a racer can commit the same
-        # (tenant, owner, digest) row between our prior-SELECT and our INSERT.
-        # The loser must report "not created" and must NOT delete the object
-        # the winner's row references - that would leave row-without-object
-        # and a document permanently unavailable to a retry.
+        # IR finding: two concurrent uploads of identical bytes. The conflict
+        # -safe write makes the loser a no-op (RETURNING yields no row), so it
+        # reports "not created" and keeps the object the winner references.
         transport = _RecordingTransport(status=201)
-        connection = _FakeConnection(answers=[None, (7,)],
-                                     fail_on=("INSERT INTO",))
+        connection = _FakeConnection(answers=[None, None])
         store = make_store(transport, connection)
         created = supabase_document_store.put_document(
             store, tenant_id="school-a", owner="o", document_digest=DIGEST,
             filename="", page_count=None, content=b"1234567")
         self.assertFalse(created)
         self.assertEqual([c["method"] for c in transport.calls], ["PUT"],
-                         "the winner's object must survive the loser's error")
+                         "the winner's object must survive the loser's write")
 
-    def test_a_raced_row_with_a_different_size_still_fails_closed(self):
-        # A row appearing with a DIFFERENT size is not a benign race: the
-        # store is inconsistent, so the orphan is removed and the call fails.
+    def test_a_tombstoned_document_is_revived_by_a_reupload(self):
+        # After a purge the row is a tombstone (storage_key = ''). A new
+        # upload of the same bytes must re-establish availability instead of
+        # reporting "already present" for a document whose bytes are gone.
         transport = _RecordingTransport(status=201)
-        connection = _FakeConnection(answers=[None, (99,)],
-                                     fail_on=("INSERT INTO",))
+        connection = _FakeConnection(answers=[("", None), ("k",)])
         store = make_store(transport, connection)
-        with self.assertRaises(DocumentStoreError):
-            supabase_document_store.put_document(
-                store, tenant_id="school-a", owner="o", document_digest=DIGEST,
-                filename="", page_count=None, content=b"1234567")
-        self.assertEqual([c["method"] for c in transport.calls],
-                         ["PUT", "DELETE"])
+        created = supabase_document_store.put_document(
+            store, tenant_id="school-a", owner="o", document_digest=DIGEST,
+            filename="", page_count=None, content=b"%PDF-1.4")
+        self.assertTrue(created)
+        self.assertEqual([c["method"] for c in transport.calls], ["PUT"])
 
 
 class FindDocumentTests(unittest.TestCase):
