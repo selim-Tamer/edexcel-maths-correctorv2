@@ -219,6 +219,11 @@ Retention/deletion proposal (for approval with the adapter):
   event (no silent hard delete);
 * purge runs as a bounded worker task (Supabase Free has no object lifecycle
   rules), with a dry-run mode first;
+* the sweep also removes **orphan objects** (an object with no `pdf_references`
+  row). Upload compensation deliberately never deletes: a failed upload leaves
+  private garbage at worst, because deleting could remove bytes a concurrent
+  winner's row references - unrecoverable. Only the sweep (and the documented
+  delete verb) ever deletes objects;
 * **purge uses a separate elevated role**, `marker_purge` (schema 0004,
   `NOLOGIN` group role with `SELECT, UPDATE` on `pdf_references` only - the
   tombstone). The runtime roles hold no DELETE on any table

@@ -22,13 +22,17 @@ Security posture:
   API validates through ``document_limits`` first);
 * the tenant binding is transaction-local and taken from the caller's verified
   identity, never from a request field;
-* a failed metadata write after a successful upload is fail-closed: the
-  orphaned object is deleted on a best-effort basis and the call reports
-  ``store_unusable`` rather than returning success. The ONE exception is the
-  benign concurrent-upload race (IR finding): if the row that rejected our
-  INSERT now exists with our size, another upload of identical bytes won and
-  its row references the very object we uploaded - we report ``False`` and
-  never delete it.
+* a failed metadata write after a successful upload is fail-closed and the
+  call reports ``store_unusable`` - and the object is **never deleted as
+  compensation**. Deleting is the one action that can turn a race into an
+  unrecoverable row-without-object, so a failed upload leaves private bucket
+  garbage at worst (removed by the retention/purge sweep) and deletion happens
+  in exactly one place: ``delete_document``.
+* concurrent uploads are resolved WITHOUT a failing insert: the write is an
+  ``ON CONFLICT ... DO UPDATE ... WHERE storage_key = '' RETURNING`` - a
+  conflicting LIVE row means another upload of identical bytes already won
+  (same digest = same bytes), so the caller reports ``False`` and the object
+  both wrote is kept; only a tombstoned row is revived.
 
 NOTHING here is deployed or provisioned: the bucket, its service key and the
 operator roles are created by the reviewed setup packet, not by this code.
@@ -165,9 +169,11 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
     accepted for interface parity with the dev store and are deliberately NOT
     stored: ``pdf_references`` keeps digest + key + size only.
 
-    Two concurrent uploads of identical bytes are also resolved safely: the
-    loser of the primary-key race returns False and keeps the winner's object
-    (they are the same bytes), instead of deleting it.
+    Two concurrent uploads of identical bytes are also resolved safely and
+    without any exception path: the row write is
+    ``ON CONFLICT ... DO UPDATE ... WHERE storage_key = '' RETURNING``, so a
+    conflicting LIVE row (the winner) makes ours a no-op - we return False and
+    keep the object both uploads wrote - while a tombstoned row is revived.
     """
     digest = _valid_digest(document_digest)
     payload = bytes(content)
@@ -178,55 +184,50 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
         with store._conn.transaction():
             store._bind(tenant_id)
             prior = store._conn.execute(
-                "SELECT size_bytes FROM pdf_references WHERE tenant_id = %s"
-                " AND owner_subject = %s AND document_digest = %s",
+                "SELECT storage_key, size_bytes FROM pdf_references"
+                " WHERE tenant_id = %s AND owner_subject = %s"
+                " AND document_digest = %s",
                 (tenant_id, owner, digest)).fetchone()
-            if prior is not None:
-                if prior[0] is not None and int(prior[0]) != len(payload):
+            if prior is not None and str(prior[0]):
+                # A LIVE row: idempotent repeat. A size mismatch means the
+                # store itself is inconsistent, so it fails closed.
+                if prior[1] is not None and int(prior[1]) != len(payload):
                     raise DocumentStoreError("store_unusable")
                 return False
+            # No live row: either unknown, or tombstoned by a purge (a
+            # re-upload re-establishes availability - the tombstone history
+            # stays in the audit events).
             status, _ = store._request("PUT", key, payload)
             if status not in (200, 201):
                 raise DocumentStoreError("store_unusable")
-            try:
-                # Savepoint: a failed INSERT must not abort the outer
-                # transaction, because the race check below still needs to
-                # read.
-                with store._conn.transaction():
-                    store._conn.execute(
-                        "INSERT INTO pdf_references (tenant_id, owner_subject,"
-                        " document_digest, storage_key, size_bytes)"
-                        " VALUES (%s, %s, %s, %s, %s)",
-                        (tenant_id, owner, digest, key, len(payload)))
-            except Exception as error:
-                # Concurrent identical upload (IR finding): under READ
-                # COMMITTED a racer can commit the same (tenant, owner,
-                # digest) row after our prior-SELECT and before our INSERT.
-                # The PK then rejects ours - and the bytes both uploads wrote
-                # are the same object the winner's row references. So: if a
-                # row is now there with our size, the race is BENIGN (report
-                # not-created) and the object must NOT be deleted. Only a
-                # genuinely ownerless upload is an orphan worth removing.
-                try:
-                    raced = store._conn.execute(
-                        "SELECT size_bytes FROM pdf_references"
-                        " WHERE tenant_id = %s AND owner_subject = %s"
-                        " AND document_digest = %s",
-                        (tenant_id, owner, digest)).fetchone()
-                except Exception:
-                    raced = None
-                if raced is not None and (raced[0] is None
-                                          or int(raced[0]) == len(payload)):
-                    return False
-                try:
-                    store._request("DELETE", key)
-                except Exception:
-                    pass
-                raise DocumentStoreError("store_unusable") from error
+            inserted = store._conn.execute(
+                "INSERT INTO pdf_references (tenant_id, owner_subject,"
+                " document_digest, storage_key, size_bytes)"
+                " VALUES (%s, %s, %s, %s, %s)"
+                " ON CONFLICT (tenant_id, owner_subject, document_digest)"
+                " DO UPDATE SET storage_key = EXCLUDED.storage_key,"
+                " size_bytes = EXCLUDED.size_bytes"
+                " WHERE pdf_references.storage_key = ''"
+                " RETURNING storage_key",
+                (tenant_id, owner, digest, key, len(payload))).fetchone()
+            if inserted is None:
+                # CONFLICT-SAFE BENIGN RACE (IR finding, hardened per review):
+                # a LIVE row for these exact (tenant, owner, digest) already
+                # exists. Same digest means the same bytes, so the object both
+                # uploads wrote is the one that row references - report
+                # "not created" and KEEP it.
+                return False
             return True
     except DocumentStoreError:
         raise
     except Exception as error:
+        # Fail closed. Note what does NOT happen here: the object is NEVER
+        # deleted as compensation. A failing INSERT can race a winner whose
+        # row is not committed yet (or not visible yet), so any delete could
+        # remove bytes a successful transaction references - an unrecoverable
+        # row-without-object. Orphan objects are private bucket garbage at
+        # worst and are removed by the retention/purge sweep, never by this
+        # path. Deletion happens in exactly one place: ``delete_document``.
         raise DocumentStoreError("store_unusable") from error
 
 

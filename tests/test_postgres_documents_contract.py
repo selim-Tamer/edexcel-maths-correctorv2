@@ -30,6 +30,9 @@ try:
 except ImportError:  # pragma: no cover - driver ships in the test manifest
     psycopg = None
 
+import supabase_document_store
+from document_store import DocumentStoreError
+
 DSN = os.environ.get("AI_MARKER_TEST_PG_DSN", "").strip()
 ROOT = Path(__file__).resolve().parents[1]
 TEST_DB = "marker_docs_ci"
@@ -38,6 +41,8 @@ TENANT = "school-docs-a"
 OTHER_TENANT = "school-docs-b"
 OWNER = "google:teacher-a"
 OTHER_OWNER = "google:teacher-b"
+DIGEST = "a" * 64
+OTHER_DIGEST = "b" * 64
 
 APP_ROLE = "marker_docs_app_ci"
 PURGE_ROLE = "marker_docs_purge_ci"
@@ -259,6 +264,144 @@ class DocumentsContractTests(unittest.TestCase):
             " WHERE grantee = 'marker_purge' ORDER BY 1, 2").fetchall()
         self.assertEqual(grants, [("pdf_references", "SELECT"),
                                   ("pdf_references", "UPDATE")])
+
+    # -- real-PostgreSQL concurrency (adapter + scripted transport) --------
+    def _store(self, connection, transport):
+        return supabase_document_store.SupabaseDocumentStore(
+            url="https://dbx.supabase.co", service_key="service-key",
+            bucket="marker-pdfs", connection=connection, transport=transport)
+
+    def test_the_upload_race_is_benign_on_real_postgres(self):
+        """The winner commits INSIDE the loser's upload window.
+
+        Deterministic two-connection race on real PostgreSQL: the competitor's
+        complete upload runs in the loser's transport call - exactly the window
+        where a winner commits after the loser's prior-check. The conflict-safe
+        row write must make the loser a no-op with NO exception, and nothing
+        may delete the object the winner's row references.
+        """
+        race_digest = "c" * 64
+        loser_log = []
+        winner_log = []
+
+        def winner_transport(method, url, headers, body):
+            winner_log.append(method)
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
+
+        def loser_transport(method, url, headers, body):
+            loser_log.append(method)
+            if method == "PUT" and not winner_log:
+                # The winner commits its full upload INSIDE our PUT window.
+                with psycopg.connect(_dsn()) as winner_conn:
+                    winner = self._store(winner_conn, winner_transport)
+                    self.assertTrue(supabase_document_store.put_document(
+                        winner, tenant_id=TENANT, owner=OWNER,
+                        document_digest=race_digest, filename="",
+                        page_count=1, content=b"%PDF-1.4"))
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
+
+        with psycopg.connect(_dsn()) as loser_conn:
+            loser = self._store(loser_conn, loser_transport)
+            created = supabase_document_store.put_document(
+                loser, tenant_id=TENANT, owner=OWNER,
+                document_digest=race_digest, filename="", page_count=1,
+                content=b"%PDF-1.4")
+            self.assertFalse(created)
+            self.assertNotIn("DELETE", loser_log + winner_log,
+                             "a race must never delete an object")
+            self.assertEqual(winner_log, ["PUT"])
+            row = self.setup.execute(
+                "SELECT storage_key, size_bytes FROM pdf_references"
+                " WHERE tenant_id = %s AND document_digest = %s",
+                (TENANT, race_digest)).fetchone()
+            self.assertTrue(row[0].startswith("objects/"))
+            self.assertEqual(int(row[1]), len(b"%PDF-1.4"))
+            found = supabase_document_store.find_document(
+                loser, tenant_id=TENANT, owner=OWNER,
+                document_digest=race_digest)
+        self.assertEqual(found, b"%PDF-1.4")
+
+    def test_a_metadata_failure_never_deletes_the_object_on_real_postgres(self):
+        # No membership row for this owner: the INSERT fails on the foreign
+        # key and the transaction aborts. Even then the compensation path
+        # must not delete the uploaded object - a concurrent winner may be
+        # referencing it.
+        log = []
+
+        def transport(method, url, headers, body):
+            log.append(method)
+            return 201, b""
+
+        with psycopg.connect(_dsn()) as connection:
+            store = self._store(connection, transport)
+            with self.assertRaises(DocumentStoreError):
+                supabase_document_store.put_document(
+                    store, tenant_id="school-docs-c", owner="google:teacher-c",
+                    document_digest=OTHER_DIGEST, filename="", page_count=1,
+                    content=b"%PDF-1.4")
+        self.assertEqual(log, ["PUT"], "a failed write must never delete")
+
+    def test_an_inflight_winner_is_never_deleted_on_real_postgres(self):
+        # The case a re-SELECT cannot fix (IR/Mr.G): connection A holds an
+        # UNCOMMITTED insert, so under READ COMMITTED our write cannot see it,
+        # blocks on its lock, and with lock_timeout the write FAILS. Even
+        # then nothing may delete: those bytes belong to A's row, which may
+        # commit at any moment. A then rolls back - neither side committed a
+        # reference and the object is an orphan for the retention sweep.
+        in_flight = "d" * 64
+        log = []
+
+        def transport(method, url, headers, body):
+            log.append(method)
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
+
+        holder = psycopg.connect(_dsn())
+        self.addCleanup(holder.close)
+        holder.execute(
+            "INSERT INTO pdf_references (tenant_id, owner_subject,"
+            " document_digest, storage_key, size_bytes)"
+            " VALUES (%s, %s, %s, %s, 8)",
+            (TENANT, OWNER, in_flight,
+             f"objects/{'7' * 40}/{in_flight}.pdf"))
+        try:
+            with psycopg.connect(_dsn()) as connection:
+                connection.execute("SET lock_timeout = '2000'")
+                store = self._store(connection, transport)
+                with self.assertRaises(DocumentStoreError):
+                    supabase_document_store.put_document(
+                        store, tenant_id=TENANT, owner=OWNER,
+                        document_digest=in_flight, filename="", page_count=1,
+                        content=b"%PDF-1.4")
+            self.assertEqual(log, ["PUT"],
+                             "an in-flight winner's object must never be "
+                             "deleted")
+        finally:
+            holder.rollback()
+        self.assertIsNone(self.setup.execute(
+            "SELECT 1 FROM pdf_references WHERE document_digest = %s",
+            (in_flight,)).fetchone())
+
+    def test_a_tombstoned_document_is_revived_by_a_reupload(self):
+        self.setup.execute(
+            "UPDATE pdf_references SET storage_key = '', size_bytes = NULL"
+            " WHERE tenant_id = %s AND document_digest = %s",
+            (TENANT, DIGEST))
+        log = []
+
+        def transport(method, url, headers, body):
+            log.append(method)
+            return (200, b"%PDF-1.4") if method == "GET" else (201, b"")
+
+        with psycopg.connect(_dsn()) as connection:
+            store = self._store(connection, transport)
+            created = supabase_document_store.put_document(
+                store, tenant_id=TENANT, owner=OWNER, document_digest=DIGEST,
+                filename="", page_count=1, content=b"%PDF-1.4")
+            self.assertTrue(created)
+            found = supabase_document_store.find_document(
+                store, tenant_id=TENANT, owner=OWNER, document_digest=DIGEST)
+        self.assertEqual(found, b"%PDF-1.4")
+        self.assertEqual(log, ["PUT", "GET"])
 
     # -- backout ----------------------------------------------------------
     def test_zz_rollback_restores_the_0002_posture_then_reapplies(self):
