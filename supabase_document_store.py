@@ -262,7 +262,7 @@ def find_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
 
 def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
                     owner: str, document_digest: str) -> bool:
-    """RETENTION/PURGE verb: remove the bytes, keep the digest tombstone.
+    """RETENTION/PURGE verb: tombstone the row, best-effort remove the bytes.
 
     The reviewed retention proposal deletes the object and KEEPS the
     ``pdf_references`` row as a tombstone for audit ("deletion removes the
@@ -270,10 +270,20 @@ def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
     ``storage_key = ''`` instead of deleting it - which is why NO role in the
     schema holds any DELETE at all. Idempotent: purging twice is a no-op.
 
+    Ordering (IR review of the setup packet, finding C, 2026-10-26): the
+    tombstone UPDATE commits in a short transaction FIRST - row locks are
+    never held across the Storage network call - and the object DELETE runs
+    afterwards, best-effort, under the deterministically recomputed key
+    (never a stored key). A crash or storage failure after the commit
+    leaves tombstone + orphan object: reads miss, ``put_document``'s
+    tombstone-revive accepts a re-upload, and the retention sweep reclaims
+    the orphan. A crash before the commit leaves everything unchanged.
+    Nothing after the commit can fail this call.
+
     Must run as the separate elevated role (``marker_purge``, 0004). Tenant-
     bound like everything else: a purge is per tenant with the binding set,
     never a privileged cross-tenant delete. Returns True when this call
-    removed the object.
+    tombstoned the row; the byte removal is best-effort by design.
     """
     digest = _valid_digest(document_digest)
     key = storage_key(tenant_id, owner, digest)
@@ -286,19 +296,23 @@ def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
                 (tenant_id, owner, digest)).fetchone()
             if row is None or not str(row[0]):
                 return False
-            status, _ = store._request("DELETE", str(row[0]))
-            if status not in (200, 204, 404):
-                raise DocumentStoreError("store_unusable")
             store._conn.execute(
                 "UPDATE pdf_references SET storage_key = '', size_bytes = NULL"
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND document_digest = %s",
                 (tenant_id, owner, digest))
-            return True
     except DocumentStoreError:
         raise
     except Exception as error:
         raise DocumentStoreError("store_unusable") from error
+    # Post-commit and best-effort (never a stored key, no row read needed):
+    # the tombstone already committed, so a Storage 404 counts as
+    # already-deleted and any failure leaves a sweep-cleanable orphan.
+    try:
+        store._request("DELETE", key)
+    except Exception:
+        pass
+    return True
 
 
 def close_quietly(store) -> None:

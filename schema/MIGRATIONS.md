@@ -211,7 +211,7 @@ statements are the evidence:
 | `pdf_references` (0004) | INSERT | yes | yes | `put_document()` records digest + object key + size after a successful upload |
 | `pdf_references` (0004) | UPDATE | **no** | **no** | none: the metadata row is immutable |
 | `pdf_references` (0004) | DELETE | **no** | **no** | none: retention runs as the separate elevated `marker_purge` role |
-| `pdf_references` (0004, `marker_purge`) | SELECT, UPDATE | elevated only | - | the retention/purge task: find the tenant's rows and tombstone them (`storage_key = ''`) after the object is deleted. Tenant-bound like everything else; **no DELETE, ever**. |
+| `pdf_references` (0004, `marker_purge`) | SELECT, UPDATE | elevated only | - | the retention/purge task: find the tenant's rows and tombstone them (`storage_key = ''`) - the tombstone commits first in a short transaction, then the object DELETE runs best-effort under the recomputed key (a crash between the two leaves a sweep-cleanable orphan; `put_document`'s tombstone-revive accepts a re-upload). Tenant-bound like everything else; **no DELETE, ever**. |
 | `marking_jobs` (0003) | SELECT | yes | yes | `get_job()`, `find_authorizable_job()`, `claim_job()` |
 | `marking_jobs` (0003) | INSERT | yes | yes | `create_job()` |
 | `marking_jobs` (0003) | UPDATE | yes | yes | `claim_job()` lease/attempt bumps, `succeed_job()`, `settle_failure()` |
