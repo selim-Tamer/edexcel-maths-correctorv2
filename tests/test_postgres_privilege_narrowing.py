@@ -135,17 +135,25 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
             (role, column, privilege)).fetchone()[0]
 
     def _explicit_column_grant(self, role, column, privilege="UPDATE"):
-        """Is there a COLUMN-scoped grant row (not implied by table UPDATE)?
+        """Is there a COLUMN-scoped grant (not implied by table UPDATE)?
 
         ``has_column_privilege`` answers "can this role update this column",
-        which a table-wide grant also satisfies. To tell the narrowed shape
-        apart from the 0002 shape we need the explicit grant row itself.
+        which a table-wide grant also satisfies, and
+        ``information_schema.role_column_grants`` expands table-level grants
+        into per-column rows - so neither distinguishes the 0006 shape from the
+        0002 shape. The real discriminator is the column ACL itself:
+        ``pg_attribute.attacl`` carries ONLY column-level grants.
         """
         row = self._database_admin().execute(
-            "SELECT 1 FROM information_schema.role_column_grants"
-            " WHERE grantee = %s AND table_name = 'results'"
-            " AND column_name = %s AND privilege_type = %s",
-            (role, column, privilege)).fetchone()
+            "SELECT 1 FROM pg_attribute a"
+            " JOIN pg_class c ON c.oid = a.attrelid"
+            " JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " CROSS JOIN LATERAL aclexplode(a.attacl) AS x"
+            " JOIN pg_roles r ON r.oid = x.grantee"
+            " WHERE n.nspname = 'public' AND c.relname = 'results'"
+            " AND a.attname = %s AND r.rolname = %s"
+            " AND x.privilege_type = %s",
+            (column, role, privilege)).fetchone()
         return row is not None
 
     # --- the grant itself -------------------------------------------------
