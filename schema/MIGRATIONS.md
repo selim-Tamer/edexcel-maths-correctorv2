@@ -42,11 +42,17 @@ Reuse it; do not recreate it.
 | 0002 | `schema/postgres_v2_tenant_rls.sql` | Creates NOLOGIN group roles `marker_app` / `marker_worker` (attributes **verified**, not altered), least-privilege grants, `anon`/`authenticated` revoke, RLS **ENABLE + FORCE** and `tenant_isolation` on all 5 tenant tables. | `schema_meta.rls_version = '1'` (the adapter's `schema_version` stays `'1'`: table shape unchanged) | `schema/postgres_v2_tenant_rls_rollback.sql` |
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
+| 0006 | `schema/postgres_v6_assignments.sql` | Server-owned teacher `assignments`: server-minted `assignment_id`, unique `(tenant_id, owner_subject, idempotency_key)`, title 1..200, created_at epoch. RLS **ENABLE + FORCE** + `tenant_isolation`; `SELECT, INSERT` for `marker_app` and **no UPDATE / no DELETE** in v1.2. | `schema_meta.assignments_version = '1'` | `schema/postgres_v6_assignments_rollback.sql` (drops the table and therefore every assignment row - dump first) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
 Those tables are new to this project and the Data API stays disabled; if that
 ever changes, re-grant explicitly and record why.
+
+**Numbering note:** `0005` is the membership-access migration
+(`schema/postgres_v5_membership_access.sql`), which lands on its own branch/PR.
+`0006` is deliberately numbered above it so neither PR can collide; 0006
+requires only the 0001-0004 base and does not depend on 0005.
 
 **0003 is a DRAFT artifact** (`schema/postgres_v3_jobs.sql`): the file is
 reviewed code, not an applied change. Applying it needs IR approval of the

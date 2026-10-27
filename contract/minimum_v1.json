@@ -1,16 +1,16 @@
 {
   "spec": {
     "name": "ai-maths-marker-minimum-v1",
-    "version": "1.1.0",
-    "status": "AGREED",
-    "confirmed_by": "2d206cc3-69d8-4b22-8859-cd08d6634612",
-    "confirmed_at": "2026-10-26",
-    "confirmed_scope": "v1.1: FCM confirmed the durable-worker trigger wording in message 2d206cc3-69d8-4b22-8859-cd08d6634612: row 5 (POST /v1/jobs/{job_id}/run, synchronous and lease-guarded) is kept exactly as agreed in v1.0 (confirmed_by 68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d); the added clarification states that a queued job is executed by the durable worker when triggered (operator or scheduler: Cloud Scheduler -> gcloud run jobs execute marker-worker) and that the client's recovery path is polling GET /v1/jobs/{job_id} with backoff 1s, 2s, 4s, then 5s, stopping at ~2 minutes and rendering last-known state. Self-trigger (alternative a) and no-trigger (alternative b) were explicitly rejected by FCM. No route was added, removed or changed by v1.1. Any change to a row needs a new numbered contract version confirmed by BOTH owners.",
+    "version": "1.2.0",
+    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
+    "confirmed_by": "",
+    "confirmed_at": null,
+    "confirmed_scope": "v1.2 PROPOSED by CM (backend) and NOT yet agreed: both owners must confirm this exact version in writing (FCM for the browser client, CM for the runtime routes), and the artifact may only become AGREED with both message ids recorded. Change from v1.1: (a) createAssignment becomes a server route - POST /v1/assignments and GET /v1/assignments; (b) the assignment row, wire fields, server-minted assignment_id, required idempotency key and keyset pagination are pinned in the assignments section; (c) the projection question fields review_status / corrected / last_action / last_reason are pinned as optional carry-through with absent-means-omit; (d) richer scheme evidence (per-question mark-scheme lines, A/M/B annotations, any other engine field) is explicitly OUT of v1.2 and needs a separate owner-approved scope. No other row changes.",
     "owners": {
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
     },
-    "backend_commit": "584f450 (route table unchanged since 2077b16)",
+    "backend_commit": "feature/assignments-v1.2 branch head (recorded in PR); route table adds the two assignment routes only",
     "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
     "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
     "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
@@ -18,18 +18,22 @@
       "src/api/fetchClient.ts and src/api/types.ts in the frontend clone (the actual live calls)",
       "api/app.py route table at this backend commit",
       "IFR live-beta integration audit 48e7e28 (P0/P1 list)"
-    ]
+    ],
+    "prior_confirmation": {
+      "version": "1.1.0",
+      "confirmed_by": "2d206cc3-69d8-4b22-8859-cd08d6634612",
+      "confirmed_at": "2026-10-26"
+    }
   },
-
   "principles": [
     "Errors use the existing backend vocabulary; the frontend maps codes, it does not invent response shapes.",
     "The client never chooses a job id, result id, owner or tenant.",
     "A retry is the same job: no new idempotency key and no new document digest.",
     "Server-owned state is limited to documents, jobs, results, decisions and events. Assignment/draft/queue UI state stays on the device.",
     "No wildcard CORS, no browser-visible bucket URL, no signed URL in the beta slice.",
-    "No deployment, migration, cloud activation or paid engine call is part of this contract."
+    "No deployment, migration, cloud activation or paid engine call is part of this contract.",
+    "The client never chooses an assignment id either: it sends an idempotency key and the server mints assignment_id. Replaying the key returns the same assignment; reusing it for a different title is a 409."
   ],
-
   "server_routes": [
     {
       "method": "GET",
@@ -100,16 +104,33 @@
       "implemented": true,
       "auth": "bearer",
       "purpose": "Append-only decision stream for one result."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/assignments",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Create or replay one server-owned teacher assignment. Body {idempotency_key, title}. tenant/owner come only from the verified token; assignment_id is minted server-side (asg_ + 24 hex). 201 {assignment_id,title,created_at}; 200 same body on same-key/same-title replay; 409 idempotency_key_payload_mismatch on same key with a different title; 400 payload_invalid for a blank/over-200 title or a malformed key."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/assignments",
+      "implemented": true,
+      "auth": "bearer",
+      "purpose": "Newest-first page of THIS owner's assignments (owner_subject, mirroring documents ownership; a tenant-wide teacher view would be an additive later version). ?limit=1..100 (default 50) and an opaque ?cursor= from the previous page. 200 {assignments:[{assignment_id,title,created_at}], next_cursor: string|null}; 400 payload_invalid for a malformed cursor."
     }
   ],
-
   "frontend_calls": [
     {
       "client_method": "createAssignment",
       "client_route": "POST /v1/assignments",
-      "disposition": "client_owned",
-      "server_route": null,
-      "justification": "No assignment resource exists server-side and beta does not add one. The Assignment object is local state with a client-generated id."
+      "disposition": "mapped",
+      "server_route": {
+        "method": "POST",
+        "path": "/v1/assignments"
+      },
+      "justification": "v1.2: the assignment row is now server-owned so it survives a reload and a second device. The client sends title + idempotency key only; the server mints assignment_id and derives tenant/owner from the verified token.",
+      "list_route": "GET /v1/assignments"
     },
     {
       "client_method": "authorizeUpload",
@@ -200,7 +221,6 @@
       "justification": "1:1."
     }
   ],
-
   "durable_worker_trigger": {
     "row_5_unchanged": "v1.1 changes no row: browser retry still drives the synchronous, lease-guarded POST /v1/jobs/{job_id}/run. A second call while the lease is live is refused.",
     "executor": "A queued job is executed by the durable worker (worker.py, one job per Cloud Run Jobs invocation) when triggered by the operator or a scheduler: Cloud Scheduler -> gcloud run jobs execute marker-worker. The trigger is operator infrastructure; it is not a client responsibility and not a server route.",
@@ -208,23 +228,26 @@
     "rejected_alternatives": "Self-trigger from the API (a) and no operational trigger (b) are not part of this contract; FCM explicitly refused both.",
     "confirmed_by": "2d206cc3-69d8-4b22-8859-cd08d6634612"
   },
-
   "identity": {
     "token": "Google ID token in Authorization: Bearer; verified server-side against GOOGLE_OIDC_AUDIENCE.",
     "tenant_and_owner": "Derived only from verified subject + active membership. Never accepted from the client.",
     "question_number_wire_type": "string",
-    "question_number_backend_accepts": ["string", "integer"],
+    "question_number_backend_accepts": [
+      "string",
+      "integer"
+    ],
     "question_number_normalisation": "stripped string; booleans, empty and >256 characters are refused",
-    "submission_identity": "submissionId == result_id returned by the job"
+    "submission_identity": "submissionId == result_id returned by the job",
+    "assignment_identity": "assignment_id is minted by the server (asg_ + 24 lowercase hex) and is echoed to the client; the client never supplies it. tenant_id and owner_subject are derived from the verified token only."
   },
-
   "idempotency": {
     "job_key_rule": "job-<first 32 hex chars of sha256(assignmentId + '|' + studentRef + '|' + document_digest)>",
     "regenerate_only_when": "document_digest changes (a new upload is a new job)",
     "retry_rule": "a retry is POST /v1/jobs/{job_id}/run with no new key",
-    "decision_key_rule": "client-generated per (result_id, question_number, intended payload); replaying the same key with a different payload is refused with idempotency_key_payload_mismatch"
+    "decision_key_rule": "client-generated per (result_id, question_number, intended payload); replaying the same key with a different payload is refused with idempotency_key_payload_mismatch",
+    "assignment_key_rule": "client-generated per intended (title) payload; same key + same title returns the SAME assignment (200), same key + different title is refused with idempotency_key_payload_mismatch (409)",
+    "assignment_lookup_rule": "the key is scoped to (tenant_id, owner_subject), so two teachers using the same literal key get different assignments"
   },
-
   "error_contract": {
     "envelope": {
       "error": {
@@ -234,8 +257,13 @@
       }
     },
     "auth": {
-      "401": ["authentication_required"],
-      "403": ["tenant_membership_required", "manual_document_provenance_required"],
+      "401": [
+        "authentication_required"
+      ],
+      "403": [
+        "tenant_membership_required",
+        "manual_document_provenance_required"
+      ],
       "rule": "403 tenant_membership_required is a membership problem, NOT an expired session. The client must not sign the user out or treat it as a retryable auth error."
     },
     "conflict_codes": [
@@ -263,23 +291,92 @@
       ]
     }
   },
-
   "cors": {
     "env": "AI_MARKER_ALLOWED_ORIGINS",
     "origins": "exact scheme://host[:port], comma separated",
     "wildcard": false,
     "credentials": false,
-    "methods": ["GET", "POST", "OPTIONS"],
-    "headers": ["Authorization", "Content-Type", "Accept"],
+    "methods": [
+      "GET",
+      "POST",
+      "OPTIONS"
+    ],
+    "headers": [
+      "Authorization",
+      "Content-Type",
+      "Accept"
+    ],
     "production_scheme": "https only",
     "note": "The production and any preview origin must be named explicitly. There is no wildcard fallback and an invalid allowlist fails startup."
   },
-
   "client_owned_state": {
-    "assignment": "local object, client-generated id",
+    "assignment": "server-owned since v1.2 (POST/GET /v1/assignments); drafts stay device-local and are keyed by the server assignment_id",
     "drafts": "device storage keyed by Google sub + assignmentId + studentRef; never uploaded; never rendered for a different sub",
     "queue": "local list of job ids per assignment, refreshed through GET /v1/jobs/{job_id}",
     "finalize": "computed from decision responses + projection",
     "logout": "stop rendering the previous sub's drafts; the bytes stay on the device under that sub key until the user discards them"
+  },
+  "assignments": {
+    "status": "PROPOSED_AWAITING_BOTH_CONFIRMATIONS",
+    "resource": "teacher assignment (title only in v1.2)",
+    "create": {
+      "method": "POST",
+      "path": "/v1/assignments",
+      "request": {
+        "idempotency_key": "required, string, 8..128 chars, no '/', no control chars",
+        "title": "required, string, trimmed, 1..200 chars after trimming"
+      },
+      "response_created": {
+        "status": 201,
+        "body": {
+          "assignment_id": "asg_ + 24 hex",
+          "title": "trimmed title",
+          "created_at": "epoch seconds (integer)"
+        }
+      },
+      "response_replay": {
+        "status": 200,
+        "body": "identical to the created body for the same key + title"
+      },
+      "errors": {
+        "400": "payload_invalid (blank/over-long title, malformed key, malformed cursor)",
+        "401": "authentication_required",
+        "403": "tenant_membership_required",
+        "409": "idempotency_key_payload_mismatch",
+        "503": "store_unusable / dev_opt_in_required"
+      }
+    },
+    "list": {
+      "method": "GET",
+      "path": "/v1/assignments",
+      "query": {
+        "limit": "integer 1..100, default 50",
+        "cursor": "opaque string from next_cursor; malformed => 400 payload_invalid"
+      },
+      "response": {
+        "assignments": "array of {assignment_id,title,created_at}",
+        "next_cursor": "opaque string or null when the page is not full"
+      },
+      "order": "created_at DESC, assignment_id DESC (keyset; no OFFSET, no duplicates across pages)",
+      "scope": "owner_subject only (the caller's own rows within their tenant)"
+    },
+    "out_of_scope_v1_2": [
+      "renaming or deleting an assignment (no UPDATE/DELETE grant, no route)",
+      "validating assignment_id on POST /v1/documents or POST /v1/jobs (linkage is a separate agreed addition)",
+      "tenant-wide teacher visibility",
+      "richer scheme evidence"
+    ],
+    "server_owned": "schema/postgres_v6_assignments.sql (DRAFT, not applied): PK (tenant_id,owner_subject,assignment_id), UNIQUE (tenant_id,owner_subject,idempotency_key), RLS tenant_isolation, SELECT+INSERT only for marker_app"
+  },
+  "projection_question_fields": {
+    "fields": [
+      "review_status",
+      "corrected",
+      "last_action",
+      "last_reason"
+    ],
+    "semantics": "Optional carry-through on each projection question. Present when the backend has stored a value, absent otherwise; the frontend renders nothing when a field is absent (no fabrication, no client default presented as review evidence).",
+    "boundary": "Richer scheme evidence - per-question mark-scheme lines, A/M/B scheme annotations, or any engine-output field beyond these four - is OUT of v1.2. It needs a separate owner-approved scope with its own contract version; it is neither invented here nor silently deferred as done.",
+    "status": "PROPOSED_AWAITING_BOTH_CONFIRMATIONS"
   }
 }

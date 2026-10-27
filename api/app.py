@@ -48,6 +48,7 @@ in-process with ``fastapi.testclient``.
 from __future__ import annotations
 
 import os
+import base64
 import hashlib
 import time
 from contextlib import closing
@@ -62,11 +63,13 @@ from pydantic import BaseModel, Field, field_validator
 import runtime_config
 
 import audit_store
+import assignment_store
 import decision_core
 import document_limits
 import document_store
 import ingest_registry
 import job_store
+import postgres_assignment_store
 import postgres_job_store
 import supabase_document_store
 import marking_engine
@@ -216,6 +219,39 @@ class JobRequest(BaseModel):
     document_digest: str = Field(min_length=64, max_length=64)
 
 
+class AssignmentRequest(BaseModel):
+    """``POST /v1/assignments`` body (contract v1.2, PROPOSED).
+
+    The client supplies a title and an idempotency key only. It never chooses
+    ``assignment_id``, the owner or the tenant: those are server decisions
+    derived from the verified token (and the id is minted here).
+    """
+
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    title: str = Field(min_length=1, max_length=200)
+
+
+def _encode_assignment_cursor(created_at: int, assignment_id: str) -> str:
+    raw = f"{int(created_at)}:{assignment_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_assignment_cursor(cursor: Optional[str]):
+    """Return ``(created_at, assignment_id)``; malformed cursors are 400."""
+    if cursor is None or not cursor.strip():
+        return 0, ""
+    try:
+        padded = cursor.strip() + "=" * (-len(cursor.strip()) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        created_at, _, assignment_id = raw.partition(":")
+        if not assignment_id.startswith("asg_") or not created_at.isdigit():
+            raise ValueError("shape")
+        return int(created_at), assignment_id
+    except Exception:
+        raise ApiError("payload_invalid", "cursor is not a valid page cursor")
+
+
+
 def _now() -> str:
     return f"{time.time():.0f}"
 
@@ -263,6 +299,19 @@ def _job_api():
     error handling is identical either way.
     """
     return postgres_job_store if postgres_job_store.configured() else job_store
+
+
+def _assignment_api():
+    """The assignment store module for THIS process (same facade pattern).
+
+    Production: durable PostgreSQL (schema 0006) through
+    ``postgres_assignment_store`` when ``AI_MARKER_PG_DSN`` is configured.
+    Development: the opt-in SQLite store. Both share
+    ``AssignmentStoreError``, so call-site error handling is identical.
+    """
+    return (postgres_assignment_store
+            if postgres_assignment_store.configured() else assignment_store)
+
 
 
 def _document_api():
@@ -874,6 +923,32 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         except job_store.JobStoreError:
             raise ApiError("store_unusable", "the job store is unusable")
 
+    def require_assignment_connection():
+        """The assignment store for THIS process, failing closed when absent.
+
+        Production: durable PostgreSQL (schema 0006) when
+        ``AI_MARKER_PG_DSN`` is configured. Development: the explicit
+        opt-in SQLite store. Neither path creates production schema.
+        """
+        if postgres_assignment_store.configured():
+            try:
+                return postgres_assignment_store.require_connection()
+            except assignment_store.AssignmentStoreError:
+                raise ApiError("store_unusable",
+                               "the assignment store is unusable")
+        path = (os.environ.get(assignment_store.PATH_ENV) or "").strip()
+        acknowledged = (os.environ.get(
+            assignment_store.ACK_ENV) or "").strip() == "1"
+        if not path or not acknowledged:
+            raise ApiError("dev_opt_in_required",
+                           "the assignment store is not configured for"
+                           " development")
+        try:
+            return assignment_store.open_store(path)
+        except assignment_store.AssignmentStoreError:
+            raise ApiError("store_unusable",
+                           "the assignment store is unusable")
+
     def _marks_only(owner: Optional[str], result_id: str):
         """Marks-only question projection for one registered result.
 
@@ -976,6 +1051,71 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         if job is None:
             raise ApiError("result_not_registered", "no job for this owner")
         return job_payload(job)
+
+    @app.post("/v1/assignments", status_code=201)
+    def create_assignment(body: AssignmentRequest, who=Depends(actor)):
+        """Create (or replay) one server-owned teacher assignment.
+
+        Identity is the verified token: ``tenant_id``/``owner_subject`` come
+        from ``actor`` and the body can neither set nor override them.
+        ``assignment_id`` is minted server-side; the client only supplies an
+        idempotency key. Same key + same title replays the SAME assignment
+        (200); same key + different title is refused 409
+        ``idempotency_key_payload_mismatch``.
+        """
+        subject, owner, tenant_id = who
+        try:
+            key = assignment_store.normalize_idempotency_key(
+                body.idempotency_key)
+            title = assignment_store.normalize_title(body.title)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment payload is invalid")
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                created = _assignment_api().create_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    idempotency_key=key, title=title)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment could not be created")
+        payload = {"assignment_id": created["assignment_id"],
+                   "title": created["title"],
+                   "created_at": created["created_at"]}
+        if not created["created"]:
+            return JSONResponse(status_code=200, content=payload)
+        return payload
+
+    @app.get("/v1/assignments")
+    def list_assignments(who=Depends(actor),
+                         limit: int = Query(assignment_store.DEFAULT_PAGE_SIZE,
+                                            ge=1,
+                                            le=assignment_store.MAX_PAGE_SIZE),
+                         cursor: Optional[str] = Query(None)):
+        """Newest-first page of THIS owner's assignments.
+
+        Owner-scoped (``owner_subject``), mirroring documents ownership. A
+        tenant-wide teacher view would be an additive later version, not a
+        silent change here. ``next_cursor`` is opaque and null when the page
+        is not full; a malformed cursor is 400 ``payload_invalid``.
+        """
+        subject, owner, tenant_id = who
+        after_created_at, after_assignment_id = _decode_assignment_cursor(
+            cursor)
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                rows = _assignment_api().list_assignments(
+                    connection, tenant_id=tenant_id, owner=owner, limit=limit,
+                    after_created_at=after_created_at,
+                    after_assignment_id=after_assignment_id)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignments could not be read")
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_cursor = _encode_assignment_cursor(
+                last["created_at"], last["assignment_id"])
+        return {"assignments": rows, "next_cursor": next_cursor}
 
     @app.post("/v1/jobs/{job_id}/run")
     def run_marking_job(job_id: str, who=Depends(actor)):

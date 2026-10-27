@@ -1,13 +1,21 @@
-# Minimum shared API contract v1 (agreed)
+# Minimum shared API contract v1.2 (PROPOSED_AWAITING_FCM_CONFIRMATION)
 
 Machine-readable source of truth: [`contract/minimum_v1.json`](../contract/minimum_v1.json).
-Status **AGREED** on 2026-10-26 - FCM confirmed this exact version in message
-`2d206cc3-69d8-4b22-8859-cd08d6634612` (contract **v1.1**: the durable-worker
-trigger wording below; row 5 unchanged from v1.0, which FCM confirmed in
-message `68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d` - their reconciled
-`work/bolt/docs/FRONTEND_BACKEND_CONTRACT.md`, frontend PR #4 `bc8f3c86`,
-green CI run `40252538314`), and CM confirms on the backend side. Any change
-to a row needs a new numbered contract version confirmed by BOTH owners.
+
+Status **PROPOSED_AWAITING_FCM_CONFIRMATION**: CM drafted v1.2 on the backend
+side; it is **not agreed** until FCM confirms this exact version in writing
+for the browser client and CM records both message ids. The previously agreed
+version was **v1.1** (FCM confirmed in message
+`2d206cc3-69d8-4b22-8859-cd08d6634612`; v1.0 in
+`68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d`). Any change to a row needs a new
+numbered contract version confirmed by BOTH owners.
+
+v1.2 adds only: `POST /v1/assignments` and `GET /v1/assignments` (server-owned
+assignment rows, server-minted `assignment_id`, client idempotency key), the
+four projection question fields as optional carry-through, and an explicit
+boundary that richer scheme evidence is out of scope. No existing row's
+behaviour changes.
+
 
 This document exists because IFR's live-beta audit found the frontend calling
 9-10 routes that the backend does not serve, and the two sides drifting apart
@@ -23,7 +31,7 @@ Nothing here is deployed, migrated, provisioned or billed.
 
 | # | Frontend call (live) | Disposition | Backend route |
 |---|---|---|---|
-| 1 | `POST /v1/assignments` | client-owned | - (local object, client id) |
+| 1 | `POST /v1/assignments` | mapped | `POST /v1/assignments` (server-owned; `GET /v1/assignments` lists this owner's rows) |
 | 2 | `POST /v1/assignments/{id}/uploads` | replaced | `POST /v1/documents?filename=` (raw PDF) |
 | 3 | `POST /v1/uploads/{id}/confirm` | removed | - (upload is atomic) |
 | 4 | *(none today)* | required addition | `POST /v1/jobs` |
@@ -149,14 +157,70 @@ or invalid list fails the process at startup rather than silently allowing
 nothing. FCM must supply the final Pages origin (and any preview-origin
 decision - previews are not allowed by default).
 
-## 8. What is deliberately NOT in v1
+## 8. Assignments (new in v1.2, PROPOSED)
 
-* A server-side assignment/queue/draft model. It needs its own tables,
-  authorization and migration; it is not required to prove marking end-to-end.
+The assignment row is **server-owned** so it survives a reload and a second
+device. Identity is unchanged: `tenant_id` and `owner_subject` come only from
+the verified token and active membership.
+
+```jsonc
+// POST /v1/assignments  (Authorization: Bearer <google-id-token>)
+// request
+{ "idempotency_key": "<8..128 chars>", "title": "Year 10 Paper 1" }
+// -> 201 { "assignment_id": "asg_<24 hex>", "title": "Year 10 Paper 1",
+//          "created_at": 1761600000 }
+// -> 200 identical body on same key + same title (replay)
+// -> 409 idempotency_key_payload_mismatch on same key + different title
+// -> 400 payload_invalid on blank/whitespace title or >200 chars after trim
+```
+
+* `assignment_id` is **minted by the server**; the client never sends one.
+  Replaying the key returns the same assignment, keyed by
+  `(tenant_id, owner_subject, idempotency_key)`.
+* `title` is trimmed; 1..200 characters after trimming is the whole accepted
+  body. Extra client fields (id, tenant, owner) are not part of the body and
+  cannot override the token.
+
+```jsonc
+// GET /v1/assignments?limit=1..100&cursor=<next_cursor>
+// -> 200 { "assignments": [ { "assignment_id": "...", "title": "...",
+//                             "created_at": 1761600000 } ],
+//          "next_cursor": "<opaque>" | null }
+// -> 400 payload_invalid on a malformed cursor
+```
+
+* Scope is the caller's own `owner_subject` within their tenant, mirroring
+  documents ownership. A tenant-wide teacher view is an additive later
+  version, not a silent change here.
+* Order is `created_at DESC, assignment_id DESC` (keyset, no OFFSET); each row
+  appears once across pages. `next_cursor` is null when the page is not full.
+* No rename and no delete route: the runtime role has `SELECT, INSERT` only on
+  the assignments table. Retention belongs to the separate elevated role.
+
+## 9. Projection question fields (new in v1.2, PROPOSED)
+
+`review_status`, `corrected`, `last_action` and `last_reason` are **optional
+carry-through** fields on each projection question. Present when the backend
+has stored a value, absent otherwise; the client renders nothing when a field
+is absent and never substitutes a default that could read as review evidence.
+
+**Out of scope and explicitly not done:** richer scheme evidence - per-question
+mark-scheme lines, A/M/B scheme annotations, or any engine-output field beyond
+those four. That needs its own owner-approved scope and a new numbered
+contract version. It is not invented here and not silently deferred as if
+delivered.
+
+## 10. What is deliberately NOT in v1.2
+
+* Server-side **drafts** and **queue** state (still device-local), and a
+  tenant-wide assignment view.
+* Validating an `assignment_id` on `POST /v1/documents` or `POST /v1/jobs`;
+  document/job-to-assignment linkage is a separate agreed addition.
 * Signed upload URLs and direct-to-bucket writes.
 * `cancel` / `pause` / `resume` for jobs.
 * A submission resource separate from `result_id`.
 * Streaming/websocket updates: the client polls `GET /v1/jobs/{id}`.
+* Richer scheme evidence (section 9 boundary).
 
 Adding any of these later is a new numbered contract version agreed by both
 sides first, not a quiet route addition.

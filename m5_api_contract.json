@@ -11,24 +11,33 @@
     "deployed": false,
     "note": "The per-endpoint `implemented` flags are authoritative: they mark the routes served in-process by the dev API (tests drive it with fastapi.testclient). spec.status stays SPEC_NOT_IMPLEMENTED because the sign-off endpoint and the deployment posture are not implemented. fastapi/uvicorn are now production dependencies because api/server.py is the prepared container entrypoint (nothing is built, provisioned or deployed by this repository state), and every failure code is drawn from the existing source vocabulary - no code is invented. The browser mapping of these routes is contract/minimum_v1.json (PROPOSED, awaiting FCM)."
   },
-
   "error_envelope": {
     "description": "Every non-2xx response uses this shape. Codes are a subset of the existing source vocabulary.",
     "type": "object",
-    "required": ["error"],
+    "required": [
+      "error"
+    ],
     "properties": {
       "error": {
         "type": "object",
-        "required": ["code", "message"],
+        "required": [
+          "code",
+          "message"
+        ],
         "properties": {
-          "code": { "type": "string" },
-          "message": { "type": "string" },
-          "detail": { "type": "string" }
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
         }
       }
     }
   },
-
   "auth": {
     "scheme": "Bearer (OIDC identity token)",
     "actor_is_not_tenant": true,
@@ -40,7 +49,6 @@
       "fresh_reverification_for_classroom_scope"
     ]
   },
-
   "endpoints": [
     {
       "method": "POST",
@@ -51,43 +59,94 @@
       "tenant_scoped": true,
       "request": {
         "type": "object",
-        "required": ["scope", "original_output"],
+        "required": [
+          "scope",
+          "original_output"
+        ],
         "properties": {
-          "scope": { "enum": ["classroom", "manual"] },
+          "scope": {
+            "enum": [
+              "classroom",
+              "manual"
+            ]
+          },
           "classroom_identity": {
             "type": "object",
             "properties": {
-              "course_id": { "type": "string" },
-              "assignment_id": { "type": "string" },
-              "submission_id": { "type": "string" },
-              "revision": { "type": "string" }
+              "course_id": {
+                "type": "string"
+              },
+              "assignment_id": {
+                "type": "string"
+              },
+              "submission_id": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              }
             },
-            "required": ["course_id", "assignment_id", "submission_id"]
+            "required": [
+              "course_id",
+              "assignment_id",
+              "submission_id"
+            ]
           },
           "manual_identity": {
             "type": "object",
             "description": "Opaque server-issued submission id bound to document digest + owner. No pupil name in the key.",
             "properties": {
-              "submission_ref": { "type": "string" },
-              "document_digest": { "type": "string" }
+              "submission_ref": {
+                "type": "string"
+              },
+              "document_digest": {
+                "type": "string"
+              }
             },
-            "required": ["document_digest"]
+            "required": [
+              "document_digest"
+            ]
           },
-          "original_output": { "type": "object" }
+          "original_output": {
+            "type": "object"
+          }
         }
       },
       "response_201": {
         "type": "object",
-        "required": ["result_id", "owner", "result_revision", "audit_reference"],
+        "required": [
+          "result_id",
+          "owner",
+          "result_revision",
+          "audit_reference"
+        ],
         "properties": {
-          "result_id": { "type": "string" },
-          "owner": { "type": "string" },
-          "result_revision": { "type": "integer" },
-          "audit_reference": { "type": "string" },
-          "supersedes": { "type": ["string", "null"] }
+          "result_id": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "result_revision": {
+            "type": "integer"
+          },
+          "audit_reference": {
+            "type": "string"
+          },
+          "supersedes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       },
-      "error_codes": ["payload_invalid", "original_output_invalid", "store_unusable", "audit_store_unavailable"]
+      "error_codes": [
+        "payload_invalid",
+        "original_output_invalid",
+        "store_unusable",
+        "audit_store_unavailable"
+      ]
     },
     {
       "method": "POST",
@@ -100,29 +159,82 @@
       "optimistic_concurrency": true,
       "request": {
         "type": "object",
-        "required": ["question_number", "action", "expected_revision", "idempotency_key"],
+        "required": [
+          "question_number",
+          "action",
+          "expected_revision",
+          "idempotency_key"
+        ],
         "properties": {
-          "question_number": { "type": ["string", "integer"],
-                              "description": "Canonical identity is the stripped string (\"1\", \"2a\"). An integer is accepted and normalised, never stored as a number." },
-          "action": { "enum": ["approve", "correct", "flag"] },
-          "review_status": { "type": "string" },
-          "old_score": { "type": ["string", "null"] },
-          "new_score": { "type": ["string", "null"] },
-          "reason": { "type": "string", "maxLength": 2000 },
-          "binding": { "type": "string" },
-          "expected_revision": { "type": "integer" },
-          "idempotency_key": { "type": "string" }
+          "question_number": {
+            "type": [
+              "string",
+              "integer"
+            ],
+            "description": "Canonical identity is the stripped string (\"1\", \"2a\"). An integer is accepted and normalised, never stored as a number."
+          },
+          "action": {
+            "enum": [
+              "approve",
+              "correct",
+              "flag"
+            ]
+          },
+          "review_status": {
+            "type": "string"
+          },
+          "old_score": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_score": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "binding": {
+            "type": "string"
+          },
+          "expected_revision": {
+            "type": "integer"
+          },
+          "idempotency_key": {
+            "type": "string"
+          }
         }
       },
       "response_200": {
         "type": "object",
-        "required": ["result_id", "result_revision", "event_sequence", "audit_reference", "replayed"],
+        "required": [
+          "result_id",
+          "result_revision",
+          "event_sequence",
+          "audit_reference",
+          "replayed"
+        ],
         "properties": {
-          "result_id": { "type": "string" },
-          "result_revision": { "type": "integer" },
-          "event_sequence": { "type": "integer" },
-          "audit_reference": { "type": "string" },
-          "replayed": { "type": "boolean" }
+          "result_id": {
+            "type": "string"
+          },
+          "result_revision": {
+            "type": "integer"
+          },
+          "event_sequence": {
+            "type": "integer"
+          },
+          "audit_reference": {
+            "type": "string"
+          },
+          "replayed": {
+            "type": "boolean"
+          }
         }
       },
       "error_codes": [
@@ -151,14 +263,30 @@
       "tenant_scoped": true,
       "response_200": {
         "type": "object",
-        "required": ["result_id", "events"],
+        "required": [
+          "result_id",
+          "events"
+        ],
         "properties": {
-          "result_id": { "type": "string" },
-          "events": { "type": "array", "items": { "type": "object" } },
-          "result_revision": { "type": "integer" }
+          "result_id": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "result_revision": {
+            "type": "integer"
+          }
         }
       },
-      "error_codes": ["result_not_registered", "store_closed", "audit_store_unavailable"]
+      "error_codes": [
+        "result_not_registered",
+        "store_closed",
+        "audit_store_unavailable"
+      ]
     },
     {
       "method": "GET",
@@ -169,17 +297,38 @@
       "tenant_scoped": true,
       "response_200": {
         "type": "object",
-        "required": ["result_id", "result_revision", "questions", "original_ai_output"],
+        "required": [
+          "result_id",
+          "result_revision",
+          "questions",
+          "original_ai_output"
+        ],
         "properties": {
-          "result_id": { "type": "string" },
-          "result_revision": { "type": "integer" },
-          "questions": { "type": "array", "items": { "type": "object" } },
-          "original_ai_output": { "type": "object" },
-          "totals": { "type": "object" }
+          "result_id": {
+            "type": "string"
+          },
+          "result_revision": {
+            "type": "integer"
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "original_ai_output": {
+            "type": "object"
+          },
+          "totals": {
+            "type": "object"
+          }
         }
       },
       "invariant": "Original AI marks are preserved and returned unchanged; corrected values sit alongside, never overwriting.",
-      "error_codes": ["result_not_registered", "audit_store_unavailable"]
+      "error_codes": [
+        "result_not_registered",
+        "audit_store_unavailable"
+      ]
     },
     {
       "method": "POST",
@@ -190,24 +339,48 @@
       "tenant_scoped": true,
       "request": {
         "type": "object",
-        "required": ["approved", "expected_revision"],
+        "required": [
+          "approved",
+          "expected_revision"
+        ],
         "properties": {
-          "approved": { "type": "boolean" },
-          "expected_revision": { "type": "integer" }
+          "approved": {
+            "type": "boolean"
+          },
+          "expected_revision": {
+            "type": "integer"
+          }
         }
       },
       "response_200": {
         "type": "object",
-        "required": ["result_id", "approved", "approved_by", "approved_at"],
+        "required": [
+          "result_id",
+          "approved",
+          "approved_by",
+          "approved_at"
+        ],
         "properties": {
-          "result_id": { "type": "string" },
-          "approved": { "type": "boolean" },
-          "approved_by": { "type": "string" },
-          "approved_at": { "type": "string" }
+          "result_id": {
+            "type": "string"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "approved_by": {
+            "type": "string"
+          },
+          "approved_at": {
+            "type": "string"
+          }
         }
       },
       "note": "Exactly ONE sign-off gate exists. There is no grade-publication endpoint in this contract, because the application performs zero mutating Classroom/Drive calls.",
-      "error_codes": ["stale_revision", "result_not_registered", "audit_store_unavailable"]
+      "error_codes": [
+        "stale_revision",
+        "result_not_registered",
+        "audit_store_unavailable"
+      ]
     },
     {
       "method": "GET",
@@ -218,8 +391,16 @@
       "tenant_scoped": false,
       "response_200": {
         "type": "object",
-        "required": ["status"],
-        "properties": { "status": { "enum": ["ok"] } }
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "ok"
+            ]
+          }
+        }
       },
       "error_codes": []
     },
@@ -233,22 +414,56 @@
       "dev_only_storage": true,
       "request": {
         "body": "raw application/pdf bytes, bounded by document_limits",
-        "query": { "filename": { "type": "string", "maxLength": 256 } }
+        "query": {
+          "filename": {
+            "type": "string",
+            "maxLength": 256
+          }
+        }
       },
       "response_201": {
         "type": "object",
-        "required": ["document_digest", "owner", "bytes", "stored"],
+        "required": [
+          "document_digest",
+          "owner",
+          "bytes",
+          "stored"
+        ],
         "properties": {
-          "document_digest": { "type": "string" },
-          "owner": { "type": "string" },
-          "bytes": { "type": "integer" },
-          "pages": { "type": ["integer", "null"] },
-          "kind": { "type": "string" },
-          "stored": { "type": "boolean" }
+          "document_digest": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "pages": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "stored": {
+            "type": "boolean"
+          }
         },
         "note": "An identical re-upload answers 200 with stored:false (content-addressed idempotency)."
       },
-      "error_codes": ["payload_invalid", "document_too_large", "invalid_pdf", "encrypted_pdf", "too_many_pages", "unsupported_type", "dev_opt_in_required", "store_unusable"]
+      "error_codes": [
+        "payload_invalid",
+        "document_too_large",
+        "invalid_pdf",
+        "encrypted_pdf",
+        "too_many_pages",
+        "unsupported_type",
+        "dev_opt_in_required",
+        "store_unusable"
+      ]
     },
     {
       "method": "GET",
@@ -258,8 +473,15 @@
       "auth_required": true,
       "tenant_scoped": true,
       "dev_only_storage": true,
-      "response_200": { "type": "string", "format": "binary" },
-      "error_codes": ["result_not_registered", "dev_opt_in_required", "store_unusable"]
+      "response_200": {
+        "type": "string",
+        "format": "binary"
+      },
+      "error_codes": [
+        "result_not_registered",
+        "dev_opt_in_required",
+        "store_unusable"
+      ]
     },
     {
       "method": "POST",
@@ -272,15 +494,36 @@
       "idempotent": true,
       "request": {
         "type": "object",
-        "required": ["idempotency_key", "document_digest"],
+        "required": [
+          "idempotency_key",
+          "document_digest"
+        ],
         "properties": {
-          "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 128 },
-          "document_digest": { "type": "string", "minLength": 64, "maxLength": 64 }
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128
+          },
+          "document_digest": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          }
         }
       },
-      "response_201": { "$ref_job_payload": "see /v1/jobs/{job_id} response_200" },
-      "response_200": { "$ref_job_payload": "replay: same job, current state, created:false" },
-      "error_codes": ["payload_invalid", "result_not_registered", "idempotency_key_payload_mismatch", "dev_opt_in_required", "store_unusable"]
+      "response_201": {
+        "$ref_job_payload": "see /v1/jobs/{job_id} response_200"
+      },
+      "response_200": {
+        "$ref_job_payload": "replay: same job, current state, created:false"
+      },
+      "error_codes": [
+        "payload_invalid",
+        "result_not_registered",
+        "idempotency_key_payload_mismatch",
+        "dev_opt_in_required",
+        "store_unusable"
+      ]
     },
     {
       "method": "GET",
@@ -292,30 +535,77 @@
       "dev_only_storage": true,
       "response_200": {
         "type": "object",
-        "required": ["job_id", "status", "attempts", "max_attempts", "document_digest", "result_id", "error_code"],
+        "required": [
+          "job_id",
+          "status",
+          "attempts",
+          "max_attempts",
+          "document_digest",
+          "result_id",
+          "error_code"
+        ],
         "properties": {
-          "job_id": { "type": "string" },
-          "status": { "enum": ["queued", "running", "succeeded", "failed"] },
-          "attempts": { "type": "integer" },
-          "max_attempts": { "type": "integer" },
-          "document_digest": { "type": "string" },
-          "result_id": { "type": ["string", "null"] },
-          "error_code": { "type": ["string", "null"] },
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "attempts": {
+            "type": "integer"
+          },
+          "max_attempts": {
+            "type": "integer"
+          },
+          "document_digest": {
+            "type": "string"
+          },
+          "result_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "questions": {
             "type": "array",
             "description": "SUCCEEDED jobs only, when the marks-only projection is readable; omitted otherwise rather than guessed.",
             "items": {
               "type": "object",
-              "required": ["question_number", "awarded_marks"],
+              "required": [
+                "question_number",
+                "awarded_marks"
+              ],
               "properties": {
-                "question_number": { "type": "string" },
-                "awarded_marks": { "type": ["number", "null"] }
+                "question_number": {
+                  "type": "string"
+                },
+                "awarded_marks": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                }
               }
             }
           }
         }
       },
-      "error_codes": ["result_not_registered", "dev_opt_in_required", "store_unusable"]
+      "error_codes": [
+        "result_not_registered",
+        "dev_opt_in_required",
+        "store_unusable"
+      ]
     },
     {
       "method": "POST",
@@ -325,11 +615,115 @@
       "auth_required": true,
       "tenant_scoped": true,
       "dev_only_storage": true,
-      "response_200": { "$ref_job_payload": "see /v1/jobs/{job_id} response_200" },
-      "error_codes": ["result_not_registered", "model_unavailable", "manual_document_provenance_required", "original_output_invalid", "service_unavailable", "dev_opt_in_required", "store_unusable"]
+      "response_200": {
+        "$ref_job_payload": "see /v1/jobs/{job_id} response_200"
+      },
+      "error_codes": [
+        "result_not_registered",
+        "model_unavailable",
+        "manual_document_provenance_required",
+        "original_output_invalid",
+        "service_unavailable",
+        "dev_opt_in_required",
+        "store_unusable"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/v1/assignments",
+      "purpose": "Create or replay one server-owned teacher assignment (contract v1.2, PROPOSED).",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "idempotent": true,
+      "request": {
+        "type": "object",
+        "required": [
+          "idempotency_key",
+          "title"
+        ],
+        "properties": {
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "trimmed before validation; 1..200 chars after trimming"
+          }
+        }
+      },
+      "response_201": {
+        "type": "object",
+        "required": [
+          "assignment_id",
+          "title",
+          "created_at"
+        ],
+        "properties": {
+          "assignment_id": {
+            "type": "string",
+            "pattern": "^asg_[0-9a-f]{24}$"
+          },
+          "title": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          }
+        }
+      },
+      "response_200": "same body on same-key + same-title replay",
+      "error_codes": [
+        "payload_invalid",
+        "idempotency_key_payload_mismatch",
+        "store_unusable",
+        "dev_opt_in_required"
+      ],
+      "invariant": "assignment_id is minted server-side; tenant/owner come only from the verified token."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/assignments",
+      "purpose": "Newest-first keyset page of the caller's own assignments (contract v1.2, PROPOSED).",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "query": {
+        "limit": "integer 1..100, default 50",
+        "cursor": "opaque next_cursor; malformed => 400 payload_invalid"
+      },
+      "response_200": {
+        "type": "object",
+        "required": [
+          "assignments",
+          "next_cursor"
+        ],
+        "properties": {
+          "assignments": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "error_codes": [
+        "payload_invalid",
+        "store_unusable",
+        "dev_opt_in_required"
+      ]
     }
   ],
-
   "absent_by_design": {
     "grade_publication": "No POST/PUT/PATCH/DELETE to Classroom or Drive exists in the application. All five classroom_request call sites pass GET. Scores surface to the teacher for manual entry.",
     "payments": "Not in scope; separately gated.",
