@@ -55,8 +55,7 @@ USER 10001
 
 # The scheme mount point exists so an operator mount cannot silently fail for
 # a missing parent directory. It is EMPTY by design: no licensed PDF is baked.
-RUN mkdir -p /app/scheme \
-    && test ! -e /app/scheme.pdf || true
+RUN mkdir -p /app/scheme
 
 EXPOSE 8080
 

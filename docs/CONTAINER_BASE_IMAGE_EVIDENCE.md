@@ -69,6 +69,12 @@ update `Dockerfile` and this file together, then re-run the packaging tests.
   (exactly one `FROM`, name is `python:3.13-slim-bookworm`, non-empty
   `@sha256:` with 64 hex chars, no `:latest`).
 * CI remains the authoritative build evidence for the branch head.
+* The image's interpreter, **CPython 3.13**, is now in the CI-validated
+  Streamlit/UI matrix (IR condition: the image runtime must be tested before
+  the first operator build). The matrix entry uses the same pinned
+  `streamlit==1.66.1` / `google-genai` window as the other rows.
+* Still not evidence: an actual `docker build` or container start. That is
+  the operator/CI build job IR may require before a first real image build.
 
 No migration, deployment, infrastructure activation or paid action was
 performed.
