@@ -43,6 +43,7 @@ Reuse it; do not recreate it.
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
 | 0005 | `schema/postgres_v5_membership_access.sql` | Production membership **resolution**: a second SELECT-only RLS policy on `tenant_membership` keyed by `app.subject`, plus column-level `SELECT` (five columns) for `marker_app`. **No INSERT/UPDATE/DELETE** on membership rows for any runtime role - the API cannot grant itself a tenant. | `schema_meta.membership_access_version = '1'` | `schema/postgres_v5_membership_access_rollback.sql` (drops the policy + grant, leaves membership rows intact) |
+| 0006 | `schema/postgres_v6_result_narrowing.sql` | Least privilege on `results`: drops the table-wide `UPDATE` and grants **`UPDATE (result_revision)` only** to `marker_app` / `marker_worker` - the single column `postgres_store.commit()` writes. Every other column becomes non-writable by a runtime role, so the immutable original result cannot be rewritten. **No DELETE.** | `schema_meta.results_update_version = '1'` | `schema/postgres_v6_result_narrowing_rollback.sql` (restores the 0002 table-wide UPDATE; refuses when 0006 was never applied; touches no rows) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
@@ -60,14 +61,15 @@ role. Its backout removes ACCESS only - it deletes neither bucket objects nor
 existing metadata rows. Creating the bucket and its service key is operator
 work in `docs/BETA_DEPLOY_SETUP.md`, never code.
 
-**Numbering after 0005.** `0006` is **RESERVED** for the still-open security
-fix that narrows the `UPDATE` privilege on `results`. Today `marker_app` and
-`marker_worker` hold table-wide `UPDATE` (used by `UPDATE results SET
-result_revision`), and the column-level narrowing to `result_revision` has NOT
-been applied. Until 0006 lands, the wider grant recorded in 4.1 is the real,
-open state - it is a tracked blocker, never a closed item. The assignments
-slice therefore numbers its migration `0007` so it cannot collide with the
-reserved `0006`.
+**Numbering after 0005 and the 0006 narrowing.** `0006`
+(`schema/postgres_v6_result_narrowing.sql`) is the result-revision privilege
+fix: it removes the table-wide `UPDATE` that 0002 granted on `results` and
+leaves `marker_app` / `marker_worker` with `UPDATE (result_revision)` only.
+It is **implemented and CI-tested, but NOT applied** - the wider grant is
+still the real production state until an authorized operator applies and
+verifies 0006. Do not read "implemented" as "closed": closing needs the
+apply evidence in 4.5. The assignments slice stays `0007` so it cannot collide
+with 0006.
 
 ---
 
@@ -140,8 +142,9 @@ rollback path is known-good before it is ever needed.
 | 5 | Create runtime logins (operator, once per environment): `CREATE ROLE marker_runtime LOGIN PASSWORD '<generated>'; GRANT marker_app TO marker_runtime;` (and, later, `marker_worker_login` → `marker_worker`) | `select current_user, session_user;` as the login shows the login, and `select rolname from pg_roles where pg_has_role(current_user, oid, 'member')` shows `marker_app` | `REVOKE marker_app FROM marker_runtime; DROP ROLE marker_runtime;` — do this **before** the 0002 backout, which refuses to drop a role with dependents |
 | 6 | Smoke test as the login: one `BEGIN; select set_config('app.tenant_id','<tenant>',true); select count(*) from results; COMMIT;` and one unbound `select count(*) from results;` | bound sees that tenant only; unbound sees `0` | none (read only) |
 | 7 | Apply `postgres_v5_membership_access.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.membership_access_version = '1'`; `pg_policies` shows **6** rows incl. `membership_self_read` (SELECT) on `tenant_membership`; `information_schema.role_column_grants` shows exactly the five resolver columns for `marker_app`; `role_table_grants` for `tenant_membership` is **0 rows**; an **unbound** `select count(*) from tenant_membership` as the runtime login returns **0** | `postgres_v5_membership_access_rollback.sql` -> re-run the section 4 shape check -> re-apply 0005 |
-| 8 | **First-membership seeding (operator, once per tenant/subject)** - section 4.4, **document only, not executed**: run as the project owner/superuser on the direct 5432 connection | the seeding verification in 4.4 returns exactly one `active = true` row for the subject; the runtime resolver probe returns that tenant; an unbound or other-subject probe returns nothing | deactivate the seeded row as the owner (`update ... set active = false`); no runtime role holds UPDATE/DELETE on membership |
-| 9 | Record evidence: dump id, the section 2 emptiness output (or the drill transcript), section 4 verification output, the 0005 verification output, the seeding record (who/when/tenant/subject - never the token), who applied what, errors | section 4 + 4.2 + 4.4 | - |
+| 8 | Apply `postgres_v6_result_narrowing.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.results_update_version = '1'`; `has_table_privilege('marker_app','results','UPDATE')` is **false**; `has_column_privilege(...,'result_revision','UPDATE')` is **true**; every other column is false; the adapter-shaped `UPDATE results SET result_revision` still returns 1 row and a rewrite of `original_scores` is refused | `postgres_v6_result_narrowing_rollback.sql` -> re-run the 4.5 shape check -> re-apply 0006 |
+| 9 | **First-membership seeding (operator, once per tenant/subject)** - section 4.4, **document only, not executed**: run as the project owner/superuser on the direct 5432 connection | the seeding verification in 4.4 returns exactly one `active = true` row for the subject; the runtime resolver probe returns that tenant; an unbound or other-subject probe returns nothing | deactivate the seeded row as the owner (`update ... set active = false`); no runtime role holds UPDATE/DELETE on membership |
+| 10 | Record evidence: dump id, the section 2 emptiness output (or the drill transcript), section 4 verification output, the 0005 verification output, the 0006 verification output, the seeding record (who/when/tenant/subject - never the token), who applied what, errors | section 4 + 4.2 + 4.5 + 4.4 | - |
 
 The generated password for step 5 is created once, stored only in Secret
 Manager, and never written to this repository, a message or a log.
@@ -189,20 +192,24 @@ order by 1,2;
 ```
 
 Expected evidence after a correct apply: 2 markers, 5 forced tables, 5
-`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, **exactly 12
-grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT/UPDATE;
-`audit_events` SELECT/INSERT - each for both runtime roles), **zero DELETE
-grants**, no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
-function. **With 0003 applied too, the same query returns 18 rows**: the
+`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, **exactly 10
+grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT; `audit_events`
+SELECT/INSERT - each for both runtime roles), **zero table-level UPDATE on
+`results`** (it moved to the `result_revision` column), **zero DELETE grants**,
+no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
+function. **With 0003 applied too, the same query returns 16 rows**: the
 `marking_jobs` SELECT/INSERT/UPDATE for each runtime role, still zero DELETE.
-**With 0004 as well, 22 rows**: plus `pdf_references` SELECT/INSERT for each
+**With 0004 as well, 20 rows**: plus `pdf_references` SELECT/INSERT for each
 runtime role - and the separate `marker_purge` role (queried by grantee) holds
 exactly `pdf_references` SELECT + UPDATE and nothing else. **With 0005**, the
 table-grant row count is unchanged (the membership grant is column-level, so it
 appears in `information_schema.role_column_grants`, not
 `role_table_grants`), and `pg_policies` shows **6 rows**: the five
 `tenant_isolation` policies plus `membership_self_read` (FOR SELECT) on
-`tenant_membership`. **No role in the schema holds any DELETE at all**: purge
+`tenant_membership`. **With 0006**, the table-grant count drops by two
+(the `results` UPDATE row for each runtime role) and
+`information_schema.role_column_grants` gains exactly `result_revision` UPDATE
+for both roles. **No role in the schema holds any DELETE at all**: purge
 tombstones the row and removes the object, so history cannot be trimmed.
 
 ### 4.1 Per-grant justification (every runtime privilege)
@@ -216,7 +223,7 @@ statements are the evidence:
 | `schema_meta` | SELECT | yes | yes | `open_store()` reads `schema_version` |
 | `results` | SELECT | yes | yes | `original_record()`, revision/event reads |
 | `results` | INSERT | yes | yes | register the immutable original result |
-| `results` | UPDATE | yes | yes | `UPDATE results SET result_revision` (revision advancement) |
+| `results` | UPDATE (column `result_revision` only, per 0006) | yes | yes | `UPDATE results SET result_revision` (revision advancement); no other column is writable |
 | `results` | DELETE | **no** | **no** | none shipped - deferred to the elevated purge role |
 | `audit_events` | SELECT | yes | yes | `events()`, `stream_revision()` |
 | `audit_events` | INSERT | yes | yes | `commit()` appends the decision event |
@@ -417,6 +424,47 @@ where tenant_id = '<tenant-id>' and subject = '<google-sub>'
 If a subject must move tenants, deactivate the old row **in the same
 transaction** as the new insert, or the resolver refuses the ambiguous state.
 
+### 4.5 0006 verification (the privilege narrowing)
+
+```sql
+-- Marker.
+select key, value from schema_meta where key = 'results_update_version'; -- '1'
+
+-- Table-wide UPDATE must be gone from BOTH runtime roles.
+select r, has_table_privilege(r, 'public.results', 'UPDATE') as table_update
+from unnest(array['marker_app','marker_worker']) as r;      -- both false
+
+-- Only result_revision is writable.
+select r, has_column_privilege(r, 'public.results', 'result_revision',
+                               'UPDATE') as revision_update
+from unnest(array['marker_app','marker_worker']) as r;      -- both true
+
+-- Every other column is refused.
+select c, has_column_privilege('marker_app', 'public.results', c, 'UPDATE')
+from unnest(array['tenant_id','owner_subject','result_id','original_digest',
+                  'original_scores','original_scores_digest','created_at'])
+     as c;                                                   -- all false
+```
+
+Run the two behavioural probes as the **runtime login** (member of
+`marker_app`), tenant-bound:
+
+```sql
+begin;
+select set_config('app.tenant_id', '<tenant>', true);
+-- the shipped statement: must succeed and affect exactly 1 row
+update results set result_revision = result_revision
+ where tenant_id = '<tenant>' and owner_subject = '<owner>'
+   and result_id = '<result>';
+-- the immutable original: must fail with InsufficientPrivilege
+update results set original_scores = original_scores;
+rollback;
+```
+
+Rollback restores the 0002 shape (table-wide UPDATE) and **refuses when 0006
+was never applied**, so a mistaken backout cannot silently widen the grant.
+It touches no rows.
+
 ---
 
 ## 5. What RLS does and does not do here
@@ -494,6 +542,12 @@ service:
   rollback-then-re-apply.
 * `tests/test_postgres_store_contract.py` — the adapter contract on the same
   schema.
+
+* `tests/test_postgres_privilege_narrowing.py` - the 0006 contract in its own
+  isolated database: table-wide UPDATE absent for both roles, only
+  `result_revision` writable, every other column refused with
+  `InsufficientPrivilege`, the adapter's exact statement still succeeds,
+  DELETE still denied, and rollback/refuses-when-absent/re-apply verified.
 
 The job log for the head under review is the executed evidence; it is linked
 from the PR. This is a scratch container, **not** the Supabase project: no
