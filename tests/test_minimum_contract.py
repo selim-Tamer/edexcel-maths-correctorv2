@@ -74,6 +74,30 @@ class ContractArtifactTests(unittest.TestCase):
             self.assertTrue(spec["confirmed_by"],
                             "AGREED requires the confirming message id")
 
+    def test_agreed_surface_excludes_the_v1_2_1_additions(self):
+        """AGREED must mean exactly what FCM confirmed - no quiet growth.
+
+        FCM confirmed v1.2 with linkage OUT and asked for it as additive
+        v1.2.1. The backend already implements the job half, so the only way
+        the artifact can stay honest is: the agreed route text must NOT claim
+        the field, and the addition must sit in ``additive_after_v1_2`` with a
+        non-agreed status that names no confirmer.
+        """
+        add = self.artifact.get("additive_after_v1_2")
+        self.assertIsNotNone(add, "the proposed v1.2.1 addition must be recorded")
+        self.assertNotEqual("AGREED", add["status"])
+        self.assertFalse(add["confirmed_by"])
+        self.assertFalse(add["in_agreed_v1_2"])
+        for route in self.artifact["server_routes"]:
+            if route.get("path") in ("/v1/jobs", "/v1/jobs/{job_id}"):
+                self.assertNotIn("assignment_id", route["purpose"],
+                                 "the agreed v1.2 jobs text must not promise "
+                                 "the v1.2.1 linkage field")
+        # The agreed client never sends it, so the implementation must treat
+        # it as optional rather than required on the wire.
+        self.assertIn("optional", add["wire"]["request"]["assignment_id"])
+        self.assertEqual("AGREED", self.artifact["assignments"]["status"])
+
     def test_doc_and_artifact_agree_on_the_agreement_state(self):
         # The prose document and the artifact must never disagree about
         # whether this contract is agreed or who agreed it.

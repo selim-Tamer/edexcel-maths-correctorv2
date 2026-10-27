@@ -2,10 +2,10 @@
   "spec": {
     "name": "ai-maths-marker-minimum-v1",
     "version": "1.2.0",
-    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
-    "confirmed_by": "",
-    "confirmed_at": null,
-    "confirmed_scope": "v1.2 PROPOSED by CM (backend) and NOT yet agreed: both owners must confirm this exact version in writing (FCM for the browser client, CM for the runtime routes), and the artifact may only become AGREED with both message ids recorded. Change from v1.1: (a) createAssignment becomes a server route - POST /v1/assignments and GET /v1/assignments; (b) the assignment row, wire fields, server-minted assignment_id, required idempotency key and keyset pagination are pinned in the assignments section; (c) the projection question fields review_status / corrected / last_action / last_reason are pinned as optional carry-through with absent-means-omit; (d) richer scheme evidence (per-question mark-scheme lines, A/M/B annotations, any other engine field) is explicitly OUT of v1.2 and needs a separate owner-approved scope. No other row changes.",
+    "status": "AGREED",
+    "confirmed_by": "80fcb269-eaa2-43e7-9771-e8ca996c1fca",
+    "confirmed_at": "2026-10-27",
+    "confirmed_scope": "v1.2.0 AGREED 2026-10-27. FCM confirmed the browser-client surface in message 80fcb269-eaa2-43e7-9771-e8ca996c1fca, verified against client head 99b73ba432dca24a4617ce3b34441360459eb195 (CI 40440374586); CM records the backend side in the commit that sets AGREED. Covered: POST /v1/assignments and GET /v1/assignments with server-minted assignment_id, body {idempotency_key,title} as the client carrier (Idempotency-Key header accepted as an equal alias), epoch-second created_at, the four optional projection question fields, and the explicit boundary that richer scheme evidence is out of scope. NOT covered: job-to-assignment and document-to-assignment linkage. FCM confirmed v1.2 with linkage out and asked for it as additive v1.2.1; that addition is recorded under additive_after_v1_2 and is PROPOSED, not agreed.",
     "owners": {
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
@@ -61,14 +61,14 @@
       "path": "/v1/jobs",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest, assignment_id?}. The document must already belong to this owner+tenant; an optional assignment_id must also be an assignment of this owner+tenant (else 404 assignment_not_found) and is echoed on the job payload."
+      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest}. The document must already belong to this owner+tenant."
     },
     {
       "method": "GET",
       "path": "/v1/jobs/{job_id}",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Job state: job_id, status, attempts, max_attempts, document_digest, result_id, error_code, assignment_id (null when unlinked); a succeeded job also carries marks-only questions."
+      "purpose": "Job state: job_id, status, attempts, max_attempts, document_digest, result_id, error_code; a succeeded job also carries marks-only questions."
     },
     {
       "method": "POST",
@@ -317,7 +317,7 @@
     "logout": "stop rendering the previous sub's drafts; the bytes stay on the device under that sub key until the user discards them"
   },
   "assignments": {
-    "status": "PROPOSED_AWAITING_BOTH_CONFIRMATIONS",
+    "status": "AGREED",
     "resource": "teacher assignment (title only in v1.2)",
     "create": {
       "method": "POST",
@@ -383,5 +383,29 @@
     "semantics": "Optional carry-through on each projection question. Present when the backend has stored a value, absent otherwise; the frontend renders nothing when a field is absent (no fabrication, no client default presented as review evidence).",
     "boundary": "Richer scheme evidence - per-question mark-scheme lines, A/M/B scheme annotations, or any engine-output field beyond these four - is OUT of v1.2. It needs a separate owner-approved scope with its own contract version; it is neither invented here nor silently deferred as done.",
     "status": "PROPOSED_AWAITING_BOTH_CONFIRMATIONS"
+  },
+  "additive_after_v1_2": {
+    "version": "1.2.1",
+    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
+    "confirmed_by": "",
+    "scope": "job-to-assignment linkage: optional assignment_id on POST /v1/jobs",
+    "implemented": true,
+    "in_agreed_v1_2": false,
+    "wire": {
+      "request": {
+        "assignment_id": "optional asg_<24 lowercase hex>; omit or null = unlinked"
+      },
+      "response": {
+        "assignment_id": "echoed on job payloads; null when unlinked"
+      },
+      "errors": {
+        "400": "payload_invalid (present but blank, wrong shape, or >64 chars)",
+        "404": "assignment_not_found (not an assignment of this tenant+owner; never 403)",
+        "409": "idempotency_key_payload_mismatch (replay with a DIFFERENT assignment_id or document_digest)"
+      },
+      "database": "composite FK (tenant_id, owner_subject, assignment_id) -> assignments; cross-owner linkage refused even if the API check regresses"
+    },
+    "known_gap": "A one-way job->assignment link does not by itself deliver cross-device recovery: there is no route to enumerate an assignment's jobs (GET /v1/jobs/{id} needs a job_id the client must already have). v1.2.1 needs an assignment-scoped job listing route or an agreed client-side mapping before it can be called complete.",
+    "document_linkage": "NOT defined here: POST /v1/documents has no assignment_id and no document-registration route exists to carry one."
   }
 }

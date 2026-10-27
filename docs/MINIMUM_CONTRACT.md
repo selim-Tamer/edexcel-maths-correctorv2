@@ -1,11 +1,11 @@
-# Minimum shared API contract v1.2 (PROPOSED_AWAITING_FCM_CONFIRMATION)
+# Minimum shared API contract v1.2 (AGREED)
 
 Machine-readable source of truth: [`contract/minimum_v1.json`](../contract/minimum_v1.json).
 
-Status **PROPOSED_AWAITING_FCM_CONFIRMATION**: CM drafted v1.2 on the backend
-side; it is **not agreed** until FCM confirms this exact version in writing
-for the browser client and CM records both message ids. The previously agreed
-version was **v1.1** (FCM confirmed in message
+Status **AGREED**, confirmed 2026-10-27 by FCM for the browser client in
+message `80fcb269-eaa2-43e7-9771-e8ca996c1fca`, and recorded on the backend
+side by CM in the commit that sets this status. The previously agreed version
+was **v1.1** (FCM confirmed in message
 `2d206cc3-69d8-4b22-8859-cd08d6634612`; v1.0 in
 `68a3f090-2d3e-47e2-acf9-9dd6d2c4b20d`). Any change to a row needs a new
 numbered contract version confirmed by BOTH owners.
@@ -15,6 +15,13 @@ assignment rows, server-minted `assignment_id`, client idempotency key), the
 four projection question fields as optional carry-through, and an explicit
 boundary that richer scheme evidence is out of scope. No existing row's
 behaviour changes.
+
+**What "AGREED" does and does not cover.** It covers exactly that surface, as
+FCM verified against client head `99b73ba4` (CI `40440374586`). It does **not**
+cover job-to-assignment linkage: FCM confirmed v1.2 with linkage deliberately
+*out*, and asked for it as an additive **v1.2.1**. That addition is drafted,
+implemented and tested on the backend (section 8a) but is **PROPOSED**, not
+agreed, and the agreed v1.2 wire surface above must be read without it.
 
 
 This document exists because IFR's live-beta audit found the frontend calling
@@ -165,11 +172,12 @@ the verified token and active membership.
 
 ```jsonc
 // POST /v1/assignments  (Authorization: Bearer <google-id-token>)
-// Idempotency-Key: <8..128 chars>          <- canonical carrier
-// request body
-{ "title": "Year 10 Paper 1" }
-// (an early client may send { "idempotency_key": "...", "title": "..." } as an
-//  alias; if both are present they MUST match, otherwise 400 payload_invalid)
+// request body - this is what the agreed client sends (FCM head 99b73ba4)
+{ "idempotency_key": "<8..128 chars>", "title": "Year 10 Paper 1" }
+// The Idempotency-Key request header is accepted as an EQUAL alias (the
+// server's original carrier). Either carrier alone is enough; if both are
+// present they MUST match, otherwise 400 payload_invalid. Neither is resolved
+// by precedence, so a client cannot be surprised by the other one winning.
 // -> 201 { "assignment_id": "asg_<24 hex>", "title": "Year 10 Paper 1",
 //          "created_at": 1761600000 }
 // -> 200 identical body on same key + same title (replay)
@@ -201,7 +209,7 @@ the verified token and active membership.
 * No rename and no delete route: the runtime role has `SELECT, INSERT` only on
   the assignments table. Retention belongs to the separate elevated role.
 
-### 8a. Job-to-assignment linkage (new in v1.2, PROPOSED)
+### 8a. Job-to-assignment linkage (v1.2.1 addition, PROPOSED - NOT part of agreed v1.2)
 
 `POST /v1/jobs` accepts one **optional** field so a marking job can be followed
 from the assignment it belongs to:
@@ -225,16 +233,24 @@ from the assignment it belongs to:
   reference with a composite FK, so a code bug cannot link across owners.
 * `assignment_id` is nullable and additive: existing/unlinked jobs stay valid
   and report `null`.
-* **Document-to-assignment linkage is still NOT in v1.2.** `POST /v1/documents`
-  does not accept `assignment_id`; there is no document-registration route that
-  could carry it today. It must be agreed no later than **v1.3**.
+* **Document-to-assignment linkage is still NOT in v1.2 or 8a.**
+  `POST /v1/documents` does not accept `assignment_id`; there is no
+  document-registration route that could carry it today.
 
-**Status against FCM agreement.** Job-only linkage is implemented and tested
-here because the end-to-end assignments scope needs the job to be attributable
-to its assignment. It stays marked **PROPOSED** until FCM confirms the v1.2
-addition; a confirmation that instead requires *job + document* linkage in the
-same version needs the document half added before v1.2 is called agreed - the
-job half alone does not satisfy that variant.
+**Status: PROPOSED for v1.2.1, not agreed, and not in v1.2.** FCM's v1.2
+confirmation excluded linkage and asked for it as an additive v1.2.1, so the
+agreed v1.2 surface does not contain this field even though the backend already
+implements it. The implementation is optional and additive: a client that never
+sends `assignment_id` - which is exactly the agreed client - sees no change.
+
+**What v1.2.1 still needs before it can honestly be called recovery.** FCM's
+reason for asking is cross-device recovery of an assignment's work. A one-way
+`job -> assignment` link is not sufficient for that: given an assignment, the
+client currently has no way to enumerate its jobs (`GET /v1/jobs/{id}` needs a
+`job_id` it would have to have stored). So v1.2.1 is not complete with this
+field alone - it also needs either an assignment-scoped job listing route or a
+client-side mapping, and the document half of the linkage is still undefined
+because no document-registration route exists to carry it.
 
 ## 9. Projection question fields (new in v1.2, PROPOSED)
 
@@ -254,9 +270,11 @@ delivered.
 * Server-side **drafts** and **queue** state (still device-local), and a
   tenant-wide assignment view.
 * Validating an `assignment_id` on `POST /v1/documents`: **document-to-
-  assignment** linkage is a separate agreed addition. It MUST be agreed no
-  later than **v1.3**: it is tracked here so it cannot slip silently past the
-  next contract revision. (Job-to-assignment linkage is 8a and is optional.)
+  assignment** linkage is a separate agreed addition. It is tracked here so it
+  cannot slip silently into a later revision; it needs a route decision first
+  (there is no document-registration route to carry the link).
+* Job-to-assignment linkage in the **agreed v1.2** surface. It is section 8a,
+  PROPOSED for v1.2.1 only; the v1.2 wire surface is unchanged by it.
 * A `GET /v1/assignments/{id}/jobs` collection route: the client keeps polling
   `GET /v1/jobs/{job_id}`, and `assignment_id` on the job payload is the link.
 * Signed upload URLs and direct-to-bucket writes.
