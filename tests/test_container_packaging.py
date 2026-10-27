@@ -47,12 +47,16 @@ class DockerfileContractTests(unittest.TestCase):
         cls.text = DOCKERFILE.read_text(encoding="utf-8")
         cls.ignore = DOCKERIGNORE.read_text(encoding="utf-8")
 
-    def test_base_image_is_pinned_by_version_not_latest(self):
+    def test_base_image_is_pinned_by_tag_and_digest(self):
         from_lines = [line for line in self.text.splitlines()
                       if line.strip().upper().startswith("FROM ")]
         self.assertEqual(1, len(from_lines), "exactly one build stage")
         image = from_lines[0].split()[1]
-        self.assertRegex(image, r"^python:3\.\d+-slim-bookworm$")
+        name, separator, digest = image.partition("@sha256:")
+        self.assertEqual("python:3.13-slim-bookworm", name)
+        self.assertEqual("@sha256:", separator,
+                         "the base image must be digest-pinned")
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
         self.assertNotIn(":latest", image)
 
     def test_installs_the_single_reviewed_manifest(self):

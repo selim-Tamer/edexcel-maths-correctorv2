@@ -15,14 +15,17 @@
 #     /app/scheme.pdf (read-only) and pointed at by AI_MARKER_MARK_SCHEME.
 #     A real exam board scheme is licensed content and must never live in git.
 #   * It runs NO migration and contacts NO database at build time.
-#   * The base tag is pinned by version, not digest: this build is reproducible
-#     for a given registry mirror, and CI should record the resolved digest with
-#     the image tag (docs/BETA_DEPLOY_SETUP.md 6).
+#   * The base image is pinned by tag AND digest. python:3.13-slim-bookworm
+#     resolved to the multi-arch index digest
+#     sha256:7f40274ed887f9b12d9b7a4a37343ebc783390f9be6e13d9e99ba1e2147e5f26
+#     on 2026-10-27 (Docker Hub registry manifest, see
+#     docs/CONTAINER_BASE_IMAGE_EVIDENCE.md). The digest is not decorative:
+#     it is what makes the base bytes reproducible when the tag moves.
 #
 # Least privilege: the process runs as the unprivileged "app" user (UID 10001),
 # owns only /app, and has no shell-accessible secret material.
 
-FROM python:3.13-slim-bookworm
+FROM python:3.13-slim-bookworm@sha256:7f40274ed887f9b12d9b7a4a37343ebc783390f9be6e13d9e99ba1e2147e5f26
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
