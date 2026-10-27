@@ -337,7 +337,11 @@ Preconditions, all of which must hold:
 * 0001-0005 applied and verified (section 4 + 4.2) on the target project;
 * the credential used is the project **owner/superuser** (Supabase `postgres`)
   on a **direct or session connection, port 5432** - never the transaction
-  pooler, and never a runtime login;
+  pooler, and never a runtime login. The runnable preflight below asserts
+  `rolsuper or rolbypassrls` for the session: FORCE RLS binds even the table
+  owner, and Supabase's `postgres` is not a superuser but does hold
+  `BYPASSRLS`. Proving the bypass (rather than assuming it) also means the
+  "existing but inactive" refusal below cannot be fooled by an empty read;
 * the password comes from `PGPASSFILE` / the interactive prompt, never a
   command line, log or chat;
 * Free-plan connection limits respected: 60 direct connections, 200 pooler
@@ -351,6 +355,23 @@ are refused as `membership_ambiguous` and the API never picks one.
 -- Operator, project owner/superuser, direct 5432. Placeholders in <>.
 -- One transaction: tenant first (FK), then the membership.
 begin;
+
+-- Preflight: PROVE the session bypasses RLS instead of assuming it. The v2
+-- hardening uses ENABLE + FORCE, so even the TABLE OWNER is bound by the
+-- tenant_isolation policy. On Supabase the `postgres` role is NOT a superuser
+-- but DOES hold BYPASSRLS, so seeding works there - and this block proves that
+-- is why, rather than trusting the role's name. Without the bypass the
+-- existence checks below would read zero rows and a live membership could
+-- look absent, which is the dangerous direction.
+do $$
+begin
+    if not coalesce((select rolsuper or rolbypassrls
+                     from pg_roles where rolname = current_user), false) then
+        raise exception
+            'seeding role % is neither superuser nor BYPASSRLS: FORCE RLS would hide existing rows - use the project owner/superuser',
+            current_user;
+    end if;
+end $$;
 
 insert into tenants (tenant_id) values ('<tenant-id>')
 on conflict (tenant_id) do nothing;
