@@ -246,13 +246,22 @@ class PostgresJobStoreContractTests(unittest.TestCase):
                 " VALUES (%s, %s, %s, %s, %s, %s)",
                 (OTHER_TENANT, OTHER_OWNER, "asg_" + "b" * 24,
                  "assign-other-key", "Other", int(time.time())))
-        with self.assertRaises((psycopg.errors.ForeignKeyViolation,
-                                psycopg.errors.InsufficientPrivilege)):
+        with self.assertRaises(JobStoreError) as caught:
             postgres_job_store.create_job(
                 self.connection, tenant_id=TENANT, owner=OWNER,
                 idempotency_key="job-cross-link-0001",
                 document_digest="d" * 64,
                 assignment_id="asg_" + "b" * 24)
+        # Defence in depth: the composite FK refuses, and the store reports the
+        # product-level 404 detail - not store_unusable (whole store down) and
+        # never success. Nothing is partially written.
+        self.assertEqual("assignment_not_found", caught.exception.detail)
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            count = admin.execute(
+                "SELECT count(*) FROM marking_jobs"
+                " WHERE idempotency_key = %s",
+                ("job-cross-link-0001",)).fetchone()[0]
+        self.assertEqual(0, count)
 
     def test_create_is_idempotent_and_refuses_retargeting(self):
         created = postgres_job_store.create_job(

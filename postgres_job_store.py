@@ -59,6 +59,27 @@ def _rows_to_job(row) -> dict:
     return dict(zip(_JOB_COLUMNS, row))
 
 
+def _assignment_link_error(error):
+    """Translate ONLY the 0008 composite-FK refusal into a product error.
+
+    The API validates assignment ownership before it writes, so this branch is
+    defence in depth: it fires when a caller reached the store directly, or
+    when the assignment was removed between the API check and the insert. It
+    must not be reported as ``store_unusable`` (that would tell the client the
+    whole store is down) and it must not be reported as success.
+
+    Narrow on purpose: sqlstate 23503 AND the exact constraint name. Any other
+    foreign-key refusal (for example the membership reference) keeps the
+    existing generic mapping.
+    """
+    if getattr(error, "sqlstate", None) != "23503":
+        return None
+    diag = getattr(error, "diag", None)
+    if getattr(diag, "constraint_name", None) != "fk_marking_jobs_assignment":
+        return None
+    return JobStoreError("assignment_not_found")
+
+
 def open_store(dsn: str):
     """Connect and validate (never create) the 0003 job schema."""
     import psycopg  # lazy: only the Postgres path needs the driver
@@ -177,7 +198,8 @@ def create_job(connection, *, tenant_id: str, owner: str,
     except JobStoreError:
         raise
     except Exception as error:
-        raise JobStoreError("store_unusable") from error
+        raise _assignment_link_error(error) or JobStoreError(
+            "store_unusable") from error
 
 
 def get_job(connection, *, tenant_id: str, owner: str, job_id: str):
