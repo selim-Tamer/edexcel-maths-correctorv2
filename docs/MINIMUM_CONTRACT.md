@@ -218,7 +218,9 @@ from the assignment it belongs to:
 // POST /v1/jobs   (existing body plus:)
 { "idempotency_key": "...", "document_digest": "<sha256 hex>",
   "assignment_id": "asg_<24 hex>" }   // OPTIONAL; omit or null = unlinked
-// -> 201/200 job payload gains: "assignment_id": "asg_..." | null
+// -> 201/200 job payload gains "assignment_id": "asg_..." ONLY when linked;
+//    an unlinked job omits the field entirely (absent-means-omit), so the
+//    agreed v1.2 payload for that job is byte-identical
 // -> 400 payload_invalid  when assignment_id is present but blank,
 //    not the server's `asg_<24 lowercase hex>` shape, or >64 chars
 // -> 404 assignment_not_found when the id is not an assignment of THIS
@@ -232,7 +234,7 @@ from the assignment it belongs to:
   client never supplies tenant or owner. The database enforces the same
   reference with a composite FK, so a code bug cannot link across owners.
 * `assignment_id` is nullable and additive: existing/unlinked jobs stay valid
-  and report `null`.
+  and simply omit the field from their payload.
 * **Document-to-assignment linkage is still NOT in v1.2 or 8a.**
   `POST /v1/documents` does not accept `assignment_id`; there is no
   document-registration route that could carry it today.

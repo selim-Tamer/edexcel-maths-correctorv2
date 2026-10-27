@@ -1000,8 +1000,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                    "max_attempts": int(job["max_attempts"]),
                    "document_digest": job["document_digest"],
                    "result_id": job["result_id"],
-                   "error_code": job["error_code"],
-                   "assignment_id": job.get("assignment_id")}
+                   "error_code": job["error_code"]}
+        # Absent-means-omit, like the projection question fields: an UNLINKED
+        # job's payload is byte-identical to the AGREED v1.2 shape, so a client
+        # that validates responses strictly (or predates the v1.2.1 addition)
+        # cannot be broken by a field it never asked for. Only a client that
+        # sent assignment_id ever sees it.
+        if job.get("assignment_id") is not None:
+            payload["assignment_id"] = job["assignment_id"]
         if job["status"] == "succeeded" and job.get("result_id"):
             questions = _marks_only(job.get("owner_subject"), job["result_id"])
             if questions is not None:

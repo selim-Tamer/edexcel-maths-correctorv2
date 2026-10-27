@@ -396,7 +396,7 @@
         "assignment_id": "optional asg_<24 lowercase hex>; omit or null = unlinked"
       },
       "response": {
-        "assignment_id": "echoed on job payloads; null when unlinked"
+        "assignment_id": "present ONLY on a linked job (null is never emitted), so an unlinked job's payload is byte-identical to the agreed v1.2 shape"
       },
       "errors": {
         "400": "payload_invalid (present but blank, wrong shape, or >64 chars)",

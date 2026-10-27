@@ -121,9 +121,19 @@ class JobApiTests(unittest.TestCase):
         self.assertEqual(200, status.status_code, status.text)
         self.assertEqual(assignment_id, status.json()["assignment_id"])
 
-    def test_unlinked_jobs_still_report_a_null_assignment(self):
+    def test_unlinked_jobs_keep_the_agreed_v1_2_payload_shape(self):
+        """Absent-means-omit: an unlinked job must not grow a null field.
+
+        The agreed v1.2 response shape did not contain assignment_id. Emitting
+        null on every job would change bytes for a client that never opted in,
+        so the field appears only when a link exists.
+        """
         payload = self._create().json()
-        self.assertIsNone(payload["assignment_id"])
+        self.assertNotIn("assignment_id", payload)
+        status = self.client.get(f"/v1/jobs/{payload['job_id']}",
+                                 headers=self._headers())
+        self.assertEqual(200, status.status_code, status.text)
+        self.assertNotIn("assignment_id", status.json())
 
     def test_malformed_assignment_id_is_payload_invalid(self):
         for bad in ("asg_nothex", "asg_" + "A" * 24, "assignment-1", " "):
