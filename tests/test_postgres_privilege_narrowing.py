@@ -134,6 +134,20 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
             "SELECT has_column_privilege(%s, 'public.results', %s, %s)",
             (role, column, privilege)).fetchone()[0]
 
+    def _explicit_column_grant(self, role, column, privilege="UPDATE"):
+        """Is there a COLUMN-scoped grant row (not implied by table UPDATE)?
+
+        ``has_column_privilege`` answers "can this role update this column",
+        which a table-wide grant also satisfies. To tell the narrowed shape
+        apart from the 0002 shape we need the explicit grant row itself.
+        """
+        row = self._database_admin().execute(
+            "SELECT 1 FROM information_schema.role_column_grants"
+            " WHERE grantee = %s AND table_name = 'results'"
+            " AND column_name = %s AND privilege_type = %s",
+            (role, column, privilege)).fetchone()
+        return row is not None
+
     # --- the grant itself -------------------------------------------------
 
     def test_marker_keeps_only_the_revision_column_update(self):
@@ -142,6 +156,9 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
                 self.assertFalse(self._has(role, None),
                                  "table-wide UPDATE must be gone")
                 self.assertTrue(self._has(role, "result_revision"))
+                self.assertTrue(
+                    self._explicit_column_grant(role, "result_revision"),
+                    "the narrowing must be an explicit COLUMN grant")
                 for column in OTHER_COLUMNS:
                     self.assertFalse(self._has(role, column),
                                      f"{role} must not update {column}")
@@ -206,8 +223,12 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
         with psycopg.connect(_dsn(), autocommit=True) as setup:
             _execute_sql_file(setup,
                               "postgres_v6_result_narrowing_rollback.sql")
-            self.assertFalse(self._has("marker_app", "result_revision"))
+            # 0002 shape is back: table-wide UPDATE, and NO column-scoped grant
+            # row. (has_column_privilege is true again here BECAUSE the table
+            # grant implies it, so the explicit row is the real discriminator.)
             self.assertTrue(self._has("marker_app", None))
+            self.assertFalse(
+                self._explicit_column_grant("marker_app", "result_revision"))
             marker = setup.execute(
                 "SELECT 1 FROM schema_meta"
                 " WHERE key = 'results_update_version'").fetchone()
@@ -217,7 +238,8 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
                     setup, "postgres_v6_result_narrowing_rollback.sql")
             # Restore the narrowed state for any later test/order.
             _execute_sql_file(setup, "postgres_v6_result_narrowing.sql")
-            self.assertTrue(self._has("marker_app", "result_revision"))
+            self.assertTrue(
+                self._explicit_column_grant("marker_app", "result_revision"))
             self.assertFalse(self._has("marker_app", None))
 
 
