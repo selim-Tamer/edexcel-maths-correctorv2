@@ -1,0 +1,43 @@
+# Context minimisation for the Cloud Run image.
+# The image needs: requirements.txt, the runtime modules at the repository
+# root, and api/. Everything else is build-independent noise or content that
+# must never enter an image layer.
+
+.git
+.github
+.devcontainer
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.sqlite3
+*.db
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests, benchmarks and investigations are not runtime code.
+tests
+investigation
+benchmarks
+*.md
+!requirements.txt
+
+# Secrets, local data and licensed content: never bake these.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+secrets
+scheme.pdf
+scheme/
+*.pdf
+*.zip
+*.log
+
+# Editor / OS noise.
+.vscode
+.idea
+.DS_Store
+Thumbs.db
