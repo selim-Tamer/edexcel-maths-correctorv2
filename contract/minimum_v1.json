@@ -110,7 +110,7 @@
       "path": "/v1/assignments",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Create or replay one server-owned teacher assignment. Body {idempotency_key, title}. tenant/owner come only from the verified token; assignment_id is minted server-side (asg_ + 24 hex). 201 {assignment_id,title,created_at}; 200 same body on same-key/same-title replay; 409 idempotency_key_payload_mismatch on same key with a different title; 400 payload_invalid for a blank/over-200 title or a malformed key."
+      "purpose": "Create or replay one server-owned teacher assignment. Header Idempotency-Key (canonical; body idempotency_key accepted only as an equal alias) + body {title}. tenant/owner come only from the verified token; assignment_id is minted server-side (asg_ + 24 hex). 201 {assignment_id,title,created_at}; 200 same body on same-key/same-title replay; 409 idempotency_key_payload_mismatch on same key with a different title; 400 payload_invalid for a blank/over-200 title, a missing or malformed key, or header/body keys that differ."
     },
     {
       "method": "GET",
@@ -323,8 +323,13 @@
       "method": "POST",
       "path": "/v1/assignments",
       "request": {
-        "idempotency_key": "required, string, 8..128 chars, no '/', no control chars",
-        "title": "required, string, trimmed, 1..200 chars after trimming"
+        "headers": {
+          "Idempotency-Key": "required (canonical carrier): string 8..128 chars, no '/', no control chars"
+        },
+        "body": {
+          "title": "required, string, trimmed, 1..200 chars after trimming",
+          "idempotency_key": "optional alias; if present it MUST equal Idempotency-Key, otherwise 400 payload_invalid"
+        }
       },
       "response_created": {
         "status": 201,
@@ -339,7 +344,7 @@
         "body": "identical to the created body for the same key + title"
       },
       "errors": {
-        "400": "payload_invalid (blank/over-long title, malformed key, malformed cursor)",
+        "400": "payload_invalid (blank/over-long title, missing/malformed key, header/body key mismatch, malformed cursor)",
         "401": "authentication_required",
         "403": "tenant_membership_required",
         "409": "idempotency_key_payload_mismatch",

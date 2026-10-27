@@ -56,9 +56,10 @@ class AssignmentApiTests(unittest.TestCase):
 
     def _create(self, key="assignment-key-0001", title="Year 10 Paper 1",
                 token="tok-a", client=None):
+        headers = dict(self._headers(token))
+        headers["Idempotency-Key"] = key
         return (client or self.client).post(
-            "/v1/assignments", headers=self._headers(token),
-            json={"idempotency_key": key, "title": title})
+            "/v1/assignments", headers=headers, json={"title": title})
 
     # --- create / idempotency -------------------------------------------
 
@@ -105,6 +106,38 @@ class AssignmentApiTests(unittest.TestCase):
             "/v1/assignments", headers=self._headers(), json={"title": "x"})
         self.assertEqual(400, response.status_code, response.text)
         self.assertEqual("payload_invalid", response.json()["error"]["code"])
+
+    def test_header_is_the_canonical_idempotency_carrier(self):
+        headers = dict(self._headers())
+        headers["Idempotency-Key"] = "header-key-0001"
+        response = self.client.post("/v1/assignments", headers=headers,
+                                    json={"title": "Header carried"})
+        self.assertEqual(201, response.status_code, response.text)
+
+    def test_body_alias_still_works(self):
+        response = self.client.post(
+            "/v1/assignments", headers=self._headers(),
+            json={"idempotency_key": "body-key-00001", "title": "Body alias"})
+        self.assertEqual(201, response.status_code, response.text)
+
+    def test_header_and_body_key_must_match(self):
+        headers = dict(self._headers())
+        headers["Idempotency-Key"] = "header-key-0002"
+        response = self.client.post(
+            "/v1/assignments", headers=headers,
+            json={"idempotency_key": "body-key-00002", "title": "Mismatch"})
+        self.assertEqual(400, response.status_code, response.text)
+        self.assertEqual("payload_invalid", response.json()["error"]["code"])
+
+    def test_header_and_matching_body_key_replay_the_same_row(self):
+        headers = dict(self._headers())
+        headers["Idempotency-Key"] = "match-key-00001"
+        body = {"idempotency_key": "match-key-00001", "title": "Matched"}
+        first = self.client.post("/v1/assignments", headers=headers, json=body)
+        second = self.client.post("/v1/assignments", headers=headers, json=body)
+        self.assertEqual(201, first.status_code)
+        self.assertEqual(200, second.status_code)
+        self.assertEqual(first.json(), second.json())
 
     # --- validation ------------------------------------------------------
 

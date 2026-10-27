@@ -165,13 +165,17 @@ the verified token and active membership.
 
 ```jsonc
 // POST /v1/assignments  (Authorization: Bearer <google-id-token>)
-// request
-{ "idempotency_key": "<8..128 chars>", "title": "Year 10 Paper 1" }
+// Idempotency-Key: <8..128 chars>          <- canonical carrier
+// request body
+{ "title": "Year 10 Paper 1" }
+// (an early client may send { "idempotency_key": "...", "title": "..." } as an
+//  alias; if both are present they MUST match, otherwise 400 payload_invalid)
 // -> 201 { "assignment_id": "asg_<24 hex>", "title": "Year 10 Paper 1",
 //          "created_at": 1761600000 }
 // -> 200 identical body on same key + same title (replay)
 // -> 409 idempotency_key_payload_mismatch on same key + different title
-// -> 400 payload_invalid on blank/whitespace title or >200 chars after trim
+// -> 400 payload_invalid on blank/whitespace title, >200 chars after trim,
+//    or a missing/conflicting idempotency key
 ```
 
 * `assignment_id` is **minted by the server**; the client never sends one.

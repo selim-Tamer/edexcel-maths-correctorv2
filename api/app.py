@@ -225,10 +225,18 @@ class AssignmentRequest(BaseModel):
     The client supplies a title and an idempotency key only. It never chooses
     ``assignment_id``, the owner or the tenant: those are server decisions
     derived from the verified token (and the id is minted here).
+
+    Idempotency is carried in the ``Idempotency-Key`` header (the canonical
+    wire form FCM asked for). The body field is an accepted alias so an early
+    client build that sent it does not break; when both are present they MUST
+    match, otherwise the request is refused rather than silently preferring
+    one.
     """
 
-    idempotency_key: str = Field(min_length=8, max_length=128)
     title: str = Field(min_length=1, max_length=200)
+    idempotency_key: Optional[str] = Field(default=None, min_length=8,
+                                           max_length=128)
+
 
 
 def _encode_assignment_cursor(created_at: int, assignment_id: str) -> str:
@@ -1053,20 +1061,35 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         return job_payload(job)
 
     @app.post("/v1/assignments", status_code=201)
-    def create_assignment(body: AssignmentRequest, who=Depends(actor)):
+    def create_assignment(
+            body: AssignmentRequest,
+            idempotency_key_header: Optional[str] = Header(
+                default=None, alias="Idempotency-Key"),
+            who=Depends(actor)):
         """Create (or replay) one server-owned teacher assignment.
 
         Identity is the verified token: ``tenant_id``/``owner_subject`` come
         from ``actor`` and the body can neither set nor override them.
         ``assignment_id`` is minted server-side; the client only supplies an
-        idempotency key. Same key + same title replays the SAME assignment
-        (200); same key + different title is refused 409
+        idempotency key - canonically in the ``Idempotency-Key`` header, with
+        the body field accepted as an equal alias. Supplying both with
+        different values is refused (payload_invalid), never resolved by
+        precedence. Same key + same title replays the SAME assignment (200);
+        same key + different title is refused 409
         ``idempotency_key_payload_mismatch``.
         """
         subject, owner, tenant_id = who
+        header_key = (idempotency_key_header or "").strip()
+        body_key = (body.idempotency_key or "").strip()
+        if header_key and body_key and header_key != body_key:
+            raise ApiError("payload_invalid",
+                           "Idempotency-Key and the body key must match")
+        key_value = header_key or body_key
+        if not key_value:
+            raise ApiError("payload_invalid",
+                           "an Idempotency-Key header is required")
         try:
-            key = assignment_store.normalize_idempotency_key(
-                body.idempotency_key)
+            key = assignment_store.normalize_idempotency_key(key_value)
             title = assignment_store.normalize_title(body.title)
         except assignment_store.AssignmentStoreError as failure:
             raise ApiError(failure.detail, "the assignment payload is invalid")
