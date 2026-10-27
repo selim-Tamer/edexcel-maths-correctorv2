@@ -61,14 +61,14 @@
       "path": "/v1/jobs",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest}. The document must already belong to this owner+tenant."
+      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest, assignment_id?}. The document must already belong to this owner+tenant; an optional assignment_id must also be an assignment of this owner+tenant (else 404 assignment_not_found) and is echoed on the job payload."
     },
     {
       "method": "GET",
       "path": "/v1/jobs/{job_id}",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Job state: job_id, status, attempts, max_attempts, document_digest, result_id, error_code; a succeeded job also carries marks-only questions."
+      "purpose": "Job state: job_id, status, attempts, max_attempts, document_digest, result_id, error_code, assignment_id (null when unlinked); a succeeded job also carries marks-only questions."
     },
     {
       "method": "POST",

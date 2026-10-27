@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 
+import assignment_store
 import audit_store
 import document_store
 import ingest_registry
@@ -55,6 +56,9 @@ class JobApiTests(unittest.TestCase):
             document_store.ACK_ENV: "1",
             job_store.PATH_ENV: os.path.join(self.tmp.name, "jobs.sqlite3"),
             job_store.ACK_ENV: "1",
+            assignment_store.PATH_ENV: os.path.join(self.tmp.name,
+                                                    "assignments.sqlite3"),
+            assignment_store.ACK_ENV: "1",
         }
         for name, value in self._env.items():
             os.environ[name] = value
@@ -87,9 +91,81 @@ class JobApiTests(unittest.TestCase):
             json={"idempotency_key": key,
                   "document_digest": digest or self.digest})
 
+    def _create_assignment(self, key="assign-key-0001",
+                           title="Year 10 Paper 1", token="tok-a",
+                           client=None):
+        headers = self._headers(token)
+        headers["Idempotency-Key"] = key
+        return (client or self.client).post(
+            "/v1/assignments", headers=headers, json={"title": title})
+
     def _run(self, job_id, token="tok-a", client=None):
         return (client or self.client).post(
             f"/v1/jobs/{job_id}/run", headers=self._headers(token))
+
+    def test_job_links_to_an_owned_assignment_end_to_end(self):
+        created = self._create_assignment()
+        self.assertEqual(201, created.status_code, created.text)
+        assignment_id = created.json()["assignment_id"]
+
+        linked = self.client.post(
+            "/v1/jobs", headers=self._headers(),
+            json={"idempotency_key": "job-link-key-0001",
+                  "document_digest": self.digest,
+                  "assignment_id": assignment_id})
+        self.assertEqual(201, linked.status_code, linked.text)
+        self.assertEqual(assignment_id, linked.json()["assignment_id"])
+
+        status = self.client.get(f"/v1/jobs/{linked.json()['job_id']}",
+                                 headers=self._headers())
+        self.assertEqual(200, status.status_code, status.text)
+        self.assertEqual(assignment_id, status.json()["assignment_id"])
+
+    def test_unlinked_jobs_still_report_a_null_assignment(self):
+        payload = self._create().json()
+        self.assertIsNone(payload["assignment_id"])
+
+    def test_malformed_assignment_id_is_payload_invalid(self):
+        for bad in ("asg_nothex", "asg_" + "A" * 24, "assignment-1", " "):
+            with self.subTest(value=bad):
+                response = self.client.post(
+                    "/v1/jobs", headers=self._headers(),
+                    json={"idempotency_key": "job-bad-asg-0001",
+                          "document_digest": self.digest,
+                          "assignment_id": bad})
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+
+    def test_another_owners_assignment_is_indistinguishable_not_found(self):
+        created = self._create_assignment()
+        assignment_id = created.json()["assignment_id"]
+        other = self._client(TENANT, engine_marker=None)
+        response = other.post(
+            "/v1/jobs", headers=self._headers("tok-b"),
+            json={"idempotency_key": "job-other-owner-0001",
+                  "document_digest": self.digest,
+                  "assignment_id": assignment_id})
+        self.assertEqual(404, response.status_code, response.text)
+        self.assertEqual("assignment_not_found",
+                         response.json()["error"]["code"])
+
+    def test_replay_with_a_different_assignment_is_a_conflict(self):
+        first = self._create_assignment(key="assign-key-a", title="A")
+        second = self._create_assignment(key="assign-key-b", title="B")
+        body = {"idempotency_key": "job-retarget-0001",
+                "document_digest": self.digest,
+                "assignment_id": first.json()["assignment_id"]}
+        created = self.client.post("/v1/jobs", headers=self._headers(),
+                                   json=body)
+        self.assertEqual(201, created.status_code, created.text)
+        retargeted = dict(body,
+                          assignment_id=second.json()["assignment_id"])
+        replay = self.client.post("/v1/jobs", headers=self._headers(),
+                                  json=retargeted)
+        self.assertEqual(409, replay.status_code, replay.text)
+        self.assertEqual("idempotency_key_payload_mismatch",
+                         replay.json()["error"]["code"])
 
     def test_create_mints_the_job_and_replays_idempotently(self):
         first = self._create()

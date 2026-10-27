@@ -486,7 +486,7 @@
     {
       "method": "POST",
       "path": "/v1/jobs",
-      "purpose": "Create (or idempotently replay) one durable marking job for a document this owner already uploaded. job_id is minted server-side; the client supplies only the idempotency key and the document digest.",
+      "purpose": "Create (or idempotently replay) one durable marking job for a document this owner already uploaded. job_id is minted server-side; the client supplies only the idempotency key and the document digest, plus an OPTIONAL server-validated assignment_id link.",
       "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
@@ -508,6 +508,15 @@
             "type": "string",
             "minLength": 64,
             "maxLength": 64
+          },
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^asg_[0-9a-f]{24}$"
           }
         }
       },
@@ -522,7 +531,8 @@
         "result_not_registered",
         "idempotency_key_payload_mismatch",
         "dev_opt_in_required",
-        "store_unusable"
+        "store_unusable",
+        "assignment_not_found"
       ]
     },
     {
@@ -542,7 +552,8 @@
           "max_attempts",
           "document_digest",
           "result_id",
-          "error_code"
+          "error_code",
+          "assignment_id"
         ],
         "properties": {
           "job_id": {
@@ -598,6 +609,12 @@
                 }
               }
             }
+          },
+          "assignment_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

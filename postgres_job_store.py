@@ -46,7 +46,7 @@ TENANT_GUC = "app.tenant_id"
 _JOB_COLUMNS = ("tenant_id", "owner_subject", "job_id", "idempotency_key",
                 "document_digest", "status", "attempts", "max_attempts",
                 "lease_until", "result_id", "error_code", "created_at",
-                "updated_at")
+                "updated_at", "assignment_id")
 
 
 def _bind_tenant(connection, tenant_id: str) -> None:
@@ -77,13 +77,19 @@ def open_store(dsn: str):
             present = connection.execute(
                 "SELECT to_regclass('public.marking_jobs')"
             ).fetchone()
+            linkage = connection.execute(
+                "SELECT value FROM schema_meta"
+                " WHERE key = 'job_assignment_linkage_version'"
+            ).fetchone()
     except Exception as error:
         try:
             connection.close()
         except Exception:
             pass
         raise JobStoreError("store_unusable") from error
-    if row is None or str(row[0]) != "1" or present is None or present[0] is None:
+    if (row is None or str(row[0]) != "1" or present is None
+            or present[0] is None or linkage is None
+            or str(linkage[0]) != "1"):
         try:
             connection.close()
         except Exception:
@@ -133,11 +139,13 @@ def find_runnable_job(connection, *, tenant_id: str,
 
 def create_job(connection, *, tenant_id: str, owner: str,
                idempotency_key: str, document_digest: str,
+               assignment_id: str = None,
                max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict:
     """Create (or replay) a job. Returns ``job_id``, ``created``, digest.
 
-    Replay of the SAME key for the SAME digest returns the stored job with
-    ``created=False``; the same key for a DIFFERENT document is refused.
+    Replay of the SAME key for the SAME digest and assignment returns the
+    stored job with ``created=False``; the same key for a DIFFERENT document
+    or a different assignment link is refused.
     """
     now = int(time.time())
     job_id = mint_job_id(tenant_id, owner, idempotency_key)
@@ -145,24 +153,27 @@ def create_job(connection, *, tenant_id: str, owner: str,
         with connection.transaction():
             _bind_tenant(connection, tenant_id)
             prior = connection.execute(
-                "SELECT document_digest, job_id FROM marking_jobs"
+                "SELECT document_digest, job_id, assignment_id FROM marking_jobs"
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND idempotency_key = %s",
                 (tenant_id, owner, idempotency_key)).fetchone()
             if prior is not None:
-                if prior[0] != document_digest:
+                if prior[0] != document_digest or prior[2] != assignment_id:
                     raise JobStoreError("idempotency_key_payload_mismatch")
                 return {"job_id": prior[1], "created": False,
-                        "document_digest": prior[0]}
+                        "document_digest": prior[0],
+                        "assignment_id": prior[2]}
             connection.execute(
                 "INSERT INTO marking_jobs (tenant_id, owner_subject, job_id,"
                 " idempotency_key, document_digest, status, attempts,"
-                " max_attempts, lease_until, created_at, updated_at)"
-                " VALUES (%s, %s, %s, %s, %s, 'queued', 0, %s, 0, %s, %s)",
+                " max_attempts, lease_until, created_at, updated_at,"
+                " assignment_id)"
+                " VALUES (%s, %s, %s, %s, %s, 'queued', 0, %s, 0, %s, %s, %s)",
                 (tenant_id, owner, job_id, idempotency_key, document_digest,
-                 int(max_attempts), now, now))
+                 int(max_attempts), now, now, assignment_id))
         return {"job_id": job_id, "created": True,
-                "document_digest": document_digest}
+                "document_digest": document_digest,
+                "assignment_id": assignment_id}
     except JobStoreError:
         raise
     except Exception as error:

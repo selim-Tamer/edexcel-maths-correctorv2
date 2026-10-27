@@ -201,6 +201,41 @@ the verified token and active membership.
 * No rename and no delete route: the runtime role has `SELECT, INSERT` only on
   the assignments table. Retention belongs to the separate elevated role.
 
+### 8a. Job-to-assignment linkage (new in v1.2, PROPOSED)
+
+`POST /v1/jobs` accepts one **optional** field so a marking job can be followed
+from the assignment it belongs to:
+
+```jsonc
+// POST /v1/jobs   (existing body plus:)
+{ "idempotency_key": "...", "document_digest": "<sha256 hex>",
+  "assignment_id": "asg_<24 hex>" }   // OPTIONAL; omit or null = unlinked
+// -> 201/200 job payload gains: "assignment_id": "asg_..." | null
+// -> 400 payload_invalid  when assignment_id is present but blank,
+//    not the server's `asg_<24 lowercase hex>` shape, or >64 chars
+// -> 404 assignment_not_found when the id is not an assignment of THIS
+//    owner+tenant (an id owned by someone else is indistinguishable from one
+//    that does not exist - never 403)
+// -> 409 idempotency_key_payload_mismatch when a replayed key carries a
+//    DIFFERENT assignment_id (or document_digest) than the stored job
+```
+
+* The server validates ownership on the **verified token's** tenant+owner; the
+  client never supplies tenant or owner. The database enforces the same
+  reference with a composite FK, so a code bug cannot link across owners.
+* `assignment_id` is nullable and additive: existing/unlinked jobs stay valid
+  and report `null`.
+* **Document-to-assignment linkage is still NOT in v1.2.** `POST /v1/documents`
+  does not accept `assignment_id`; there is no document-registration route that
+  could carry it today. It must be agreed no later than **v1.3**.
+
+**Status against FCM agreement.** Job-only linkage is implemented and tested
+here because the end-to-end assignments scope needs the job to be attributable
+to its assignment. It stays marked **PROPOSED** until FCM confirms the v1.2
+addition; a confirmation that instead requires *job + document* linkage in the
+same version needs the document half added before v1.2 is called agreed - the
+job half alone does not satisfy that variant.
+
 ## 9. Projection question fields (new in v1.2, PROPOSED)
 
 `review_status`, `corrected`, `last_action` and `last_reason` are **optional
@@ -218,10 +253,12 @@ delivered.
 
 * Server-side **drafts** and **queue** state (still device-local), and a
   tenant-wide assignment view.
-* Validating an `assignment_id` on `POST /v1/documents` or `POST /v1/jobs`;
-  document/job-to-assignment linkage is a separate agreed addition. It MUST be
-  agreed no later than **v1.3**: it is tracked here so it cannot slip silently
-  past the next contract revision.
+* Validating an `assignment_id` on `POST /v1/documents`: **document-to-
+  assignment** linkage is a separate agreed addition. It MUST be agreed no
+  later than **v1.3**: it is tracked here so it cannot slip silently past the
+  next contract revision. (Job-to-assignment linkage is 8a and is optional.)
+* A `GET /v1/assignments/{id}/jobs` collection route: the client keeps polling
+  `GET /v1/jobs/{job_id}`, and `assignment_id` on the job payload is the link.
 * Signed upload URLs and direct-to-bucket writes.
 * `cancel` / `pause` / `resume` for jobs.
 * A submission resource separate from `result_id`.

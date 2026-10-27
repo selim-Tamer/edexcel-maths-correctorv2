@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS marking_jobs (
     error_code      TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
+    assignment_id   TEXT,
     PRIMARY KEY (tenant_id, owner_subject, job_id),
     UNIQUE (tenant_id, owner_subject, idempotency_key)
 )
@@ -71,6 +72,11 @@ def open_store(path: str) -> sqlite3.Connection:
     try:
         connection = sqlite3.connect(path, timeout=10)
         connection.execute(_SCHEMA)
+        columns = {row[1] for row in
+                   connection.execute("PRAGMA table_info(marking_jobs)")}
+        if "assignment_id" not in columns:
+            connection.execute(
+                "ALTER TABLE marking_jobs ADD COLUMN assignment_id TEXT")
         connection.commit()
     except sqlite3.Error:
         raise JobStoreError("store_unusable")
@@ -97,44 +103,47 @@ def _row_to_job(row) -> dict:
     keys = ("tenant_id", "owner_subject", "job_id", "idempotency_key",
             "document_digest", "status", "attempts", "max_attempts",
             "lease_until", "result_id", "error_code", "created_at",
-            "updated_at")
+            "updated_at", "assignment_id")
     return dict(zip(keys, row))
 
 
 def create_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
                 idempotency_key: str, document_digest: str,
+                assignment_id: str = None,
                 max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict:
     """Create (or replay) a job. Returns the job plus ``created``.
 
-    Replay of the SAME key for the SAME digest returns the stored job with
-    created=False; the same key for a DIFFERENT document is refused - a
-    client cannot silently retarget an existing job.
+    Replay of the SAME key for the SAME digest and assignment returns the
+    stored job with created=False; the same key for a DIFFERENT document (or a
+    different assignment link) is refused - a client cannot silently retarget
+    an existing job.
     """
     now = int(time.time())
     job_id = mint_job_id(tenant_id, owner, idempotency_key)
     try:
         connection.execute("BEGIN IMMEDIATE")
         prior = connection.execute(
-            "SELECT document_digest, job_id FROM marking_jobs"
+            "SELECT document_digest, job_id, assignment_id FROM marking_jobs"
             " WHERE tenant_id = ? AND owner_subject = ?"
             " AND idempotency_key = ?", (tenant_id, owner, idempotency_key)
         ).fetchone()
         if prior is not None:
             connection.commit()
-            if prior[0] != document_digest:
+            if prior[0] != document_digest or prior[2] != assignment_id:
                 raise JobStoreError("idempotency_key_payload_mismatch")
             return {"job_id": prior[1], "created": False,
-                    "document_digest": prior[0]}
+                    "document_digest": prior[0], "assignment_id": prior[2]}
         connection.execute(
             "INSERT INTO marking_jobs (tenant_id, owner_subject, job_id,"
             " idempotency_key, document_digest, status, attempts, max_attempts,"
-            " lease_until, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, 0, ?, ?)",
+            " lease_until, created_at, updated_at, assignment_id)"
+            " VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, 0, ?, ?, ?)",
             (tenant_id, owner, job_id, idempotency_key, document_digest,
-             int(max_attempts), now, now))
+             int(max_attempts), now, now, assignment_id))
         connection.commit()
         return {"job_id": job_id, "created": True,
-                "document_digest": document_digest}
+                "document_digest": document_digest,
+                "assignment_id": assignment_id}
     except JobStoreError:
         connection.rollback()
         raise
@@ -150,7 +159,7 @@ def get_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
         row = connection.execute(
             "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
             " document_digest, status, attempts, max_attempts, lease_until,"
-            " result_id, error_code, created_at, updated_at"
+            " result_id, error_code, created_at, updated_at, assignment_id"
             " FROM marking_jobs WHERE tenant_id = ? AND owner_subject = ?"
             " AND job_id = ?", (tenant_id, owner, job_id)).fetchone()
     except sqlite3.Error as error:
@@ -195,7 +204,7 @@ def find_runnable_job(connection: sqlite3.Connection, *, tenant_id: str,
         row = connection.execute(
             "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
             " document_digest, status, attempts, max_attempts, lease_until,"
-            " result_id, error_code, created_at, updated_at"
+            " result_id, error_code, created_at, updated_at, assignment_id"
             " FROM marking_jobs WHERE tenant_id = ? AND (status = 'queued' OR"
             " (status = 'running' AND lease_until <= ?))"
             " ORDER BY created_at ASC LIMIT 1", (tenant_id, now)).fetchone()
@@ -220,7 +229,7 @@ def claim_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
         row = connection.execute(
             "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
             " document_digest, status, attempts, max_attempts, lease_until,"
-            " result_id, error_code, created_at, updated_at"
+            " result_id, error_code, created_at, updated_at, assignment_id"
             " FROM marking_jobs WHERE tenant_id = ? AND owner_subject = ?"
             " AND job_id = ?", (tenant_id, owner, job_id)).fetchone()
         if row is None:

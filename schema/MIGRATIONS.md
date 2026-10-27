@@ -43,6 +43,7 @@ Reuse it; do not recreate it.
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
 | 0007 | `schema/postgres_v7_assignments.sql` | Server-owned teacher `assignments`: server-minted `assignment_id`, unique `(tenant_id, owner_subject, idempotency_key)`, title 1..200, created_at epoch. RLS **ENABLE + FORCE** + `tenant_isolation`; `SELECT, INSERT` for `marker_app` and **no UPDATE / no DELETE** in v1.2. | `schema_meta.assignments_version = '1'` | `schema/postgres_v7_assignments_rollback.sql` (drops the table and therefore every assignment row - dump first) |
+| 0008 | `schema/postgres_v8_job_assignment_linkage.sql` | Adds nullable `marking_jobs.assignment_id` plus composite FK `(tenant_id, owner_subject, assignment_id) -> assignments(tenant_id, owner_subject, assignment_id)` (`ON UPDATE CASCADE ON DELETE RESTRICT`), a partial index for the eventual "jobs for one assignment" read, and **no grant change** (written at INSERT time). Cross-owner/cross-tenant linkage is refused by the database even if the API check regresses; the API still verifies ownership first so the client sees 404 `assignment_not_found`, not a 500. | `schema_meta.job_assignment_linkage_version = '1'` | `schema/postgres_v8_job_assignment_linkage_rollback.sql` (drops constraint, index, column and marker; **deletes no job rows** - linked jobs simply lose the link) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
@@ -53,14 +54,19 @@ ever changes, re-grant explicitly and record why.
 
 * `0005` is the membership-access migration
   (`schema/postgres_v5_membership_access.sql`), on its own branch/PR.
-* `0006` is **RESERVED** and must stay unused here: it is the still-open
-  security fix that narrows the `UPDATE` privilege on `results` from
-  table-wide to the `result_revision` column. That narrowing has **not** been
-  applied, so the wider grant remains the real state - it is a tracked open
-  blocker, never assumed closed. Any later migration must re-check this
-  reservation before it numbers itself.
-* `0007` is this assignments slice, deliberately above both. It requires only
-  the 0001-0004 base and does not depend on 0005.
+* `0006` is the result-revision privilege narrowing on the membership branch
+  (`schema/postgres_v6_result_narrowing.sql` in that repo): it removes the
+  table-wide `UPDATE` that 0002 granted on `results` and leaves
+  `marker_app` / `marker_worker` with `UPDATE (result_revision)` only. It is
+  **implemented and CI-tested, but NOT applied here** - the wider grant is
+  still this project's real state until an authorized operator applies and
+  verifies it. Implemented is not closed; closing needs apply evidence.
+* `0007` is the assignments slice, deliberately above both. It requires only
+  the 0001-0004 base and does not depend on 0005 or 0006.
+* `0008` is the job-to-assignment linkage, additive on top of 0003 + 0007. It
+  changes **no grant**, so it does not widen or re-narrow anything 0002/0006
+  settled. The column is nullable, so older job rows and unlinked jobs remain
+  valid; only newly created linked jobs populate it.
 
 **0003 is a DRAFT artifact** (`schema/postgres_v3_jobs.sql`): the file is
 reviewed code, not an applied change. Applying it needs IR approval of the

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os
 import base64
+import re
 import hashlib
 import time
 from contextlib import closing
@@ -102,6 +103,7 @@ _STATUS_BY_CODE = {
     "manual_document_provenance_required": 403,
     "tenant_membership_required": 403,
     "result_not_registered": 404,
+    "assignment_not_found": 404,
     "review_context_unavailable": 404,
     "review_question_unavailable": 404,
     "review_question_ambiguous": 409,
@@ -209,14 +211,19 @@ class IngestRequest(BaseModel):
 
 
 class JobRequest(BaseModel):
-    """``POST /v1/jobs`` body (PROPOSED contract addition).
+    """``POST /v1/jobs`` body (contract v1.2 addition, additive).
 
     The client supplies an idempotency key and the document it wants marked;
     it never chooses the job id, the owner, the tenant or the result id.
+    ``assignment_id`` is OPTIONAL server-validated linkage: the API verifies
+    that the assignment belongs to the same verified tenant+owner before the
+    row is written, and the database enforces the same reference.
     """
 
     idempotency_key: str = Field(min_length=8, max_length=128)
     document_digest: str = Field(min_length=64, max_length=64)
+    assignment_id: Optional[str] = Field(default=None,
+                                         min_length=1, max_length=64)
 
 
 class AssignmentRequest(BaseModel):
@@ -993,7 +1000,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                    "max_attempts": int(job["max_attempts"]),
                    "document_digest": job["document_digest"],
                    "result_id": job["result_id"],
-                   "error_code": job["error_code"]}
+                   "error_code": job["error_code"],
+                   "assignment_id": job.get("assignment_id")}
         if job["status"] == "succeeded" and job.get("result_id"):
             questions = _marks_only(job.get("owner_subject"), job["result_id"])
             if questions is not None:
@@ -1021,6 +1029,27 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                 or any(ord(c) < 32 for c in key)):
             raise ApiError("payload_invalid",
                            "idempotency_key is not a valid server-safe id")
+        assignment_id = (None if body.assignment_id is None
+                         else body.assignment_id.strip())
+        if assignment_id is not None:
+            if (not assignment_id
+                    or not re.fullmatch(r"asg_[0-9a-f]{24}", assignment_id)):
+                raise ApiError("payload_invalid",
+                               "assignment_id is not a server-minted id")
+            try:
+                assignment_connection = require_assignment_connection()
+                with closing(assignment_connection):
+                    linked = _assignment_api().get_assignment(
+                        assignment_connection, tenant_id=tenant_id,
+                        owner=owner, assignment_id=assignment_id)
+            except assignment_store.AssignmentStoreError as failure:
+                raise ApiError(failure.detail,
+                               "the assignment link could not be verified")
+            if linked is None:
+                # Same indistinguishability rule as documents/jobs: an id
+                # owned by someone else is not found, not "forbidden".
+                raise ApiError("assignment_not_found",
+                               "no assignment for this owner")
         with closing(require_document_connection()) as documents:
             stored = _document_api().find_document(
                 documents, tenant_id=tenant_id, owner=owner,
@@ -1032,7 +1061,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             with closing(connection):
                 created = _job_api().create_job(
                     connection, tenant_id=tenant_id, owner=owner,
-                    idempotency_key=key, document_digest=digest)
+                    idempotency_key=key, document_digest=digest,
+                    assignment_id=assignment_id)
                 current = _job_api().get_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=created["job_id"])
