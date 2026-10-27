@@ -371,7 +371,7 @@
       "tenant-wide teacher visibility",
       "richer scheme evidence"
     ],
-    "server_owned": "schema/postgres_v6_assignments.sql (DRAFT, not applied): PK (tenant_id,owner_subject,assignment_id), UNIQUE (tenant_id,owner_subject,idempotency_key), RLS tenant_isolation, SELECT+INSERT only for marker_app"
+    "server_owned": "schema/postgres_v7_assignments.sql (DRAFT, not applied): PK (tenant_id,owner_subject,assignment_id), UNIQUE (tenant_id,owner_subject,idempotency_key), RLS tenant_isolation, SELECT+INSERT only for marker_app"
   },
   "projection_question_fields": {
     "fields": [

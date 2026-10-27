@@ -26,7 +26,7 @@ Schema (fresh, additive; no other table is touched):
     UNIQUE      (tenant_id, owner_subject, idempotency_key)
 
 Honest limit: SQLite here is NOT school storage. Production uses
-``schema/postgres_v6_assignments.sql`` through the Postgres adapter; applying
+``schema/postgres_v7_assignments.sql`` through the Postgres adapter; applying
 that migration is a separate, explicitly authorised operator step.
 """
 from __future__ import annotations

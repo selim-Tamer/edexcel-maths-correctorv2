@@ -1,6 +1,6 @@
--- schema/postgres_v6_assignments.sql
+-- schema/postgres_v7_assignments.sql
 --
--- 0006: server-backed teacher assignments (the assignment_store.py port).
+-- 0007: server-backed teacher assignments (the assignment_store.py port).
 --
 -- DRAFT artifact: NOT applied anywhere. Applying it needs IR approval of the
 -- exact SQL AND separate explicit user authorization (schema/MIGRATIONS.md).

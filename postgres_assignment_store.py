@@ -4,7 +4,7 @@ Production assignments must survive process restarts and Cloud Run scale-down
 on the managed database. This adapter follows the established Postgres
 discipline (``postgres_job_store``):
 
-* **No DDL here.** It fails closed unless ``schema/postgres_v6_assignments.sql``
+* **No DDL here.** It fails closed unless ``schema/postgres_v7_assignments.sql``
   was applied by an explicit operator step (``assignments_version = '1'``).
 * **RLS + least privilege.** ``assignments`` carries the same
   ``tenant_isolation`` policy; the adapter binds ``app.tenant_id``
@@ -42,7 +42,7 @@ def _row_to_assignment(row) -> dict:
 
 
 def open_store(dsn: str):
-    """Connect and validate (never create) the 0006 assignment schema."""
+    """Connect and validate (never create) the 0007 assignment schema."""
     import psycopg  # lazy: only the Postgres path needs the driver
 
     if not isinstance(dsn, str) or not dsn.strip():

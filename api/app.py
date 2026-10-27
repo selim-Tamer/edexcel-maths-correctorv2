@@ -312,7 +312,7 @@ def _job_api():
 def _assignment_api():
     """The assignment store module for THIS process (same facade pattern).
 
-    Production: durable PostgreSQL (schema 0006) through
+    Production: durable PostgreSQL (schema 0007) through
     ``postgres_assignment_store`` when ``AI_MARKER_PG_DSN`` is configured.
     Development: the opt-in SQLite store. Both share
     ``AssignmentStoreError``, so call-site error handling is identical.
@@ -934,7 +934,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def require_assignment_connection():
         """The assignment store for THIS process, failing closed when absent.
 
-        Production: durable PostgreSQL (schema 0006) when
+        Production: durable PostgreSQL (schema 0007) when
         ``AI_MARKER_PG_DSN`` is configured. Development: the explicit
         opt-in SQLite store. Neither path creates production schema.
         """

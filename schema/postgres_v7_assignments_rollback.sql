@@ -1,6 +1,6 @@
--- schema/postgres_v6_assignments_rollback.sql
+-- schema/postgres_v7_assignments_rollback.sql
 --
--- Exact inverse of schema/postgres_v6_assignments.sql (0006). Reviewable
+-- Exact inverse of schema/postgres_v7_assignments.sql (0007). Reviewable
 -- artifact: NOT applied anywhere without IR approval + explicit user
 -- authorization.
 --
@@ -9,14 +9,14 @@
 -- run the 2.1 backout drill on a scratch copy. Assignments on a live beta
 -- must not be reset this way.
 --
--- It restores the pre-0006 shape: no assignments table, policy, grants or
+-- It restores the pre-0007 shape: no assignments table, policy, grants or
 -- assignments_version marker. 0001-0005 objects are untouched.
 
 -- 0. Preconditions.
 DO $$
 BEGIN
     IF to_regclass('public.assignments') IS NULL THEN
-        RAISE EXCEPTION 'assignments is absent: 0006 was not applied here';
+        RAISE EXCEPTION 'assignments is absent: 0007 was not applied here';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'marker_app') THEN
         RAISE EXCEPTION

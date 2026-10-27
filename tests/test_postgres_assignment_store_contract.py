@@ -5,7 +5,7 @@
   schema itself (fail closed, like every other production adapter).
 * ``PostgresAssignmentContractTests`` runs ONLY with ``AI_MARKER_TEST_PG_DSN``
   (CI ``postgres-tests``) against an isolated database. It applies
-  0001 -> 0002 -> 0003 -> 0004 -> 0006 (twice, for idempotency) and pins:
+  0001 -> 0002 -> 0003 -> 0004 -> 0007 (twice, for idempotency) and pins:
   server-minted ids, key replay/conflict, owner+tenant isolation, keyset
   pagination, RLS fail-closed, and the zero-UPDATE/zero-DELETE grant.
 
@@ -141,10 +141,10 @@ class PostgresAssignmentContractTests(unittest.TestCase):
         with psycopg.connect(_dsn(), autocommit=True) as setup:
             for name in ("postgres_v1.sql", "postgres_v2_tenant_rls.sql",
                          "postgres_v3_jobs.sql", "postgres_v4_documents.sql",
-                         "postgres_v6_assignments.sql"):
+                         "postgres_v7_assignments.sql"):
                 _execute_sql_file(setup, name)
             # Idempotent: a second apply must not fail.
-            _execute_sql_file(setup, "postgres_v6_assignments.sql")
+            _execute_sql_file(setup, "postgres_v7_assignments.sql")
             setup.execute(sqlmod.SQL("GRANT marker_app TO {}").format(
                 sqlmod.Identifier(APP_ROLE)))
             setup.execute(
