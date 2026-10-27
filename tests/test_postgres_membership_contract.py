@@ -111,12 +111,33 @@ class PostgresMembershipContractTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for closer in (getattr(cls, "admin", None),):
-            if closer is not None:
-                try:
-                    closer.close()
-                except Exception:
-                    pass
+        # Roles are cluster-global. Leaving marker_app grants in
+        # marker_membership_ci blocks the RLS suite's DROP ROLE backout
+        # (same lesson as the job-store / documents suites).
+        admin = getattr(cls, "admin", None)
+        if admin is not None:
+            try:
+                admin.execute(sql.SQL("REVOKE marker_app FROM {}").format(
+                    sql.Identifier(APP_ROLE)))
+            except Exception:
+                pass
+            try:
+                admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(
+                    sql.Identifier(APP_ROLE)))
+            except Exception:
+                pass
+            try:
+                admin.execute(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+                    " WHERE datname = %s AND pid <> pg_backend_pid()",
+                    (TEST_DB,))
+                admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
+            except Exception:
+                pass
+            try:
+                admin.close()
+            except Exception:
+                pass
 
     def app_dsn(self):
         return _dsn(user=APP_ROLE, password=APP_PASSWORD)
@@ -221,20 +242,24 @@ class PostgresMembershipContractTests(unittest.TestCase):
     # --- least privilege ------------------------------------------------
 
     def test_runtime_role_cannot_write_membership_rows(self):
-        with psycopg.connect(self.app_dsn()) as connection:
-            with connection.transaction():
-                connection.execute(
-                    "SELECT set_config('app.tenant_id', %s, true)", (TENANT_A,))
-                for statement, params in (
-                        ("INSERT INTO tenant_membership"
-                         " (tenant_id, subject, role, active)"
-                         " VALUES (%s, %s, 'teacher', TRUE)",
-                         (TENANT_A, "google:self-granted")),
-                        ("UPDATE tenant_membership SET active = TRUE"
-                         " WHERE subject = %s", (SUBJECT_INACTIVE,)),
-                        ("DELETE FROM tenant_membership WHERE subject = %s",
-                         (SUBJECT_A,))):
-                    with self.subTest(statement=statement.split()[0]):
+        # One statement per transaction: a denied INSERT aborts the tx, and
+        # later statements would otherwise raise InFailedSqlTransaction
+        # instead of the InsufficientPrivilege we need to assert.
+        for statement, params in (
+                ("INSERT INTO tenant_membership"
+                 " (tenant_id, subject, role, active)"
+                 " VALUES (%s, %s, 'teacher', TRUE)",
+                 (TENANT_A, "google:self-granted")),
+                ("UPDATE tenant_membership SET active = TRUE"
+                 " WHERE subject = %s", (SUBJECT_INACTIVE,)),
+                ("DELETE FROM tenant_membership WHERE subject = %s",
+                 (SUBJECT_A,))):
+            with self.subTest(statement=statement.split()[0]):
+                with psycopg.connect(self.app_dsn()) as connection:
+                    with connection.transaction():
+                        connection.execute(
+                            "SELECT set_config('app.tenant_id', %s, true)",
+                            (TENANT_A,))
                         with self.assertRaises(psycopg.Error) as caught:
                             connection.execute(statement, params)
                         self.assertIsInstance(
