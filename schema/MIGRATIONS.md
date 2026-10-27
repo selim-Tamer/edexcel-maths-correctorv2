@@ -348,16 +348,24 @@ begin;
 insert into tenants (tenant_id) values ('<tenant-id>')
 on conflict (tenant_id) do nothing;
 
--- Idempotent: a re-run does not create a second row and does not silently
--- change an already-active row's role.
+-- Idempotent and non-escalating: a re-run never creates a second row, never
+-- changes an existing row, and NEVER silently reactivates a revoked
+-- membership (a seed re-run must not undo a removal).
 insert into tenant_membership (tenant_id, subject, role, active, updated_at)
 values ('<tenant-id>', '<google-sub>', 'teacher', true, now())
-on conflict (tenant_id, subject) do update
-  set role = excluded.role,
-      active = true,
-      updated_at = now()
-where tenant_membership.active is not true
-   or tenant_membership.role is distinct from excluded.role;
+on conflict (tenant_id, subject) do nothing;
+
+-- Fail closed if the row exists but was deactivated: reactivation is a
+-- deliberate operator decision below, not a side effect of re-running a seed.
+do $$
+begin
+    if exists (select 1 from tenant_membership
+               where tenant_id = '<tenant-id>' and subject = '<google-sub>'
+                 and active is not true) then
+        raise exception
+            'membership exists but is INACTIVE: reactivate deliberately';
+    end if;
+end $$;
 
 -- Hard requirement: exactly one ACTIVE tenant for this subject.
 select subject, count(*) filter (where active) as active_rows
@@ -394,6 +402,16 @@ Removal is **deactivation**, not deletion (owner only):
 ```sql
 update tenant_membership set active = false, updated_at = now()
 where tenant_id = '<tenant-id>' and subject = '<google-sub>';
+```
+
+Reactivation is a **separate, deliberate** grant of access - never implicit in
+a seed re-run. Run it only after confirming the access is intended, and note
+who/when in the evidence record:
+
+```sql
+update tenant_membership set active = true, updated_at = now()
+where tenant_id = '<tenant-id>' and subject = '<google-sub>'
+  and active is not true;
 ```
 
 If a subject must move tenants, deactivate the old row **in the same
