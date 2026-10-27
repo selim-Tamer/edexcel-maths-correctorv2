@@ -18,7 +18,9 @@ import secrets
 import sys
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest import mock
 
 try:
@@ -229,6 +231,64 @@ class PostgresAssignmentContractTests(unittest.TestCase):
             after_id = page[-1]["assignment_id"]
         self.assertEqual(5, len(seen))
         self.assertEqual(5, len(set(seen)))
+
+    # --- concurrency -----------------------------------------------------
+
+    def test_two_connections_same_key_replay_without_a_store_error(self):
+        barrier = Barrier(2)
+
+        def attempt():
+            connection = psycopg.connect(
+                _dsn(user=APP_ROLE, password=APP_PASSWORD),
+                prepare_threshold=None)
+            try:
+                barrier.wait(timeout=10)
+                return postgres_assignment_store.create_assignment(
+                    connection, tenant_id=TENANT, owner=OWNER,
+                    idempotency_key="race-key-0001", title="Raced")
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(attempt) for _ in range(2)]
+            outcomes = [future.result(timeout=20) for future in futures]
+
+        self.assertEqual(1, sum(1 for item in outcomes if item["created"]))
+        self.assertEqual(1, len({item["assignment_id"] for item in outcomes}))
+        self.assertFalse(any(item.get("created") and item.get("created_at") <= 0
+                             for item in outcomes))
+
+    def test_two_connections_different_titles_are_a_conflict_not_unusable(self):
+        barrier = Barrier(2)
+
+        def attempt(title):
+            connection = psycopg.connect(
+                _dsn(user=APP_ROLE, password=APP_PASSWORD),
+                prepare_threshold=None)
+            try:
+                barrier.wait(timeout=10)
+                return postgres_assignment_store.create_assignment(
+                    connection, tenant_id=TENANT, owner=OWNER,
+                    idempotency_key="race-key-0002", title=title)
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(attempt, title)
+                       for title in ("Race A", "Race B")]
+            results = []
+            for future in futures:
+                try:
+                    results.append(future.result(timeout=20))
+                except AssignmentStoreError as error:
+                    results.append(error)
+
+        errors = [item for item in results if isinstance(item, Exception)]
+        created = [item for item in results if not isinstance(item, Exception)]
+        self.assertEqual(1, len(created), results)
+        self.assertEqual(1, len(errors), results)
+        self.assertEqual("idempotency_key_payload_mismatch",
+                         errors[0].detail)
 
     # --- least privilege / RLS -----------------------------------------
 

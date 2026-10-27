@@ -84,8 +84,31 @@ def require_connection():
     return open_store(dsn)
 
 
+def _replay(prior, title: str) -> dict:
+    if prior[1] != title:
+        raise AssignmentStoreError("idempotency_key_payload_mismatch")
+    payload = _row_to_assignment(prior)
+    payload["created"] = False
+    return payload
+
+
+def _lookup(connection, tenant_id: str, owner: str, idempotency_key: str):
+    return connection.execute(
+        "SELECT " + _RETURN_COLUMNS + " FROM assignments"
+        " WHERE tenant_id = %s AND owner_subject = %s"
+        " AND idempotency_key = %s",
+        (tenant_id, owner, idempotency_key)).fetchone()
+
+
 def create_assignment(connection, *, tenant_id: str, owner: str,
                       idempotency_key: str, title: str) -> dict:
+    """Create or replay one assignment, safe under a same-key race.
+
+    A concurrent request with the same key is expected, not exceptional: the
+    INSERT uses ``ON CONFLICT DO NOTHING`` and, when it lost the race, the
+    winner's committed row is re-read and compared. A unique violation must
+    never surface as ``store_unusable`` (IR finding).
+    """
     if (not isinstance(idempotency_key, str) or not idempotency_key
             or len(idempotency_key) > IDEMPOTENCY_KEY_MAX_CHARS):
         raise AssignmentStoreError("payload_invalid")
@@ -93,24 +116,24 @@ def create_assignment(connection, *, tenant_id: str, owner: str,
     try:
         with connection.transaction():
             _bind_tenant(connection, tenant_id)
-            prior = connection.execute(
-                "SELECT " + _RETURN_COLUMNS + " FROM assignments"
-                " WHERE tenant_id = %s AND owner_subject = %s"
-                " AND idempotency_key = %s",
-                (tenant_id, owner, idempotency_key)).fetchone()
+            prior = _lookup(connection, tenant_id, owner, idempotency_key)
             if prior is not None:
-                if prior[1] != title:
-                    raise AssignmentStoreError(
-                        "idempotency_key_payload_mismatch")
-                payload = _row_to_assignment(prior)
-                payload["created"] = False
-                return payload
+                return _replay(prior, title)
             assignment_id = mint_assignment_id()
-            connection.execute(
+            inserted = connection.execute(
                 "INSERT INTO assignments (tenant_id, owner_subject,"
                 " assignment_id, idempotency_key, title, created_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s)",
+                " VALUES (%s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (tenant_id, owner_subject, idempotency_key)"
+                " DO NOTHING",
                 (tenant_id, owner, assignment_id, idempotency_key, title, now))
+            if inserted.rowcount == 0:
+                # Another transaction won the insert. Its row is committed by
+                # the time ON CONFLICT DO NOTHING returns; compare and replay.
+                prior = _lookup(connection, tenant_id, owner, idempotency_key)
+                if prior is None:
+                    raise AssignmentStoreError("store_unusable")
+                return _replay(prior, title)
     except AssignmentStoreError:
         raise
     except Exception as error:

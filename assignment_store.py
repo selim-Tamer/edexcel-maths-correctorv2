@@ -119,28 +119,51 @@ def normalize_idempotency_key(value) -> str:
     return key
 
 
+def _replay(prior, title: str) -> dict:
+    if prior[1] != title:
+        raise AssignmentStoreError("idempotency_key_payload_mismatch")
+    return {"assignment_id": prior[0], "title": prior[1],
+            "created_at": int(prior[2]), "created": False}
+
+
+def _lookup(connection: sqlite3.Connection, tenant_id: str, owner: str,
+            idempotency_key: str):
+    return connection.execute(
+        "SELECT assignment_id, title, created_at FROM assignments"
+        " WHERE tenant_id = ? AND owner_subject = ?"
+        " AND idempotency_key = ?",
+        (tenant_id, owner, idempotency_key)).fetchone()
+
+
 def create_assignment(connection: sqlite3.Connection, *, tenant_id: str,
                       owner: str, idempotency_key: str, title: str) -> dict:
-    """Create (or replay) one assignment. Returns the row plus ``created``."""
+    """Create (or replay) one assignment. Returns the row plus ``created``.
+
+    Same shape as the PostgreSQL adapter: ``ON CONFLICT DO NOTHING`` plus a
+    re-read, so a same-key race is a replay/mismatch - never a raw constraint
+    error surfaced as ``store_unusable``. ``BEGIN IMMEDIATE`` already
+    serialises writers; the conflict clause keeps the semantics explicit.
+    """
     now = int(time.time())
     try:
         connection.execute("BEGIN IMMEDIATE")
-        prior = connection.execute(
-            "SELECT assignment_id, title, created_at FROM assignments"
-            " WHERE tenant_id = ? AND owner_subject = ?"
-            " AND idempotency_key = ?",
-            (tenant_id, owner, idempotency_key)).fetchone()
+        prior = _lookup(connection, tenant_id, owner, idempotency_key)
         if prior is not None:
             connection.commit()
-            if prior[1] != title:
-                raise AssignmentStoreError("idempotency_key_payload_mismatch")
-            return {"assignment_id": prior[0], "title": prior[1],
-                    "created_at": int(prior[2]), "created": False}
+            return _replay(prior, title)
         assignment_id = mint_assignment_id()
-        connection.execute(
+        inserted = connection.execute(
             "INSERT INTO assignments (tenant_id, owner_subject, assignment_id,"
-            " idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            " idempotency_key, title, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (tenant_id, owner_subject, idempotency_key)"
+            " DO NOTHING",
             (tenant_id, owner, assignment_id, idempotency_key, title, now))
+        if inserted.rowcount == 0:
+            prior = _lookup(connection, tenant_id, owner, idempotency_key)
+            connection.commit()
+            if prior is None:
+                raise AssignmentStoreError("store_unusable")
+            return _replay(prior, title)
         connection.commit()
     except AssignmentStoreError:
         connection.rollback()
