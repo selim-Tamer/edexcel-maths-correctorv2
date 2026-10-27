@@ -219,7 +219,9 @@ delivered.
 * Server-side **drafts** and **queue** state (still device-local), and a
   tenant-wide assignment view.
 * Validating an `assignment_id` on `POST /v1/documents` or `POST /v1/jobs`;
-  document/job-to-assignment linkage is a separate agreed addition.
+  document/job-to-assignment linkage is a separate agreed addition. It MUST be
+  agreed no later than **v1.3**: it is tracked here so it cannot slip silently
+  past the next contract revision.
 * Signed upload URLs and direct-to-bucket writes.
 * `cancel` / `pause` / `resume` for jobs.
 * A submission resource separate from `result_id`.

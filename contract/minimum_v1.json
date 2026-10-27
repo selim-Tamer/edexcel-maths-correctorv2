@@ -10,7 +10,7 @@
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
     },
-    "backend_commit": "feature/assignments-v1.2 branch head (recorded in PR); route table adds the two assignment routes only",
+    "backend_commit": "e522b3374b2b55d45af635c475959b707a46f691 (implementation head reviewed for the race fix); MUST be re-pinned to the exact 40-hex head SHA at the moment status becomes AGREED",
     "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
     "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
     "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
@@ -367,7 +367,7 @@
     },
     "out_of_scope_v1_2": [
       "renaming or deleting an assignment (no UPDATE/DELETE grant, no route)",
-      "validating assignment_id on POST /v1/documents or POST /v1/jobs (linkage is a separate agreed addition)",
+      "validating assignment_id on POST /v1/documents or POST /v1/jobs (linkage is a separate agreed addition; it MUST be agreed no later than v1.3 and may not slip silently past it)",
       "tenant-wide teacher visibility",
       "richer scheme evidence"
     ],
