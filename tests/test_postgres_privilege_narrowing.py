@@ -107,6 +107,17 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
         cls.admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
         cls.admin.close()
 
+    def _database_admin(self):
+        """Privileged connection INSIDE the throwaway test database.
+
+        ``cls.admin`` points at the cluster's default database, where the v1
+        tables do not exist; every catalog/row check about this schema must
+        use this one.
+        """
+        connection = psycopg.connect(_dsn(), autocommit=True)
+        self.addCleanup(connection.close)
+        return connection
+
     def _runtime_connection(self):
         connection = psycopg.connect(
             _dsn(user=APP_ROLE, password=APP_PASSWORD), prepare_threshold=None)
@@ -114,11 +125,12 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
         return connection
 
     def _has(self, role, column, privilege="UPDATE"):
+        db = self._database_admin()
         if column is None:
-            return self.admin.execute(
+            return db.execute(
                 "SELECT has_table_privilege(%s, 'public.results', %s)",
                 (role, privilege)).fetchone()[0]
-        return self.admin.execute(
+        return db.execute(
             "SELECT has_column_privilege(%s, 'public.results', %s, %s)",
             (role, column, privilege)).fetchone()[0]
 
@@ -142,7 +154,7 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
                 self.assertFalse(self._has(role, None, "DELETE"))
 
     def test_marker_is_recorded(self):
-        row = self.admin.execute(
+        row = self._database_admin().execute(
             "SELECT value FROM schema_meta"
             " WHERE key = 'results_update_version'").fetchone()
         self.assertEqual(("1",), row)
@@ -159,7 +171,7 @@ class ResultRevisionNarrowingTests(unittest.TestCase):
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND result_id = %s", (1, TENANT, SUBJECT, RESULT))
             self.assertEqual(1, cursor.rowcount)
-        revision = self.admin.execute(
+        revision = self._database_admin().execute(
             "SELECT result_revision FROM results WHERE result_id = %s",
             (RESULT,)).fetchone()[0]
         self.assertEqual(1, revision)
