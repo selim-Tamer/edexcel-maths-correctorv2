@@ -75,28 +75,43 @@ class ContractArtifactTests(unittest.TestCase):
                             "AGREED requires the confirming message id")
 
     def test_agreed_surface_excludes_the_v1_2_1_additions(self):
-        """AGREED must mean exactly what FCM confirmed - no quiet growth.
+        """The v1.2.0 AGREED surface must stay byte-identical - no quiet growth.
 
-        FCM confirmed v1.2 with linkage OUT and asked for it as additive
-        v1.2.1. The backend already implements the job half, so the only way
-        the artifact can stay honest is: the agreed route text must NOT claim
-        the field, and the addition must sit in ``additive_after_v1_2`` with a
-        non-agreed status that names no confirmer.
+        FCM confirmed v1.2.0 with linkage OUT (a6c33dfa) and then agreed the
+        linkage separately as additive v1.2.1 (20167dfe + 50d42e22, jobs only).
+        Both agreements are real, so this test pins BOTH halves of the
+        honesty rule:
+
+        * v1.2.1 may be AGREED only with its own confirmer recorded, and it
+          must never fold into the v1.2.0 surface (``in_agreed_v1_2`` false,
+          the agreed v1.2.0 route text must not promise the field);
+        * the implemented wire stays optional with absent-means-omit, so a
+          client that never sends assignment_id - exactly the agreed v1.2.0
+          client - sees a byte-identical payload.
         """
         add = self.artifact.get("additive_after_v1_2")
-        self.assertIsNotNone(add, "the proposed v1.2.1 addition must be recorded")
-        self.assertNotEqual("AGREED", add["status"])
-        self.assertFalse(add["confirmed_by"])
+        self.assertIsNotNone(add, "the v1.2.1 addition must be recorded")
+        self.assertEqual("AGREED", add["status"])
+        # Agreement is a message from FCM, not a unilateral edit.
+        self.assertTrue(add["confirmed_by"],
+                        "v1.2.1 AGREED requires FCM's confirming message ids")
+        # v1.2.1 is additive: it does NOT rewrite what v1.2.0 means.
         self.assertFalse(add["in_agreed_v1_2"])
         for route in self.artifact["server_routes"]:
             if route.get("path") in ("/v1/jobs", "/v1/jobs/{job_id}"):
                 self.assertNotIn("assignment_id", route["purpose"],
-                                 "the agreed v1.2 jobs text must not promise "
+                                 "the agreed v1.2.0 jobs text must not promise "
                                  "the v1.2.1 linkage field")
-        # The agreed client never sends it, so the implementation must treat
-        # it as optional rather than required on the wire.
+        # The agreed v1.2.0 client never sends it, so the implementation must
+        # treat it as optional rather than required on the wire.
         self.assertIn("optional", add["wire"]["request"]["assignment_id"])
         self.assertEqual("AGREED", self.artifact["assignments"]["status"])
+        # Jobs-only per FCM 50d42e22: document linkage stays OUT with a v1.3
+        # deadline, never silently absorbed.
+        self.assertIn("v1.3", add["document_linkage"])
+        boundaries = add["association_boundaries"]
+        self.assertIn("v1.3", boundaries["document_to_assignment"])
+        self.assertIn("v1.2.1", boundaries["assignment_job_enumeration"])
 
     def test_doc_and_artifact_agree_on_the_agreement_state(self):
         # The prose document and the artifact must never disagree about

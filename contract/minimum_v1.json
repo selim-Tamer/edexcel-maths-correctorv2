@@ -3,14 +3,14 @@
     "name": "ai-maths-marker-minimum-v1",
     "version": "1.2.0",
     "status": "AGREED",
-    "confirmed_by": "80fcb269-eaa2-43e7-9771-e8ca996c1fca",
+    "confirmed_by": "a6c33dfa-7938-424f-9ec1-a35a53a02d2b",
     "confirmed_at": "2026-10-27",
-    "confirmed_scope": "v1.2.0 AGREED 2026-10-27. FCM confirmed the browser-client surface in message 80fcb269-eaa2-43e7-9771-e8ca996c1fca, verified against client head 99b73ba432dca24a4617ce3b34441360459eb195 (CI 40440374586); CM records the backend side in the commit that sets AGREED. Covered: POST /v1/assignments and GET /v1/assignments with server-minted assignment_id, body {idempotency_key,title} as the client carrier (Idempotency-Key header accepted as an equal alias), epoch-second created_at, the four optional projection question fields, and the explicit boundary that richer scheme evidence is out of scope. NOT covered: job-to-assignment and document-to-assignment linkage. FCM confirmed v1.2 with linkage out and asked for it as additive v1.2.1; that addition is recorded under additive_after_v1_2 and is PROPOSED, not agreed.",
+    "confirmed_scope": "v1.2.0 AGREED 2026-10-27. FCM confirmed the browser-client surface in message a6c33dfa-7938-424f-9ec1-a35a53a02d2b (superseding the earlier 80fcb269-eaa2-43e7-9771-e8ca996c1fca, which FCM replaced with a corrected re-confirmation), verified against client head 99b73ba432dca24a4617ce3b34441360459eb195 (CI 40440374586); CM records the backend side in the commit that sets AGREED. Covered: POST /v1/assignments and GET /v1/assignments with server-minted assignment_id, body {idempotency_key,title} as the client carrier (Idempotency-Key header accepted as an equal alias), epoch-second created_at, the four optional projection question fields, and the explicit boundary that richer scheme evidence is out of scope. Job-to-assignment linkage was confirmed OUT of v1.2.0 and agreed separately as the additive v1.2.1 block below (FCM 20167dfe-f3a1-4d6e-9e0d-67a676a99afe: linkage required, jobs only; FCM 50d42e22: job-only is sufficient for v1.2.1). Document-to-assignment linkage remains OUT with a hard v1.3 deadline.",
     "owners": {
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
     },
-    "backend_commit": "e522b3374b2b55d45af635c475959b707a46f691 (implementation head reviewed for the race fix); MUST be re-pinned to the exact 40-hex head SHA at the moment status becomes AGREED",
+    "backend_commit": "0668bf57a4294cec30009297c652ad273eee69fd (implementation head for v1.2.0 + v1.2.1; this contract commit is its direct child - pin updated from the stale e522b337 per FCM)",
     "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
     "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
     "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
@@ -61,7 +61,8 @@
       "path": "/v1/jobs",
       "implemented": true,
       "auth": "bearer",
-      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest}. The document must already belong to this owner+tenant."
+      "purpose": "Create or replay one durable marking job. Body {idempotency_key, document_digest}. The document must already belong to this owner+tenant.",
+      "additive_v1_2_1": "optional assignment_id is AGREED as additive v1.2.1 (migration 0008): shape-checked asg_[0-9a-f]{24}, ownership validated under the verified tenant+owner, 400 malformed / 404 assignment_not_found indistinguishable from absent / 409 idempotency_key_payload_mismatch on replay with a different link; job payloads carry assignment_id ONLY when linked (absent-means-omit, a null is never emitted - corrected from FCM's draft 'echo assignment_id|null' to match shipped commit 0668bf57)"
     },
     {
       "method": "GET",
@@ -367,7 +368,7 @@
     },
     "out_of_scope_v1_2": [
       "renaming or deleting an assignment (no UPDATE/DELETE grant, no route)",
-      "validating assignment_id on POST /v1/documents or POST /v1/jobs (linkage is a separate agreed addition; it MUST be agreed no later than v1.3 and may not slip silently past it)",
+      "document-to-assignment linkage: POST /v1/documents does not accept assignment_id and no document-registration route exists to carry one; it MUST be agreed no later than v1.3 (which request carries it, and against which document identity) and may not slip silently past it",
       "tenant-wide teacher visibility",
       "richer scheme evidence"
     ],
@@ -382,12 +383,12 @@
     ],
     "semantics": "Optional carry-through on each projection question. Present when the backend has stored a value, absent otherwise; the frontend renders nothing when a field is absent (no fabrication, no client default presented as review evidence).",
     "boundary": "Richer scheme evidence - per-question mark-scheme lines, A/M/B scheme annotations, or any engine-output field beyond these four - is OUT of v1.2. It needs a separate owner-approved scope with its own contract version; it is neither invented here nor silently deferred as done.",
-    "status": "PROPOSED_AWAITING_BOTH_CONFIRMATIONS"
+    "status": "AGREED as part of v1.2.0 (FCM a6c33dfa-7938-424f-9ec1-a35a53a02d2b); the richer-scheme-evidence boundary stays OUT"
   },
   "additive_after_v1_2": {
     "version": "1.2.1",
-    "status": "PROPOSED_AWAITING_FCM_CONFIRMATION",
-    "confirmed_by": "",
+    "status": "AGREED",
+    "confirmed_by": "20167dfe-f3a1-4d6e-9e0d-67a676a99afe (linkage required, jobs only) + 50d42e22 (variant answer: job-only linkage is sufficient for v1.2.1)",
     "scope": "job-to-assignment linkage: optional assignment_id on POST /v1/jobs",
     "implemented": true,
     "in_agreed_v1_2": false,
@@ -396,7 +397,7 @@
         "assignment_id": "optional asg_<24 lowercase hex>; omit or null = unlinked"
       },
       "response": {
-        "assignment_id": "present ONLY on a linked job (null is never emitted), so an unlinked job's payload is byte-identical to the agreed v1.2 shape"
+        "assignment_id": "present ONLY on a linked job (absent-means-omit; a null is never emitted), so an unlinked job's payload is byte-identical to the agreed v1.2.0 shape"
       },
       "errors": {
         "400": "payload_invalid (present but blank, wrong shape, or >64 chars)",
@@ -405,7 +406,18 @@
       },
       "database": "composite FK (tenant_id, owner_subject, assignment_id) -> assignments; cross-owner linkage refused even if the API check regresses"
     },
-    "known_gap": "A one-way job->assignment link does not by itself deliver cross-device recovery: there is no route to enumerate an assignment's jobs (GET /v1/jobs/{id} needs a job_id the client must already have). v1.2.1 needs an assignment-scoped job listing route or an agreed client-side mapping before it can be called complete.",
-    "document_linkage": "NOT defined here: POST /v1/documents has no assignment_id and no document-registration route exists to carry one."
+    "known_gap": "Resolved for v1.2.1 by agreement (FCM 50d42e22): job-only linkage is sufficient - the document is identified inside the job by document_digest, so the link ties an assignment to its marking work and the client keeps the assignment->job_id mapping. What is explicitly NOT in v1.2.1 and MUST be decided no later than v1.3: (a) a server-side assignment-scoped job enumeration route, and (b) document-to-assignment linkage.",
+    "document_linkage": "NOT defined here and explicitly deferred: POST /v1/documents has no assignment_id and no document-registration route exists to carry one; MUST be agreed no later than v1.3 (FCM 50d42e22 confirmed this deferral).",
+    "confirmed_at": "2026-10-27",
+    "association_boundaries": {
+      "assignment_to_jobs": "1..N via assignment_id on marking_jobs (server-validated)",
+      "job_to_document": "exactly 1 via document_digest (already in the agreed v1.2.0 job body)",
+      "job_to_result": "0..1 via result_id (unchanged from agreed v1.2.0)",
+      "document_to_assignment": "NOT linked in v1.2.1 - no route exists to carry it; MUST be defined by v1.3",
+      "assignment_job_enumeration": "NOT served in v1.2.1: there is no GET /v1/assignments/{id}/jobs. The client keeps its own assignment->job_id mapping (FCM owns this client-side state); adding a server enumeration route is deferred and MUST be decided no later than v1.3 together with document linkage",
+      "identity": "assignment_id is server-minted (asg_ + 24 lowercase hex), immutable, never client-supplied as identity; tenant and owner come only from the verified bearer token",
+      "ownership_validation": "API layer: shape check, then lookup under verified tenant+owner, 404 assignment_not_found indistinguishable from absent (never 403); database layer: composite FK (tenant_id, owner_subject, assignment_id) makes cross-owner linkage physically unrepresentable",
+      "idempotency_retry": "one stable job idempotency key per create intent; replay with the same (document_digest, assignment_id) pair replays the stored job; replay with a different pair is 409 idempotency_key_payload_mismatch; POST /v1/jobs/{job_id}/run retries the SAME job and never regenerates the key"
+    }
   }
 }
