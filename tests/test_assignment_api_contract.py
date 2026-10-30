@@ -420,6 +420,42 @@ class AssignmentJobLinkageTests(unittest.TestCase):
                           for row in mine.json()["assignments"]],
                          "the list never widens because of the link")
 
+    def test_unlinked_job_keeps_the_agreed_v1_2_payload_bytes(self):
+        """0668bf5 absent-means-omit: only a LINKED job may grow the field.
+
+        The agreed v1.2 response shape had no assignment_id, so an unlinked
+        job must not emit ``null`` - that would change bytes for a strict
+        pre-v1.2.1 client. The linked bundle must differ by exactly that key.
+        """
+        unlinked = self._job("omit-key-00000001")
+        self.assertEqual(201, unlinked.status_code, unlinked.text)
+        created = unlinked.json()
+        self.assertNotIn("assignment_id", created)
+        self.assertEqual({"job_id", "status", "attempts", "max_attempts",
+                          "document_digest", "result_id", "error_code",
+                          "owner", "created"},
+                         set(created),
+                         "an unlinked job must expose exactly the v1.2 keys")
+        unlinked_status = self.client.get(f"/v1/jobs/{created['job_id']}",
+                                          headers=self._headers())
+        self.assertEqual(200, unlinked_status.status_code)
+        self.assertNotIn("assignment_id", unlinked_status.json())
+
+        linked = self._assignment("asg-key-00000007").json()
+        with_link = self._job("omit-key-00000002",
+                              assignment_id=linked["assignment_id"])
+        self.assertEqual(201, with_link.status_code, with_link.text)
+        linked_body = with_link.json()
+        self.assertEqual(linked["assignment_id"], linked_body["assignment_id"])
+        baseline = dict(created)
+        baseline.pop("job_id")
+        compared = dict(linked_body)
+        compared.pop("job_id")
+        self.assertEqual({"assignment_id"}, set(compared) - set(baseline))
+        for key, value in baseline.items():
+            self.assertEqual(value, compared[key],
+                             f"linking must not perturb {key}")
+
     def test_another_owner_cannot_read_the_linked_job(self):
         created = self._assignment("asg-key-00000006").json()
         job = self._job("isolate-key-0001",
