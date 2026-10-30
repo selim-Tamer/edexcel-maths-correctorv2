@@ -531,6 +531,15 @@ class TenantRlsContractTests(unittest.TestCase):
             setup.execute(
                 sql.SQL("REVOKE marker_worker FROM {}").format(
                     sql.Identifier(WORKER_ROLE)))
+            # 0005 (membership access) holds a COLUMN-level SELECT grant on
+            # tenant_membership for marker_app. The v2 rollback's table-level
+            # REVOKE ALL does not remove column grants (they are tracked
+            # independently), so DROP ROLE would fail with
+            # dependent_objects_still_exist. Restore the v1 posture by also
+            # rolling back 0005 first; it is idempotent and a no-op when 0005
+            # was never applied.
+            _execute_sql_file(setup,
+                              "postgres_v5_membership_access_rollback.sql")
             _execute_sql_file(setup, "postgres_v2_tenant_rls_rollback.sql")
             for table in ("tenants", "tenant_membership", "results",
                           "audit_events", "pdf_references"):

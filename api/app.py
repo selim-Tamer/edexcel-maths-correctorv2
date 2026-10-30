@@ -68,6 +68,7 @@ import document_store
 import ingest_registry
 import job_store
 import postgres_job_store
+import postgres_membership_store
 import supabase_document_store
 import marking_engine
 import question_review
@@ -265,6 +266,20 @@ def _job_api():
     return postgres_job_store if postgres_job_store.configured() else job_store
 
 
+def _default_membership_resolver():
+    """The membership resolver for THIS process.
+
+    Production: when ``AI_MARKER_PG_DSN`` is configured, the verified subject
+    is resolved from PostgreSQL through ``postgres_membership_store`` (schema
+    0005, subject-scoped, transaction-local binding). Development: the opt-in
+    SQLite membership store. A configured-but-unmigrated database fails closed
+    with 403 ``membership_unavailable`` - never open.
+    """
+    if postgres_membership_store.configured():
+        return postgres_membership_store.resolve
+    return membership_store.default_resolver()
+
+
 def _document_api():
     """The document store module for THIS process.
 
@@ -323,7 +338,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     store_provider = store_provider or _default_store_provider()
     provenance_ok = manual_document_provenance_ok or (lambda row: False)
     reverify_row = reverify or _refuse_classroom
-    membership_resolver = membership_resolver or membership_store.default_resolver()
+    membership_resolver = membership_resolver or _default_membership_resolver()
     if engine is _ENGINE_UNSET:
         # Real wiring attempt: a configured opt-in dev box gets the existing
         # marking path; everywhere else this returns None and the runner
