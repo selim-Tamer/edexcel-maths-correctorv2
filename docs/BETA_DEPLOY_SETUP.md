@@ -337,6 +337,32 @@ gcloud run jobs create marker-worker \
 
 ---
 
+## 5.3 Container image (`Dockerfile`, built by CI not here)
+
+One image serves both commands above: the default CMD is
+`uvicorn api.server:application` and the Jobs command overrides it with
+`python worker.py --once`.
+
+* `Dockerfile` installs `requirements.txt` (the single reviewed manifest,
+  `pip check` enforced), copies the runtime modules, and runs as unprivileged
+  UID 10001. It bakes **no secret and no mark-scheme PDF**.
+* The mark scheme is a **read-only mount** at `/app/scheme.pdf`, pointed at by
+  `AI_MARKER_MARK_SCHEME`. The image creates an empty `/app/scheme/` parent;
+  a real exam-board PDF is licensed content and must come from the approved
+  secure mount (owner-provided) with `0644` readability for UID 10001.
+* `HEALTHCHECK` calls `GET /v1/healthz` on `$PORT`; Cloud Run's own probe is
+  the authoritative one.
+* `.dockerignore` excludes `.git`, tests, local SQLite files, `.env*`, and
+  every PDF, so neither history nor licensed data can enter a layer.
+* **Evidence status:** the packaging files and the startup contract are
+  covered by `tests/test_container_packaging.py` (offline). No image has been
+  built, pushed or deployed here - Docker is unavailable in this environment,
+  and the build/push/deploy steps remain the operator actions in sections 5
+  and 7.
+
+---
+
+
 ## 6. Google OAuth requirements (for the reviewed sign-in flow)
 
 * Existing Web OAuth client, reused. Authorized JavaScript origin: the
