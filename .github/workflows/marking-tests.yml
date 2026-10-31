@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Syntax validation
-        run: python -m py_compile app5_1_automated.py decision_core.py auth_oidc.py membership_store.py api/app.py api/server.py runtime_config.py postgres_store.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py scheme_review.py teacher_authorization.py scheme_authorization.py question_review.py audit_store.py
+        run: python -m py_compile app5_1_automated.py decision_core.py auth_oidc.py membership_store.py postgres_membership_store.py api/app.py api/server.py runtime_config.py postgres_store.py document_pipeline.py local_pdf.py marking_requests.py pipeline_metrics.py scheme_review.py teacher_authorization.py scheme_authorization.py question_review.py audit_store.py
       - name: Install offline PDF and symbolic benchmark dependencies
         # Patch pip first (pip itself carries advisories between releases),
         # then install the single complete test manifest from tests/.
@@ -77,6 +77,12 @@ jobs:
           # the first release inside the requirements window that admits it.
           - python: '3.11'
             sdk: '1.40.0'
+            streamlit: '1.66.1'
+          # 3.13 is the Docker image's runtime (python:3.13-slim-bookworm):
+          # IR requires this interpreter to be in the validated matrix before
+          # the first operator image build.
+          - python: '3.13'
+            sdk: '2.30.1'
             streamlit: '1.66.1'
           - python: '3.14'
             sdk: '2.30.1'

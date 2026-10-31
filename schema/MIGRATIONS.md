@@ -42,6 +42,8 @@ Reuse it; do not recreate it.
 | 0002 | `schema/postgres_v2_tenant_rls.sql` | Creates NOLOGIN group roles `marker_app` / `marker_worker` (attributes **verified**, not altered), least-privilege grants, `anon`/`authenticated` revoke, RLS **ENABLE + FORCE** and `tenant_isolation` on all 5 tenant tables. | `schema_meta.rls_version = '1'` (the adapter's `schema_version` stays `'1'`: table shape unchanged) | `schema/postgres_v2_tenant_rls_rollback.sql` |
 | 0003 | `schema/postgres_v3_jobs.sql` | Durable `marking_jobs` (the `job_store.py` port): same columns, lease/attempt semantics and idempotency key rules, RLS **ENABLE + FORCE** + `tenant_isolation`, `SELECT, INSERT, UPDATE` for both runtime roles, **no DELETE**. | `schema_meta.jobs_version = '1'` | `schema/postgres_v3_jobs_rollback.sql` (drops the table and therefore every job row - dump first) |
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
+| 0005 | `schema/postgres_v5_membership_access.sql` | Production membership **resolution**: a second SELECT-only RLS policy on `tenant_membership` keyed by `app.subject`, plus column-level `SELECT` (five columns) for `marker_app`. **No INSERT/UPDATE/DELETE** on membership rows for any runtime role - the API cannot grant itself a tenant. | `schema_meta.membership_access_version = '1'` | `schema/postgres_v5_membership_access_rollback.sql` (drops the policy + grant, leaves membership rows intact) |
+| 0006 | `schema/postgres_v6_result_narrowing.sql` | Least privilege on `results`: drops the table-wide `UPDATE` and grants **`UPDATE (result_revision)` only** to `marker_app` / `marker_worker` - the single column `postgres_store.commit()` writes. Every other column becomes non-writable by a runtime role, so the immutable original result cannot be rewritten. **No DELETE.** | `schema_meta.results_update_version = '1'` | `schema/postgres_v6_result_narrowing_rollback.sql` (restores the 0002 table-wide UPDATE; refuses when 0006 was never applied; touches no rows) |
 | 0007 | `schema/postgres_v7_assignments.sql` | Server-owned teacher `assignments`: server-minted `assignment_id`, unique `(tenant_id, owner_subject, idempotency_key)`, title 1..200, created_at epoch. RLS **ENABLE + FORCE** + `tenant_isolation`; `SELECT, INSERT` for `marker_app` and **no UPDATE / no DELETE** in v1.2. | `schema_meta.assignments_version = '1'` | `schema/postgres_v7_assignments_rollback.sql` (drops the table and therefore every assignment row - dump first) |
 | 0008 | `schema/postgres_v8_job_assignment_linkage.sql` | Adds nullable `marking_jobs.assignment_id` plus composite FK `(tenant_id, owner_subject, assignment_id) -> assignments(tenant_id, owner_subject, assignment_id)` (`ON UPDATE CASCADE ON DELETE RESTRICT`), a partial index for the eventual "jobs for one assignment" read, and **no grant change** (written at INSERT time). Cross-owner/cross-tenant linkage is refused by the database even if the API check regresses; the API still verifies ownership first so the client sees 404 `assignment_not_found`, not a 500. | `schema_meta.job_assignment_linkage_version = '1'` | `schema/postgres_v8_job_assignment_linkage_rollback.sql` (drops constraint, index, column and marker; **deletes no job rows** - linked jobs simply lose the link) |
 
@@ -80,6 +82,16 @@ runtime access to `pdf_references` plus the separate elevated `marker_purge`
 role. Its backout removes ACCESS only - it deletes neither bucket objects nor
 existing metadata rows. Creating the bucket and its service key is operator
 work in `docs/BETA_DEPLOY_SETUP.md`, never code.
+
+**Numbering after 0005 and the 0006 narrowing.** `0006`
+(`schema/postgres_v6_result_narrowing.sql`) is the result-revision privilege
+fix: it removes the table-wide `UPDATE` that 0002 granted on `results` and
+leaves `marker_app` / `marker_worker` with `UPDATE (result_revision)` only.
+It is **implemented and CI-tested, but NOT applied** - the wider grant is
+still the real production state until an authorized operator applies and
+verifies 0006. Do not read "implemented" as "closed": closing needs the
+apply evidence in 4.5. The assignments slice stays `0007` so it cannot collide
+with 0006.
 
 ---
 
@@ -151,7 +163,10 @@ rollback path is known-good before it is ever needed.
 | 4 | Apply `postgres_v2_tenant_rls.sql` | §4 verification block: `rls_version='1'`, `relrowsecurity` + `relforcerowsecurity` true on all 5, 5 policies, roles present, `anon`/`authenticated` revoked | `postgres_v2_tenant_rls_rollback.sql` → then §4 shape check → re-apply 0002 |
 | 5 | Create runtime logins (operator, once per environment): `CREATE ROLE marker_runtime LOGIN PASSWORD '<generated>'; GRANT marker_app TO marker_runtime;` (and, later, `marker_worker_login` → `marker_worker`) | `select current_user, session_user;` as the login shows the login, and `select rolname from pg_roles where pg_has_role(current_user, oid, 'member')` shows `marker_app` | `REVOKE marker_app FROM marker_runtime; DROP ROLE marker_runtime;` — do this **before** the 0002 backout, which refuses to drop a role with dependents |
 | 6 | Smoke test as the login: one `BEGIN; select set_config('app.tenant_id','<tenant>',true); select count(*) from results; COMMIT;` and one unbound `select count(*) from results;` | bound sees that tenant only; unbound sees `0` | none (read only) |
-| 7 | Record evidence: dump id, the §2 emptiness output (or the drill transcript), §4 verification output, who applied what, errors | §4 | — |
+| 7 | Apply `postgres_v5_membership_access.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.membership_access_version = '1'`; `pg_policies` shows **6** rows incl. `membership_self_read` (SELECT) on `tenant_membership`; `information_schema.role_column_grants` shows exactly the five resolver columns for `marker_app`; `role_table_grants` for `tenant_membership` is **0 rows**; an **unbound** `select count(*) from tenant_membership` as the runtime login returns **0** | `postgres_v5_membership_access_rollback.sql` -> re-run the section 4 shape check -> re-apply 0005 |
+| 8 | Apply `postgres_v6_result_narrowing.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.results_update_version = '1'`; `has_table_privilege('marker_app','results','UPDATE')` is **false**; `has_column_privilege(...,'result_revision','UPDATE')` is **true**; every other column is false; the adapter-shaped `UPDATE results SET result_revision` still returns 1 row and a rewrite of `original_scores` is refused | `postgres_v6_result_narrowing_rollback.sql` -> re-run the 4.5 shape check -> re-apply 0006 |
+| 9 | **First-membership seeding (operator, once per tenant/subject)** - section 4.4, **document only, not executed**: run as the project owner/superuser on the direct 5432 connection | the seeding verification in 4.4 returns exactly one `active = true` row for the subject; the runtime resolver probe returns that tenant; an unbound or other-subject probe returns nothing | deactivate the seeded row as the owner (`update ... set active = false`); no runtime role holds UPDATE/DELETE on membership |
+| 10 | Record evidence: dump id, the section 2 emptiness output (or the drill transcript), section 4 verification output, the 0005 verification output, the 0006 verification output, the seeding record (who/when/tenant/subject - never the token), who applied what, errors | section 4 + 4.2 + 4.5 + 4.4 | - |
 
 The generated password for step 5 is created once, stored only in Secret
 Manager, and never written to this repository, a message or a log.
@@ -170,7 +185,8 @@ from pg_class
 where relname in ('tenants','tenant_membership','results','audit_events','pdf_references')
 order by relname;
 
--- Exactly one policy per table, and it is the tenant predicate.
+-- Exactly one policy per tenant table, plus the 0005 subject-scoped SELECT
+-- policy on tenant_membership (six rows total when 0005 is applied).
 select tablename, policyname, cmd, qual is not null as has_using
 from pg_policies where schemaname = 'public' order by tablename;
 
@@ -198,17 +214,25 @@ order by 1,2;
 ```
 
 Expected evidence after a correct apply: 2 markers, 5 forced tables, 5
-`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, **exactly 12
-grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT/UPDATE;
-`audit_events` SELECT/INSERT - each for both runtime roles), **zero DELETE
-grants**, no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
-function. **With 0003 applied too, the same query returns 18 rows**: the
+`tenant_isolation` policies, 2 NOLOGIN non-privileged roles, **exactly 10
+grant rows** (`schema_meta` SELECT; `results` SELECT/INSERT; `audit_events`
+SELECT/INSERT - each for both runtime roles), **zero table-level UPDATE on
+`results`** (it moved to the `result_revision` column), **zero DELETE grants**,
+no `anon`/`authenticated` grants, and no unexpected `SECURITY DEFINER`
+function. **With 0003 applied too, the same query returns 16 rows**: the
 `marking_jobs` SELECT/INSERT/UPDATE for each runtime role, still zero DELETE.
-**With 0004 as well, 22 rows**: plus `pdf_references` SELECT/INSERT for each
+**With 0004 as well, 20 rows**: plus `pdf_references` SELECT/INSERT for each
 runtime role - and the separate `marker_purge` role (queried by grantee) holds
-exactly `pdf_references` SELECT + UPDATE and nothing else. **No role in the
-schema holds any DELETE at all**: purge tombstones the row and removes the
-object, so history cannot be trimmed.
+exactly `pdf_references` SELECT + UPDATE and nothing else. **With 0005**, the
+table-grant row count is unchanged (the membership grant is column-level, so it
+appears in `information_schema.role_column_grants`, not
+`role_table_grants`), and `pg_policies` shows **6 rows**: the five
+`tenant_isolation` policies plus `membership_self_read` (FOR SELECT) on
+`tenant_membership`. **With 0006**, the table-grant count drops by two
+(the `results` UPDATE row for each runtime role) and
+`information_schema.role_column_grants` gains exactly `result_revision` UPDATE
+for both roles. **No role in the schema holds any DELETE at all**: purge
+tombstones the row and removes the object, so history cannot be trimmed.
 
 ### 4.1 Per-grant justification (every runtime privilege)
 
@@ -221,14 +245,15 @@ statements are the evidence:
 | `schema_meta` | SELECT | yes | yes | `open_store()` reads `schema_version` |
 | `results` | SELECT | yes | yes | `original_record()`, revision/event reads |
 | `results` | INSERT | yes | yes | register the immutable original result |
-| `results` | UPDATE | yes | yes | `UPDATE results SET result_revision` (revision advancement) |
+| `results` | UPDATE (column `result_revision` only, per 0006) | yes | yes | `UPDATE results SET result_revision` (revision advancement); no other column is writable |
 | `results` | DELETE | **no** | **no** | none shipped - deferred to the elevated purge role |
 | `audit_events` | SELECT | yes | yes | `events()`, `stream_revision()` |
 | `audit_events` | INSERT | yes | yes | `commit()` appends the decision event |
 | `audit_events` | UPDATE | **no** | **no** | none: the audit trail is append-only, and a runtime credential must not rewrite history |
 | `audit_events` | DELETE | **no** | **no** | none - deferred to the elevated purge role |
 | `tenants` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
-| `tenant_membership` | any | no | no | no shipped PG statement; the membership slice adds its own grant |
+| `tenant_membership` | SELECT (5 columns) | yes | no | `postgres_membership_store.resolve()` reads tenant_id, subject, role, active, updated_at for the verified subject |
+| `tenant_membership` | INSERT/UPDATE/DELETE | **no** | **no** | none: provisioning is an operator/admin step; the API cannot grant itself a tenant |
 | `pdf_references` (0004) | SELECT | yes | yes | `find_document()` / `put_document()` prior-row check in `supabase_document_store` |
 | `pdf_references` (0004) | INSERT | yes | yes | `put_document()` records digest + object key + size after a successful upload |
 | `pdf_references` (0004) | UPDATE | **no** | **no** | none: the metadata row is immutable |
@@ -255,6 +280,236 @@ Consequences that are deliberate, not omissions:
 
 ---
 
+### 4.2 0005 verification (paste after step 7, and after any re-apply)
+
+```sql
+-- Marker: 0005 applied.
+select key, value from schema_meta
+where key = 'membership_access_version';                       -- 1 row: '1'
+
+-- Policies: five tenant_isolation + one membership_self_read.
+select tablename, policyname, cmd
+from pg_policies where schemaname = 'public'
+order by tablename, policyname;                                -- 6 rows; membership_self_read / SELECT
+
+-- Column-level grant: exactly the five resolver columns for marker_app.
+select grantee, table_name, column_name, privilege_type
+from information_schema.role_column_grants
+where grantee = 'marker_app' and table_name = 'tenant_membership'
+order by column_name;                    -- 5 rows: active, role, subject, tenant_id, updated_at
+
+-- No table-level membership grant ...
+select grantee, table_name, privilege_type
+from information_schema.role_table_grants
+where table_name = 'tenant_membership'
+  and grantee in ('marker_app','marker_worker');                -- 0 rows
+
+-- ... and no write verb at column level either.
+select grantee, table_name, column_name, privilege_type
+from information_schema.role_column_grants
+where table_name = 'tenant_membership'
+  and grantee in ('marker_app','marker_worker')
+  and privilege_type <> 'SELECT';                               -- 0 rows
+
+-- Unbound fail-closed: 0 rows even though a membership row exists.
+begin;
+select set_config('app.subject', '', true);
+select count(*) from tenant_membership;                         -- 0
+rollback;
+
+-- Subject-bound: only that subject's rows.
+begin;
+select set_config('app.subject', '<seeded-subject>', true);
+select tenant_id, subject, role, active from tenant_membership; -- that subject only
+rollback;
+```
+
+Run the unbound/bound probes as the **runtime login** (a member of
+`marker_app`), not as the owner: the owner is bound only because RLS is
+FORCEd, while a superuser bypasses RLS entirely. The owner probe proves the
+policy exists; the runtime probe proves the API path.
+
+### 4.3 Backout ordering (0005 in context)
+
+Roll back in **reverse apply order**, and **0005 before 0002** - always:
+
+1. `0005` rollback drops `membership_self_read`, the five-column
+   `marker_app` grant and the `membership_access_version` marker. It leaves
+   membership rows intact (they are the authorization record).
+2. `0004`, then `0003`, then `0002`. The `0002` rollback drops
+   `marker_app` / `marker_worker`; a role with dependent privileges cannot be
+   dropped, so any surviving 0003/0004/0005 grant makes it fail. The CI shape
+   test applies the 0005 column-grant rollback before the v2 rollback for
+   exactly this reason (commit `4bb3f7a`).
+3. Rolling back 0005 alone is safe for authorization: the resolver then fails
+   closed with `membership_unavailable`, and requests are refused rather than
+   resolved to a tenant. Re-applying 0005 restores access without touching
+   rows.
+4. `0002` keeps its own backout rules (roles with dependents, Supabase default
+   grants not restored - disclosed in the 0002 rollback file).
+
+### 4.4 First-membership seeding runbook (document only - NOT executed)
+
+There is **no supported self-service path** to create a membership yet: no
+runtime role holds INSERT/UPDATE/DELETE on `tenant_membership`, and the API
+has no route that grants a tenant. Seeding is a manual **operator** step.
+
+Preconditions, all of which must hold:
+
+* 0001-0005 applied and verified (section 4 + 4.2) on the target project;
+* the credential used is the project **owner/superuser** (Supabase `postgres`)
+  on a **direct or session connection, port 5432** - never the transaction
+  pooler, and never a runtime login. The runnable preflight below asserts
+  `rolsuper or rolbypassrls` for the session: FORCE RLS binds even the table
+  owner, and Supabase's `postgres` is not a superuser but does hold
+  `BYPASSRLS`. Proving the bypass (rather than assuming it) also means the
+  "existing but inactive" refusal below cannot be fooled by an empty read;
+* the password comes from `PGPASSFILE` / the interactive prompt, never a
+  command line, log or chat;
+* Free-plan connection limits respected: 60 direct connections, 200 pooler
+  clients. Close the session when done.
+
+`subject` is the Google ID-token `sub` claim, not an email address. The
+resolver requires **exactly one active tenant per subject**; two active rows
+are refused as `membership_ambiguous` and the API never picks one.
+
+```sql
+-- Operator, project owner/superuser, direct 5432. Placeholders in <>.
+-- One transaction: tenant first (FK), then the membership.
+begin;
+
+-- Preflight: PROVE the session bypasses RLS instead of assuming it. The v2
+-- hardening uses ENABLE + FORCE, so even the TABLE OWNER is bound by the
+-- tenant_isolation policy. On Supabase the `postgres` role is NOT a superuser
+-- but DOES hold BYPASSRLS, so seeding works there - and this block proves that
+-- is why, rather than trusting the role's name. Without the bypass the
+-- existence checks below would read zero rows and a live membership could
+-- look absent, which is the dangerous direction.
+do $$
+begin
+    if not coalesce((select rolsuper or rolbypassrls
+                     from pg_roles where rolname = current_user), false) then
+        raise exception
+            'seeding role % is neither superuser nor BYPASSRLS: FORCE RLS would hide existing rows - use the project owner/superuser',
+            current_user;
+    end if;
+end $$;
+
+insert into tenants (tenant_id) values ('<tenant-id>')
+on conflict (tenant_id) do nothing;
+
+-- Idempotent and non-escalating: a re-run never creates a second row, never
+-- changes an existing row, and NEVER silently reactivates a revoked
+-- membership (a seed re-run must not undo a removal).
+insert into tenant_membership (tenant_id, subject, role, active, updated_at)
+values ('<tenant-id>', '<google-sub>', 'teacher', true, now())
+on conflict (tenant_id, subject) do nothing;
+
+-- Fail closed if the row exists but was deactivated: reactivation is a
+-- deliberate operator decision below, not a side effect of re-running a seed.
+do $$
+begin
+    if exists (select 1 from tenant_membership
+               where tenant_id = '<tenant-id>' and subject = '<google-sub>'
+                 and active is not true) then
+        raise exception
+            'membership exists but is INACTIVE: reactivate deliberately';
+    end if;
+end $$;
+
+-- Hard requirement: exactly one ACTIVE tenant for this subject.
+select subject, count(*) filter (where active) as active_rows
+from tenant_membership where subject = '<google-sub>' group by subject; -- active_rows = 1
+
+commit;
+```
+
+Verify through the API's own path, as the runtime login, then roll back:
+
+```sql
+-- As the runtime login (member of marker_app), direct 5432.
+begin;
+select set_config('app.subject', '<google-sub>', true);
+select tenant_id, subject, role, active
+from tenant_membership;                       -- exactly the seeded row
+rollback;
+
+begin;
+select set_config('app.subject', 'some-other-subject', true);
+select count(*) from tenant_membership;       -- 0
+rollback;
+
+select count(*) from tenant_membership;       -- 0 (unbound)
+```
+
+Application expectation (not exercised by this document): with
+`AI_MARKER_PG_DSN` set, a request carrying that subject's verified Google ID
+token resolves the seeded tenant; an unseeded subject is refused `403`; a
+database without 0005 is refused `503 membership_unavailable`.
+
+Removal is **deactivation**, not deletion (owner only):
+
+```sql
+update tenant_membership set active = false, updated_at = now()
+where tenant_id = '<tenant-id>' and subject = '<google-sub>';
+```
+
+Reactivation is a **separate, deliberate** grant of access - never implicit in
+a seed re-run. Run it only after confirming the access is intended, and note
+who/when in the evidence record:
+
+```sql
+update tenant_membership set active = true, updated_at = now()
+where tenant_id = '<tenant-id>' and subject = '<google-sub>'
+  and active is not true;
+```
+
+If a subject must move tenants, deactivate the old row **in the same
+transaction** as the new insert, or the resolver refuses the ambiguous state.
+
+### 4.5 0006 verification (the privilege narrowing)
+
+```sql
+-- Marker.
+select key, value from schema_meta where key = 'results_update_version'; -- '1'
+
+-- Table-wide UPDATE must be gone from BOTH runtime roles.
+select r, has_table_privilege(r, 'public.results', 'UPDATE') as table_update
+from unnest(array['marker_app','marker_worker']) as r;      -- both false
+
+-- Only result_revision is writable.
+select r, has_column_privilege(r, 'public.results', 'result_revision',
+                               'UPDATE') as revision_update
+from unnest(array['marker_app','marker_worker']) as r;      -- both true
+
+-- Every other column is refused.
+select c, has_column_privilege('marker_app', 'public.results', c, 'UPDATE')
+from unnest(array['tenant_id','owner_subject','result_id','original_digest',
+                  'original_scores','original_scores_digest','created_at'])
+     as c;                                                   -- all false
+```
+
+Run the two behavioural probes as the **runtime login** (member of
+`marker_app`), tenant-bound:
+
+```sql
+begin;
+select set_config('app.tenant_id', '<tenant>', true);
+-- the shipped statement: must succeed and affect exactly 1 row
+update results set result_revision = result_revision
+ where tenant_id = '<tenant>' and owner_subject = '<owner>'
+   and result_id = '<result>';
+-- the immutable original: must fail with InsufficientPrivilege
+update results set original_scores = original_scores;
+rollback;
+```
+
+Rollback restores the 0002 shape (table-wide UPDATE) and **refuses when 0006
+was never applied**, so a mistaken backout cannot silently widen the grant.
+It touches no rows.
+
+---
+
 ## 5. What RLS does and does not do here
 
 * `tenant_id = NULLIF(current_setting('app.tenant_id', true), '')` — with no
@@ -273,6 +528,43 @@ Consequences that are deliberate, not omissions:
   role sees every tenant.
 * Supabase's "AutoRLS on" and "Data API off" are **not** isolation evidence;
   the policies, grants and tests in this ledger are.
+* **`app.subject` (0005) is a lookup key, not an authenticity proof.** The
+  resolver sets it from the API's verified token subject, transaction-locally.
+  A compromised database credential could set the same GUC and read that
+  subject's membership; RLS narrows what a leaked *runtime* credential can
+  reach, it does not make a stolen credential harmless. The membership test
+  asserts that limit instead of claiming it away, and the credential itself is
+  runtime-only, revocable and never given to a client.
+
+### 5.1 In-tenant subject visibility and connection limits (disclosed)
+
+0005 narrows **what a query needs** to resolve a subject; it does not make
+membership rows invisible to a tenant-bound connection, and this is recorded
+rather than implied away:
+
+* **Tenant-bound reads.** The 0002 `tenant_isolation` policy already lets any
+  connection that sets `app.tenant_id` read **every** `tenant_membership` row
+  of that tenant - all subjects, roles and active flags. 0005 does not widen
+  that; it adds the subject-keyed path alongside it. A leaked *runtime*
+  credential that can set the GUC could enumerate a tenant's membership, so
+  the control is credential custody + revocability + RLS in depth, not RLS
+  alone.
+* **Subject-keyed reads.** Any database connection able to set `app.subject`
+  can test whether a chosen subject has a membership and read that one row
+  (`tenant_id`, `role`, `active`, `updated_at`). `app.subject` is a GUC, so it
+  is a lookup key, not proof of identity - subjects who can be guessed can be
+  probed. The five-column grant keeps the payload minimal, but enumeration is
+  a real, stated limitation.
+* **Connection limitations.** 0005 and the seeding runbook are proven only on
+  a **direct/session 5432** connection. The application uses the transaction
+  pooler (`prepare_threshold=None` is pinned), but **no `pgbouncer`
+  transaction-mode run has executed**, so pooler behaviour for the
+  transaction-local subject binding is unverified - expected to work, not
+  evidenced. Free plan: 60 direct connections / 200 pooler clients, project
+  pauses after ~1 week idle.
+* **Seeding and removal are operator-only.** No runtime role holds
+  INSERT/UPDATE/DELETE on `tenant_membership`; the API cannot grant itself or
+  anyone a tenant. Deactivation by the owner is the reviewed removal verb.
 
 ---
 
@@ -293,6 +585,12 @@ service:
   rollback-then-re-apply.
 * `tests/test_postgres_store_contract.py` — the adapter contract on the same
   schema.
+
+* `tests/test_postgres_privilege_narrowing.py` - the 0006 contract in its own
+  isolated database: table-wide UPDATE absent for both roles, only
+  `result_revision` writable, every other column refused with
+  `InsufficientPrivilege`, the adapter's exact statement still succeeds,
+  DELETE still denied, and rollback/refuses-when-absent/re-apply verified.
 
 The job log for the head under review is the executed evidence; it is linked
 from the PR. This is a scratch container, **not** the Supabase project: no
@@ -333,7 +631,12 @@ by it, and the runbook is what carries those checks to the real project.
    no real storage round trip has ever run, and the purge task itself is not
    yet scheduled - `delete_document()` is the reviewed verb, its execution is
    an operational step.
-4. **Membership and documents are still development stores.** They hold no
-   PostgreSQL grant yet; each adds its own numbered migration with the same
-   justification table when its code lands.
+4. **Membership resolution is now a PostgreSQL slice, documents are not
+   "development only".** `postgres_membership_store.py` + 0005 give the
+   production composition a subject-scoped resolver; the API selects it
+   whenever `AI_MARKER_PG_DSN` is set and fails closed on a database that has
+   not applied 0005. Documents already have 0004. What remains unproven is
+   operational: no migration has been applied to the real project and no
+   production membership row has ever been provisioned by a supported path
+   (rows are still inserted by an operator).
 5. **No live round trip** through Supabase, Cloud Run or Google has run.
