@@ -46,7 +46,7 @@ TENANT_GUC = "app.tenant_id"
 _JOB_COLUMNS = ("tenant_id", "owner_subject", "job_id", "idempotency_key",
                 "document_digest", "status", "attempts", "max_attempts",
                 "lease_until", "result_id", "error_code", "created_at",
-                "updated_at")
+                "updated_at", "assignment_id")
 
 
 def _bind_tenant(connection, tenant_id: str) -> None:
@@ -57,6 +57,27 @@ def _bind_tenant(connection, tenant_id: str) -> None:
 
 def _rows_to_job(row) -> dict:
     return dict(zip(_JOB_COLUMNS, row))
+
+
+def _assignment_link_error(error):
+    """Translate ONLY the 0008 composite-FK refusal into a product error.
+
+    The API validates assignment ownership before it writes, so this branch is
+    defence in depth: it fires when a caller reached the store directly, or
+    when the assignment was removed between the API check and the insert. It
+    must not be reported as ``store_unusable`` (that would tell the client the
+    whole store is down) and it must not be reported as success.
+
+    Narrow on purpose: sqlstate 23503 AND the exact constraint name. Any other
+    foreign-key refusal (for example the membership reference) keeps the
+    existing generic mapping.
+    """
+    if getattr(error, "sqlstate", None) != "23503":
+        return None
+    diag = getattr(error, "diag", None)
+    if getattr(diag, "constraint_name", None) != "fk_marking_jobs_assignment":
+        return None
+    return JobStoreError("assignment_not_found")
 
 
 def open_store(dsn: str):
@@ -77,13 +98,19 @@ def open_store(dsn: str):
             present = connection.execute(
                 "SELECT to_regclass('public.marking_jobs')"
             ).fetchone()
+            linkage = connection.execute(
+                "SELECT value FROM schema_meta"
+                " WHERE key = 'job_assignment_linkage_version'"
+            ).fetchone()
     except Exception as error:
         try:
             connection.close()
         except Exception:
             pass
         raise JobStoreError("store_unusable") from error
-    if row is None or str(row[0]) != "1" or present is None or present[0] is None:
+    if (row is None or str(row[0]) != "1" or present is None
+            or present[0] is None or linkage is None
+            or str(linkage[0]) != "1"):
         try:
             connection.close()
         except Exception:
@@ -133,11 +160,13 @@ def find_runnable_job(connection, *, tenant_id: str,
 
 def create_job(connection, *, tenant_id: str, owner: str,
                idempotency_key: str, document_digest: str,
+               assignment_id: str = None,
                max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> dict:
     """Create (or replay) a job. Returns ``job_id``, ``created``, digest.
 
-    Replay of the SAME key for the SAME digest returns the stored job with
-    ``created=False``; the same key for a DIFFERENT document is refused.
+    Replay of the SAME key for the SAME digest and assignment returns the
+    stored job with ``created=False``; the same key for a DIFFERENT document
+    or a different assignment link is refused.
     """
     now = int(time.time())
     job_id = mint_job_id(tenant_id, owner, idempotency_key)
@@ -145,28 +174,32 @@ def create_job(connection, *, tenant_id: str, owner: str,
         with connection.transaction():
             _bind_tenant(connection, tenant_id)
             prior = connection.execute(
-                "SELECT document_digest, job_id FROM marking_jobs"
+                "SELECT document_digest, job_id, assignment_id FROM marking_jobs"
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND idempotency_key = %s",
                 (tenant_id, owner, idempotency_key)).fetchone()
             if prior is not None:
-                if prior[0] != document_digest:
+                if prior[0] != document_digest or prior[2] != assignment_id:
                     raise JobStoreError("idempotency_key_payload_mismatch")
                 return {"job_id": prior[1], "created": False,
-                        "document_digest": prior[0]}
+                        "document_digest": prior[0],
+                        "assignment_id": prior[2]}
             connection.execute(
                 "INSERT INTO marking_jobs (tenant_id, owner_subject, job_id,"
                 " idempotency_key, document_digest, status, attempts,"
-                " max_attempts, lease_until, created_at, updated_at)"
-                " VALUES (%s, %s, %s, %s, %s, 'queued', 0, %s, 0, %s, %s)",
+                " max_attempts, lease_until, created_at, updated_at,"
+                " assignment_id)"
+                " VALUES (%s, %s, %s, %s, %s, 'queued', 0, %s, 0, %s, %s, %s)",
                 (tenant_id, owner, job_id, idempotency_key, document_digest,
-                 int(max_attempts), now, now))
+                 int(max_attempts), now, now, assignment_id))
         return {"job_id": job_id, "created": True,
-                "document_digest": document_digest}
+                "document_digest": document_digest,
+                "assignment_id": assignment_id}
     except JobStoreError:
         raise
     except Exception as error:
-        raise JobStoreError("store_unusable") from error
+        raise _assignment_link_error(error) or JobStoreError(
+            "store_unusable") from error
 
 
 def get_job(connection, *, tenant_id: str, owner: str, job_id: str):
@@ -181,6 +214,49 @@ def get_job(connection, *, tenant_id: str, owner: str, job_id: str):
     except Exception as error:
         raise JobStoreError("store_unusable") from error
     return _rows_to_job(row) if row is not None else None
+
+
+def list_jobs_for_assignment(connection, *, tenant_id: str, owner: str,
+                             assignment_id: str, limit: int = 50,
+                             after_created_at: int = 0,
+                             after_job_id: str = ""):
+    """Newest-first keyset page of this owner+tenant's jobs for one assignment.
+
+    Production twin of ``job_store.list_jobs_for_assignment``: same
+    ``(created_at DESC, job_id DESC)`` keyset order and strict "after"
+    comparison, so pages never duplicate or skip rows. Tenant scoping is the
+    same transaction-local GUC binding as every other read (RLS is ENABLE +
+    FORCE on ``marking_jobs``); owner scoping is in the WHERE clause, so a
+    store-level caller cannot cross owner boundaries. The 0008 partial index
+    ``ix_marking_jobs_assignment`` covers the filter prefix.
+    """
+    limit = int(limit)
+    # Bounds mirror ``assignment_store``'s page size (contract: identical to
+    # GET /v1/assignments - default 50, maximum 100).
+    if limit < 1 or limit > 100:
+        raise JobStoreError("payload_invalid")
+    try:
+        with connection.transaction():
+            _bind_tenant(connection, tenant_id)
+            if after_job_id:
+                rows = connection.execute(
+                    "SELECT " + ", ".join(_JOB_COLUMNS) + " FROM marking_jobs"
+                    " WHERE tenant_id = %s AND owner_subject = %s"
+                    " AND assignment_id = %s AND (created_at, job_id)"
+                    " < (%s, %s)"
+                    " ORDER BY created_at DESC, job_id DESC LIMIT %s",
+                    (tenant_id, owner, assignment_id, int(after_created_at),
+                     after_job_id, limit)).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT " + ", ".join(_JOB_COLUMNS) + " FROM marking_jobs"
+                    " WHERE tenant_id = %s AND owner_subject = %s"
+                    " AND assignment_id = %s"
+                    " ORDER BY created_at DESC, job_id DESC LIMIT %s",
+                    (tenant_id, owner, assignment_id, limit)).fetchall()
+    except Exception as error:
+        raise JobStoreError("store_unusable") from error
+    return [_rows_to_job(row) for row in rows]
 
 
 def find_authorizable_job(connection, *, tenant_id: str, owner: str,

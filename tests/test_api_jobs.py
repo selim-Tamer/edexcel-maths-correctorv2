@@ -15,6 +15,7 @@ import tempfile
 import time
 import unittest
 
+import assignment_store
 import audit_store
 import document_store
 import ingest_registry
@@ -55,6 +56,9 @@ class JobApiTests(unittest.TestCase):
             document_store.ACK_ENV: "1",
             job_store.PATH_ENV: os.path.join(self.tmp.name, "jobs.sqlite3"),
             job_store.ACK_ENV: "1",
+            assignment_store.PATH_ENV: os.path.join(self.tmp.name,
+                                                    "assignments.sqlite3"),
+            assignment_store.ACK_ENV: "1",
         }
         for name, value in self._env.items():
             os.environ[name] = value
@@ -87,9 +91,218 @@ class JobApiTests(unittest.TestCase):
             json={"idempotency_key": key,
                   "document_digest": digest or self.digest})
 
+    def _create_assignment(self, key="assign-key-0001",
+                           title="Year 10 Paper 1", token="tok-a",
+                           client=None):
+        headers = self._headers(token)
+        headers["Idempotency-Key"] = key
+        return (client or self.client).post(
+            "/v1/assignments", headers=headers, json={"title": title})
+
     def _run(self, job_id, token="tok-a", client=None):
         return (client or self.client).post(
             f"/v1/jobs/{job_id}/run", headers=self._headers(token))
+
+    def test_job_links_to_an_owned_assignment_end_to_end(self):
+        created = self._create_assignment()
+        self.assertEqual(201, created.status_code, created.text)
+        assignment_id = created.json()["assignment_id"]
+
+        linked = self.client.post(
+            "/v1/jobs", headers=self._headers(),
+            json={"idempotency_key": "job-link-key-0001",
+                  "document_digest": self.digest,
+                  "assignment_id": assignment_id})
+        self.assertEqual(201, linked.status_code, linked.text)
+        self.assertEqual(assignment_id, linked.json()["assignment_id"])
+
+        status = self.client.get(f"/v1/jobs/{linked.json()['job_id']}",
+                                 headers=self._headers())
+        self.assertEqual(200, status.status_code, status.text)
+        self.assertEqual(assignment_id, status.json()["assignment_id"])
+
+    def test_unlinked_jobs_keep_the_agreed_v1_2_payload_shape(self):
+        """Absent-means-omit: an unlinked job must not grow a null field.
+
+        The agreed v1.2 response shape did not contain assignment_id. Emitting
+        null on every job would change bytes for a client that never opted in,
+        so the field appears only when a link exists.
+        """
+        payload = self._create().json()
+        self.assertNotIn("assignment_id", payload)
+        status = self.client.get(f"/v1/jobs/{payload['job_id']}",
+                                 headers=self._headers())
+        self.assertEqual(200, status.status_code, status.text)
+        self.assertNotIn("assignment_id", status.json())
+
+    def test_malformed_assignment_id_is_payload_invalid(self):
+        for bad in ("asg_nothex", "asg_" + "A" * 24, "assignment-1", " "):
+            with self.subTest(value=bad):
+                response = self.client.post(
+                    "/v1/jobs", headers=self._headers(),
+                    json={"idempotency_key": "job-bad-asg-0001",
+                          "document_digest": self.digest,
+                          "assignment_id": bad})
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+
+    def test_another_owners_assignment_is_indistinguishable_not_found(self):
+        created = self._create_assignment()
+        assignment_id = created.json()["assignment_id"]
+        other = self._client(TENANT, engine_marker=None)
+        response = other.post(
+            "/v1/jobs", headers=self._headers("tok-b"),
+            json={"idempotency_key": "job-other-owner-0001",
+                  "document_digest": self.digest,
+                  "assignment_id": assignment_id})
+        self.assertEqual(404, response.status_code, response.text)
+        self.assertEqual("assignment_not_found",
+                         response.json()["error"]["code"])
+
+    def test_replay_with_a_different_assignment_is_a_conflict(self):
+        first = self._create_assignment(key="assign-key-a", title="A")
+        second = self._create_assignment(key="assign-key-b", title="B")
+        body = {"idempotency_key": "job-retarget-0001",
+                "document_digest": self.digest,
+                "assignment_id": first.json()["assignment_id"]}
+        created = self.client.post("/v1/jobs", headers=self._headers(),
+                                   json=body)
+        self.assertEqual(201, created.status_code, created.text)
+        retargeted = dict(body,
+                          assignment_id=second.json()["assignment_id"])
+        replay = self.client.post("/v1/jobs", headers=self._headers(),
+                                  json=retargeted)
+        self.assertEqual(409, replay.status_code, replay.text)
+        self.assertEqual("idempotency_key_payload_mismatch",
+                         replay.json()["error"]["code"])
+
+    # -- GET /v1/assignments/{assignment_id}/jobs (agreed v1.2.1 item 3) ---
+    def test_assignment_jobs_lists_only_linked_jobs_byte_identically(self):
+        """The recovery route returns linked jobs only, payload-for-payload.
+
+        Contract item 3: each item is exactly what ``GET /v1/jobs/{job_id}``
+        returns for that job (``assignment_id`` present because the row is
+        linked by construction), and an unlinked job never appears.
+        """
+        created = self._create_assignment()
+        self.assertEqual(201, created.status_code, created.text)
+        assignment_id = created.json()["assignment_id"]
+        linked_ids = []
+        for index in (1, 2):
+            response = self.client.post(
+                "/v1/jobs", headers=self._headers(),
+                json={"idempotency_key": f"job-list-link-{index:04d}",
+                      "document_digest": self.digest,
+                      "assignment_id": assignment_id})
+            self.assertEqual(201, response.status_code, response.text)
+            linked_ids.append(response.json()["job_id"])
+        unlinked = self._create(key="job-list-unlinked-0001")
+        self.assertEqual(201, unlinked.status_code, unlinked.text)
+
+        page = self.client.get(
+            f"/v1/assignments/{assignment_id}/jobs",
+            headers=self._headers())
+        self.assertEqual(200, page.status_code, page.text)
+        body = page.json()
+        self.assertIsNone(body["next_cursor"],
+                          "a not-full page must not emit a cursor")
+        listed = body["jobs"]
+        self.assertEqual(set(linked_ids),
+                         {job["job_id"] for job in listed})
+        for job in listed:
+            single = self.client.get(f"/v1/jobs/{job['job_id']}",
+                                     headers=self._headers())
+            self.assertEqual(200, single.status_code, single.text)
+            self.assertEqual(single.json(), job,
+                             "payload must be identical to GET /v1/jobs/{id}")
+            self.assertEqual(assignment_id, job["assignment_id"])
+
+    def test_assignment_jobs_pages_by_keyset_without_duplicates_or_gaps(self):
+        created = self._create_assignment(key="assign-key-page")
+        assignment_id = created.json()["assignment_id"]
+        expected = set()
+        for index in range(3):
+            response = self.client.post(
+                "/v1/jobs", headers=self._headers(),
+                json={"idempotency_key": f"job-page-{index:04d}",
+                      "document_digest": self.digest,
+                      "assignment_id": assignment_id})
+            self.assertEqual(201, response.status_code, response.text)
+            expected.add(response.json()["job_id"])
+        seen, cursor = [], None
+        for _ in range(10):
+            params = {"limit": 1}
+            if cursor:
+                params["cursor"] = cursor
+            page = self.client.get(
+                f"/v1/assignments/{assignment_id}/jobs",
+                headers=self._headers(), params=params)
+            self.assertEqual(200, page.status_code, page.text)
+            body = page.json()
+            seen.extend(job["job_id"] for job in body["jobs"])
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+        else:
+            self.fail("the cursor did not terminate")
+        self.assertEqual(expected, set(seen), "pages skipped or invented rows")
+        self.assertEqual(len(seen), len(set(seen)), "duplicate rows across pages")
+
+    def test_assignment_jobs_malformed_id_and_cursor_are_payload_invalid(self):
+        for bad in ("asg_nothex", "asg_" + "A" * 24, "assignment-1", " "):
+            with self.subTest(assignment_id=bad):
+                response = self.client.get(
+                    f"/v1/assignments/{bad}/jobs",
+                    headers=self._headers())
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+        created = self._create_assignment(key="assign-key-bad-cursor")
+        assignment_id = created.json()["assignment_id"]
+        for bad_cursor in ("not-a-cursor!!", "b3RoZXI=", "asg_" + "a" * 24):
+            with self.subTest(cursor=bad_cursor):
+                response = self.client.get(
+                    f"/v1/assignments/{assignment_id}/jobs",
+                    headers=self._headers(),
+                    params={"cursor": bad_cursor})
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+
+    def test_assignment_jobs_unknown_and_foreign_ids_are_indistinguishable(self):
+        missing = self.client.get(
+            "/v1/assignments/" + "asg_" + "0" * 24 + "/jobs",
+            headers=self._headers())
+        self.assertEqual(404, missing.status_code, missing.text)
+        created = self._create_assignment(key="assign-key-foreign-list")
+        assignment_id = created.json()["assignment_id"]
+        other = self._client(TENANT, engine_marker=None)
+        foreign = other.get(f"/v1/assignments/{assignment_id}/jobs",
+                            headers=self._headers("tok-b"))
+        self.assertEqual(404, foreign.status_code, foreign.text)
+        # Same code for "never existed" and "owned by someone else", never 403.
+        self.assertEqual(missing.json()["error"]["code"],
+                         foreign.json()["error"]["code"])
+        self.assertEqual("assignment_not_found",
+                         foreign.json()["error"]["code"])
+
+    def test_assignment_jobs_rejects_out_of_range_limit_like_assignments(self):
+        created = self._create_assignment(key="assign-key-limit")
+        assignment_id = created.json()["assignment_id"]
+        for bad_limit in (0, 101):
+            with self.subTest(limit=bad_limit):
+                response = self.client.get(
+                    f"/v1/assignments/{assignment_id}/jobs",
+                    headers=self._headers(),
+                    params={"limit": bad_limit})
+                # Same validation as GET /v1/assignments (identical bounds).
+                self.assertEqual(response.status_code,
+                                 self.client.get(
+                                     "/v1/assignments",
+                                     headers=self._headers(),
+                                     params={"limit": bad_limit}
+                                 ).status_code)
 
     def test_create_mints_the_job_and_replays_idempotently(self):
         first = self._create()

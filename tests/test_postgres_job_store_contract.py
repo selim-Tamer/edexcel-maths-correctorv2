@@ -20,6 +20,7 @@ here - nothing in this file claims a pooled connection works.
 import contextlib
 import os
 import secrets
+import time
 import sys
 import types
 import unittest
@@ -77,9 +78,13 @@ class _FakeResult:
 class _FakeConnection:
     """Minimal psycopg connection stand-in for ``open_store`` validation."""
 
-    def __init__(self, jobs_version="1", table="marking_jobs"):
+    def __init__(self, jobs_version="1", table="marking_jobs",
+                 linkage="1"):
+        # open_store reads, in order: jobs_version, to_regclass(...),
+        # job_assignment_linkage_version (0008, fail closed when absent).
         self._answers = [_FakeResult((jobs_version,)),
-                         _FakeResult((table,))]
+                         _FakeResult((table,)),
+                         _FakeResult((linkage,))]
 
     @contextlib.contextmanager
     def transaction(self):
@@ -127,6 +132,19 @@ class OpenStoreConnectionKwargsTests(unittest.TestCase):
                         _FakeConnection(jobs_version=version, table=table))
                 self.assertEqual(caught.exception.detail, "store_unusable")
 
+    def test_open_store_fails_closed_when_0008_is_not_applied(self):
+        """A jobs schema without the linkage marker is NOT usable.
+
+        The linkage column is read on every job row, so a database that has
+        0003 but not 0008 would fail at query time with an opaque driver
+        error. Fail closed at open instead, with the same static detail.
+        """
+        for linkage in (None, "0", "2"):
+            with self.subTest(linkage=linkage):
+                with self.assertRaises(JobStoreError) as caught:
+                    self._open_with_fake(_FakeConnection(linkage=linkage))
+                self.assertEqual(caught.exception.detail, "store_unusable")
+
     def test_open_store_refuses_an_empty_dsn(self):
         for bad in ("", "   ", None):
             with self.subTest(dsn=bad):
@@ -156,6 +174,11 @@ class PostgresJobStoreContractTests(unittest.TestCase):
             _execute_sql_file(setup, "postgres_v3_jobs.sql")
             # Idempotent: a second apply must not fail.
             _execute_sql_file(setup, "postgres_v3_jobs.sql")
+            _execute_sql_file(setup, "postgres_v4_documents.sql")
+            _execute_sql_file(setup, "postgres_v7_assignments.sql")
+            _execute_sql_file(setup, "postgres_v8_job_assignment_linkage.sql")
+            # Idempotent: a second linkage apply must not fail.
+            _execute_sql_file(setup, "postgres_v8_job_assignment_linkage.sql")
             setup.execute(sqlmod.SQL("GRANT marker_app TO {}").format(
                 sqlmod.Identifier(APP_ROLE)))
             # Seed as the migration/owner role (superuser bypasses RLS).
@@ -191,6 +214,115 @@ class PostgresJobStoreContractTests(unittest.TestCase):
             self.connection.execute("DELETE FROM marking_jobs")
 
     # -- identity and idempotency ----------------------------------------
+    def test_job_row_persists_the_server_validated_assignment_link(self):
+        assignment_id = "asg_" + "a" * 24
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            admin.execute(
+                "INSERT INTO assignments (tenant_id, owner_subject,"
+                " assignment_id, idempotency_key, title, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (TENANT, OWNER, assignment_id, "assign-link-key",
+                 "Linked", int(time.time())))
+        created = postgres_job_store.create_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            idempotency_key="job-link-key-0001",
+            document_digest="d" * 64, assignment_id=assignment_id)
+        stored = postgres_job_store.get_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            job_id=created["job_id"])
+        self.assertEqual(assignment_id, stored["assignment_id"])
+        replay = postgres_job_store.create_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            idempotency_key="job-link-key-0001",
+            document_digest="d" * 64, assignment_id=assignment_id)
+        self.assertFalse(replay["created"])
+        self.assertEqual(assignment_id, replay["assignment_id"])
+
+    def test_link_to_an_assignment_owned_by_someone_else_is_refused(self):
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            admin.execute(
+                "INSERT INTO assignments (tenant_id, owner_subject,"
+                " assignment_id, idempotency_key, title, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (OTHER_TENANT, OTHER_OWNER, "asg_" + "b" * 24,
+                 "assign-other-key", "Other", int(time.time())))
+        with self.assertRaises(JobStoreError) as caught:
+            postgres_job_store.create_job(
+                self.connection, tenant_id=TENANT, owner=OWNER,
+                idempotency_key="job-cross-link-0001",
+                document_digest="d" * 64,
+                assignment_id="asg_" + "b" * 24)
+        # Defence in depth: the composite FK refuses, and the store reports the
+        # product-level 404 detail - not store_unusable (whole store down) and
+        # never success. Nothing is partially written.
+        self.assertEqual("assignment_not_found", caught.exception.detail)
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            count = admin.execute(
+                "SELECT count(*) FROM marking_jobs"
+                " WHERE idempotency_key = %s",
+                ("job-cross-link-0001",)).fetchone()[0]
+        self.assertEqual(0, count)
+
+    def test_list_jobs_for_assignment_pages_newest_first_and_scopes(self):
+        """The v1.2.1 recovery read against real PostgreSQL.
+
+        Keyset order is ``(created_at DESC, job_id DESC)`` with a strict
+        "after" comparison (no duplicates, no gaps even inside one
+        ``created_at`` second), rows are filtered to the exact assignment,
+        and the read is owner+tenant scoped at the store level.
+        """
+        assignment_id = "asg_" + "c" * 24
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            admin.execute(
+                "INSERT INTO assignments (tenant_id, owner_subject,"
+                " assignment_id, idempotency_key, title, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (TENANT, OWNER, assignment_id, "assign-page-key",
+                 "Paged", int(time.time())))
+        linked = [
+            postgres_job_store.create_job(
+                self.connection, tenant_id=TENANT, owner=OWNER,
+                idempotency_key=f"page-key-{index}",
+                document_digest="e" * 64, assignment_id=assignment_id)
+            for index in range(2)]
+        unlinked = postgres_job_store.create_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            idempotency_key="page-unlinked", document_digest="f" * 64)
+        first = postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=1)
+        self.assertEqual(1, len(first))
+        second = postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=1,
+            after_created_at=first[0]["created_at"],
+            after_job_id=first[0]["job_id"])
+        self.assertEqual(1, len(second))
+        self.assertGreater(
+            (first[0]["created_at"], first[0]["job_id"]),
+            (second[0]["created_at"], second[0]["job_id"]),
+            "pages must walk strictly downward in (created_at, job_id)")
+        seen = {first[0]["job_id"], second[0]["job_id"]}
+        self.assertEqual(seen, {job["job_id"] for job in linked})
+        self.assertNotIn(unlinked["job_id"], seen,
+                         "an unlinked job must never appear")
+        # Owner scoping holds at the store level, not only in the API.
+        self.assertEqual([], postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OTHER_OWNER,
+            assignment_id=assignment_id, limit=10))
+        self.assertEqual([], postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=OTHER_TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=10))
+        # Bounds mirror GET /v1/assignments: 1..100, else payload_invalid.
+        for bad_limit in (0, 101):
+            with self.subTest(limit=bad_limit):
+                with self.assertRaises(JobStoreError) as caught:
+                    postgres_job_store.list_jobs_for_assignment(
+                        self.connection, tenant_id=TENANT, owner=OWNER,
+                        assignment_id=assignment_id, limit=bad_limit)
+                self.assertEqual("payload_invalid", caught.exception.detail)
+
+
     def test_create_is_idempotent_and_refuses_retargeting(self):
         created = postgres_job_store.create_job(
             self.connection, tenant_id=TENANT, owner=OWNER,

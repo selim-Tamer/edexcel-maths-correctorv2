@@ -44,11 +44,36 @@ Reuse it; do not recreate it.
 | 0004 | `schema/postgres_v4_documents.sql` | Document metadata access for the private storage adapter (`pdf_references` `SELECT, INSERT` for both runtime roles - **no UPDATE, no DELETE**) plus the **separate elevated role `marker_purge`** (`NOLOGIN`, `SELECT, UPDATE` on `pdf_references` only - the tombstone - and **no DELETE anywhere**, tenant-bound like everything else, never a bypass role). | `schema_meta.docs_version = '1'` | `schema/postgres_v4_documents_rollback.sql` (restores the 0002 posture; does NOT touch bucket objects or existing rows - disclosed) |
 | 0005 | `schema/postgres_v5_membership_access.sql` | Production membership **resolution**: a second SELECT-only RLS policy on `tenant_membership` keyed by `app.subject`, plus column-level `SELECT` (five columns) for `marker_app`. **No INSERT/UPDATE/DELETE** on membership rows for any runtime role - the API cannot grant itself a tenant. | `schema_meta.membership_access_version = '1'` | `schema/postgres_v5_membership_access_rollback.sql` (drops the policy + grant, leaves membership rows intact) |
 | 0006 | `schema/postgres_v6_result_narrowing.sql` | Least privilege on `results`: drops the table-wide `UPDATE` and grants **`UPDATE (result_revision)` only** to `marker_app` / `marker_worker` - the single column `postgres_store.commit()` writes. Every other column becomes non-writable by a runtime role, so the immutable original result cannot be rewritten. **No DELETE.** | `schema_meta.results_update_version = '1'` | `schema/postgres_v6_result_narrowing_rollback.sql` (restores the 0002 table-wide UPDATE; refuses when 0006 was never applied; touches no rows) |
+| 0007 | `schema/postgres_v7_assignments.sql` | Server-owned teacher `assignments`: server-minted `assignment_id`, unique `(tenant_id, owner_subject, idempotency_key)`, title 1..200, created_at epoch. RLS **ENABLE + FORCE** + `tenant_isolation`; `SELECT, INSERT` for `marker_app` and **no UPDATE / no DELETE** in v1.2. | `schema_meta.assignments_version = '1'` | `schema/postgres_v7_assignments_rollback.sql` (drops the table and therefore every assignment row - dump first) |
+| 0008 | `schema/postgres_v8_job_assignment_linkage.sql` | Adds nullable `marking_jobs.assignment_id` plus composite FK `(tenant_id, owner_subject, assignment_id) -> assignments(tenant_id, owner_subject, assignment_id)` (`ON UPDATE CASCADE ON DELETE RESTRICT`), a partial index for the eventual "jobs for one assignment" read, and **no grant change** (written at INSERT time). Cross-owner/cross-tenant linkage is refused by the database even if the API check regresses; the API still verifies ownership first so the client sees 404 `assignment_not_found`, not a 500. | `schema_meta.job_assignment_linkage_version = '1'` | `schema/postgres_v8_job_assignment_linkage_rollback.sql` (drops constraint, index, column and marker; **deletes no job rows** - linked jobs simply lose the link) |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
 Those tables are new to this project and the Data API stays disabled; if that
 ever changes, re-grant explicitly and record why.
+
+**Numbering note (reconciled with the membership branch):**
+
+* `0005` is the membership-access migration
+  (`schema/postgres_v5_membership_access.sql`), on its own branch/PR.
+* `0006` is the result-revision privilege narrowing on the membership branch
+  (`schema/postgres_v6_result_narrowing.sql` in that repo): it removes the
+  table-wide `UPDATE` that 0002 granted on `results` and leaves
+  `marker_app` / `marker_worker` with `UPDATE (result_revision)` only. It is
+  **implemented and CI-tested, but NOT applied here** - the wider grant is
+  still this project's real state until an authorized operator applies and
+  verifies it. Implemented is not closed; closing needs apply evidence.
+* `0007` is the assignments slice, deliberately above both. It requires only
+  the 0001-0004 base and does not depend on 0005 or 0006.
+* `0008` is the job-to-assignment linkage, additive on top of 0003 + 0007. It
+  changes **no grant**, so it does not widen or re-narrow anything 0002/0006
+  settled. Contract-wise it backs the **v1.2.1** addition, which is AGREED as
+  additive v1.2.1 (FCM `2b4720bc`; CM AGREED 2026-10-31, including the
+  `GET /v1/assignments/{assignment_id}/jobs` retrieval route this index was
+  written for) and is still not part of the agreed v1.2.0 wire surface: the
+  agreed v1.2.0 client never sends `assignment_id`, and an unlinked job row is
+  valid. The column is nullable, so older job rows and unlinked jobs remain
+  valid; only newly created linked jobs populate it.
 
 **0003 is a DRAFT artifact** (`schema/postgres_v3_jobs.sql`): the file is
 reviewed code, not an applied change. Applying it needs IR approval of the

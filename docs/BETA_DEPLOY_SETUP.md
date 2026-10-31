@@ -295,11 +295,17 @@ could not reach the API at all. This slice fixes the CM-owned half:
   `tests/test_minimum_contract.py` fails if the artifact and the real route
   table diverge, if a live frontend call disappears, if a client-owned call
   grows a server route, or if an error code is not a real backend code.
-* **Status is `PROPOSED_AWAITING_FCM_CONFIRMATION`.** It becomes `AGREED` only
-  with FCM's confirming message id. The client changes it implies (one upload
-  instead of authorize+confirm, a `POST /v1/jobs` call it does not have today,
-  `question_number` as a string, string question numbers, 403 ≠ expiry,
-  device-local drafts) are in the contract doc, not invented here.
+* **Status is `AGREED`.** v1.2.0 was confirmed by FCM in message
+  `a6c33dfa-7938-424f-9ec1-a35a53a02d2b` (superseding `80fcb269`), and
+  the additive v1.2.1 job-linkage block was confirmed in messages
+  `20167dfe-f3a1-4d6e-9e0d-67a676a99afe` + `50d42e22`. The artifact
+  records both (`spec` vs `additive_after_v1_2`) and the test suite
+  refuses `AGREED` without a confirming message id. The client changes
+  v1.2.0 implies (one upload
+  instead of authorize+confirm, a `POST /v1/jobs` call it does not have
+  today, `question_number` as a string, string question numbers, 403
+  expiry, device-local drafts) are in the contract doc, not invented
+  here.
 
 ---
 
@@ -409,9 +415,12 @@ One image serves both commands above: the default CMD is
 * **Supabase Free has no backups/PITR and pauses after ~1 week of inactivity.**
   The dump in `schema/MIGRATIONS.md` §2 and a user-accepted pause policy are the
   only mitigations; neither is a platform guarantee.
-* **The shared contract is proposed, not agreed.** FCM has not confirmed the
-  mapping, so the client half (one-shot upload, `POST /v1/jobs`, string
-  `question_number`, device-local drafts) is unproven against the real UI.
+* **The shared contract is agreed (v1.2.0 + additive v1.2.1), but the client
+  half is not yet re-proven against the real UI at these exact heads.** FCM
+  confirmed both halves in messages `a6c33dfa` / `20167dfe` / `50d42e22`; the
+  remaining risk is client implementation drift (one-shot upload,
+  `POST /v1/jobs`, string `question_number`, device-local drafts) against the
+  real UI at a named green-CI head.
 * **CORS is proven in-process only.** No Pages origin, browser preflight against
   Cloud Run, or real GIS token has been exercised.
 * No zero-cost guarantee, no production-readiness claim.
