@@ -5,7 +5,7 @@
 pypdf==6.21.2
 pypdfium2==5.14.0
 Pillow==13.0.0
-reportlab==5.0.1
+reportlab==5.1.0
 # Offline deterministic maths verification for investigation/ tests and
 # benchmarks. Not imported by the deployed Streamlit app, which uses plain
 # Python arithmetic only; must match the sympy pin used by CI.
