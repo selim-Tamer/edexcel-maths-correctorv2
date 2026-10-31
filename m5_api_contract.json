@@ -648,7 +648,7 @@
     {
       "method": "POST",
       "path": "/v1/assignments",
-      "purpose": "Create or replay one server-owned teacher assignment (contract v1.2, PROPOSED).",
+      "purpose": "Create or replay one server-owned teacher assignment (contract v1.2, AGREED).",
       "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
@@ -706,7 +706,7 @@
     {
       "method": "GET",
       "path": "/v1/assignments",
-      "purpose": "Newest-first keyset page of the caller's own assignments (contract v1.2, PROPOSED).",
+      "purpose": "Newest-first keyset page of the caller's own assignments (contract v1.2, AGREED).",
       "implemented": true,
       "auth_required": true,
       "tenant_scoped": true,
@@ -740,6 +740,50 @@
         "store_unusable",
         "dev_opt_in_required"
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/v1/assignments/{assignment_id}/jobs",
+      "purpose": "Newest-first keyset page of the caller's own jobs linked to one assignment - the server-side recovery primitive of AGREED contract v1.2.1 (FCM proposal 2b4720bc, item 3).",
+      "implemented": true,
+      "auth_required": true,
+      "tenant_scoped": true,
+      "path_params": {
+        "assignment_id": "server-minted asg_<24 lowercase hex>; malformed => 400 payload_invalid"
+      },
+      "query": {
+        "limit": "integer 1..100, default 50 (identical bounds to GET /v1/assignments)",
+        "cursor": "opaque next_cursor; malformed => 400 payload_invalid"
+      },
+      "response_200": {
+        "type": "object",
+        "required": [
+          "jobs",
+          "next_cursor"
+        ],
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "each item is byte-identical to the GET /v1/jobs/{job_id} payload for that job, with assignment_id present (linked rows only)"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "error_codes": [
+        "payload_invalid",
+        "assignment_not_found",
+        "store_unusable",
+        "dev_opt_in_required"
+      ],
+      "invariant": "ownership is verified under the verified token's tenant+owner BEFORE the read; an absent or foreign assignment is the same indistinguishable 404 assignment_not_found, never 403; order is created_at DESC, job_id DESC keyset paging with no duplicates or gaps."
     }
   ],
   "absent_by_design": {

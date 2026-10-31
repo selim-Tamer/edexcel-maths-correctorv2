@@ -24,11 +24,15 @@ assignment linkage was deliberately confirmed *out* of v1.2.0 and then agreed
 separately as additive **v1.2.1** (section 8a): FCM confirmed linkage is
 required, **jobs only** (message `20167dfe-f3a1-4d6e-9e0d-67a676a99afe`), and
 answered the variant question that job-only linkage is **sufficient** for
-v1.2.1 (message `50d42e22`). Both agreements are recorded in the artifact:
-`spec` for v1.2.0, `additive_after_v1_2` for v1.2.1. The v1.2.0 wire surface is
-unchanged by v1.2.1 - absent-means-omit keeps an unlinked job's payload
-byte-identical - and document-to-assignment linkage remains OUT with a hard
-v1.3 deadline.
+v1.2.1 (message `50d42e22`). FCM then required, in its exact v1.2.1 contract
+text (message `2b4720bc-94e0-4b8a-93e1-086cb0784ae7`), that v1.2.1 include the
+server-backed retrieval route `GET /v1/assignments/{assignment_id}/jobs` and
+explicitly rejected a device-local mapping as the only recovery path; CM
+AGREED that text on 2026-10-31. All three agreements are recorded in the
+artifact: `spec` for v1.2.0, `additive_after_v1_2` for v1.2.1. The v1.2.0 wire
+surface is unchanged by v1.2.1 - absent-means-omit keeps an unlinked job's
+payload byte-identical - and document-to-assignment linkage remains OUT with a
+hard v1.3 deadline.
 
 
 This document exists because IFR's live-beta audit found the frontend calling
@@ -246,9 +250,38 @@ from the assignment it belongs to:
   `POST /v1/documents` does not accept `assignment_id`; there is no
   document-registration route that could carry it today.
 
+**The v1.2.1 retrieval route (agreed addition, FCM `2b4720bc` item 3).**
+Linkage alone cannot recover an assignment's work after losing the device that
+created the job, so v1.2.1 also adds the server-side recovery primitive. FCM
+explicitly rejected "client-side mapping only" for this:
+
+```jsonc
+// GET /v1/assignments/{assignment_id}/jobs?limit=1..100&cursor=<opaque>
+// -> 200 { "jobs": [ <job payload objects EXACTLY as GET /v1/jobs/{job_id}
+//                     returns them, assignment_id present> ],
+//          "next_cursor": "<opaque>" | null }
+//    order: created_at DESC, job_id DESC (keyset; no OFFSET, no duplicates
+//    or skips across pages)
+//    limit: default 50, bounds identical to GET /v1/assignments
+// -> 400 payload_invalid  when assignment_id or cursor is malformed
+// -> 404 assignment_not_found when the id is not an assignment of THIS
+//    owner+tenant (indistinguishable from absent - never 403)
+```
+
+* Ownership is verified **before** the read, under the verified token's
+  tenant+owner, exactly like `GET /v1/assignments`.
+* Every item reuses the `GET /v1/jobs/{job_id}` payload builder, so the bytes
+  cannot drift between the two reads; linked rows always carry `assignment_id`.
+* Implemented at backend commit
+  `313251b720da70e1f09f27faf10cb708a4670423` (the pinned
+  `spec.backend_commit`; offline API tests plus a real-PostgreSQL contract
+  test cover it).
+
 **Status: AGREED as additive v1.2.1 (FCM messages
-`20167dfe-f3a1-4d6e-9e0d-67a676a99afe` - linkage required, jobs only - and
-`50d42e22` - job-only linkage is sufficient), and NOT part of v1.2.0.** FCM's
+`20167dfe-f3a1-4d6e-9e0d-67a676a99afe` - linkage required, jobs only -
+`50d42e22` - job-only linkage is sufficient - and `2b4720bc-94e0-4b8a-93e1-
+086cb0784ae7` - the exact v1.2.1 contract text adding the retrieval route,
+with CM's AGREED reply on 2026-10-31), and NOT part of v1.2.0.** FCM's
 v1.2.0 confirmation excluded linkage, so the agreed v1.2.0 surface does not
 contain this field even though the backend already implements it, and it is
 recorded in the artifact under `additive_after_v1_2` (never inside `spec`).
@@ -266,23 +299,26 @@ body); *job -> result* stays 0..1 via `result_id`. Identity is server-minted
 owner come only from the verified bearer token. Ownership is validated at the
 API (404 `assignment_not_found` indistinguishable from absent, never 403) and
 enforced again in the database by the composite FK, so a code regression
-cannot link across owners. Idempotency: one stable job key per create intent;
-a replay with the same `(document_digest, assignment_id)` pair replays the
+cannot link across owners. Idempotency: one stable job key per create intent,
+stable per `(assignment, student, document)` tuple - the key changes when any
+tuple member changes (`assignmentId`, `studentRef` or `document_digest`); a
+replay with the same `(document_digest, assignment_id)` pair replays the
 stored job, a different pair is 409 `idempotency_key_payload_mismatch`, and
 `POST /v1/jobs/{job_id}/run` retries the same job and never regenerates the
-key.
+key (FCM `2b4720bc` item 4 wording fix: the old "regenerate only when
+document_digest changes" text was narrower than the key rule and contradicted
+it once linkage was in).
 
-**What v1.2.1 deliberately does NOT include (agreed deferrals with a hard
+**What v1.2.1 deliberately does NOT include (agreed deferral with a hard
 v1.3 deadline).** FCM's reason for asking is cross-device recovery of an
-assignment's work. Job-only linkage plus the client-side
-assignment->job_id mapping is what both owners accepted for v1.2.1 (FCM
+assignment's work; the server-backed retrieval route above is what makes that
+recovery real (FCM `2b4720bc` rejected a device-local mapping as the only
+path). Job-only linkage remains sufficient for the document side (FCM
 `50d42e22`): the document is identified inside the job by `document_digest`,
-so the link ties an assignment to its marking work. Two things are explicitly
-deferred and must be decided no later than v1.3: (a) a server-side
-assignment-scoped job enumeration route (`GET /v1/assignments/{id}/jobs` -
-none exists today), and (b) document-to-assignment linkage, which needs a
-route decision first because no document-registration route exists to carry
-the link.
+so the link ties an assignment to its marking work. One thing is explicitly
+deferred and must be decided no later than v1.3: document-to-assignment
+linkage, which needs a route decision first because no document-registration
+route exists to carry the link.
 
 ## 9. Projection question fields (new in v1.2.0, AGREED)
 
@@ -308,9 +344,10 @@ delivered.
 * Job-to-assignment linkage in the **agreed v1.2.0** surface. It is section 8a,
   AGREED as additive **v1.2.1** only; the v1.2.0 wire surface is unchanged by
   it (absent-means-omit).
-* A `GET /v1/assignments/{id}/jobs` collection route: the client keeps polling
-  `GET /v1/jobs/{job_id}`, and `assignment_id` on the job payload is the link;
-  adding a server enumeration route is deferred to the v1.3 decision.
+* A `GET /v1/assignments/{id}/jobs` collection route **in the v1.2.0 surface**:
+  the agreed v1.2.0 client keeps polling `GET /v1/jobs/{job_id}` with
+  `assignment_id` on the job payload as the link. The route itself is the
+  AGREED additive **v1.2.1** addition (section 8a), never part of v1.2.0.
 * Signed upload URLs and direct-to-bucket writes.
 * `cancel` / `pause` / `resume` for jobs.
 * A submission resource separate from `result_id`.

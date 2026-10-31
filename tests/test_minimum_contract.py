@@ -113,6 +113,58 @@ class ContractArtifactTests(unittest.TestCase):
         self.assertIn("v1.3", boundaries["document_to_assignment"])
         self.assertIn("v1.2.1", boundaries["assignment_job_enumeration"])
 
+    def test_v1_2_1_retrieval_route_is_agreed_and_implemented(self):
+        """FCM 2b4720bc item 3: the server recovery route is contract state.
+
+        The retrieval route moved from the v1.3 deferral list into the AGREED
+        v1.2.1 block, so the artifact must say so explicitly: the agreement
+        cites FCM's exact-text message, the route is listed as implemented,
+        the old "NOT served / deferred" wording is gone, the out-of-scope list
+        cross-references where linkage actually lives, and the provenance pin
+        is a real 40-hex commit (never a prose string).
+        """
+        add = self.artifact["additive_after_v1_2"]
+        self.assertEqual("AGREED", add["status"])
+        self.assertIn("2b4720bc", add["confirmed_by"],
+                      "the retrieval-route agreement must cite FCM's message")
+        route = next(
+            entry for entry in self.artifact["server_routes"]
+            if entry["path"] == "/v1/assignments/{assignment_id}/jobs")
+        self.assertEqual("GET", route["method"])
+        self.assertIs(route["implemented"], True)
+        self.assertIn("v1.2.1", route["additive_v1_2_1"])
+        self.assertIn(("GET", "/v1/assignments/{assignment_id}/jobs"),
+                      self.actual_routes,
+                      "the agreed route must be served by the app")
+        # The deferral text is gone: enumeration is served, not promised later.
+        self.assertIn("RESOLVED", add["known_gap"])
+        self.assertNotIn("NOT served", add["known_gap"])
+        self.assertIn(
+            "SERVED", add["association_boundaries"]["assignment_job_enumeration"])
+        # out_of_scope must cross-reference the additive block (IR rev12 nit),
+        # so the two sections can never read as contradictory again.
+        outlined = " ".join(self.artifact["assignments"]["out_of_scope_v1_2"])
+        self.assertIn("additive_after_v1_2", outlined)
+        # Provenance: an exact 40-hex head, and not the commit that carries
+        # this artifact (that would be an impossible self-reference).
+        pin = self.artifact["spec"]["backend_commit"].split()[0]
+        self.assertRegex(pin, r"^[0-9a-f]{40}$")
+
+    def test_idempotency_wording_matches_the_agreed_tuple_rule(self):
+        """FCM 2b4720bc item 4: the regenerate rule must not be narrower.
+
+        The old text ("document_digest changes") contradicted the actual key
+        rule once linkage was in, because the key also moves with assignment
+        and student. The agreed replacement names the whole tuple.
+        """
+        idempotency = self.artifact["idempotency"]
+        rule = idempotency["regenerate_only_when"]
+        self.assertIn("tuple", rule)
+        for member in ("assignmentId", "studentRef", "document_digest"):
+            with self.subTest(member=member):
+                self.assertIn(member, rule)
+        self.assertIn("no new key", rule)
+
     def test_doc_and_artifact_agree_on_the_agreement_state(self):
         # The prose document and the artifact must never disagree about
         # whether this contract is agreed or who agreed it.

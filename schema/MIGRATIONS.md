@@ -67,9 +67,12 @@ ever changes, re-grant explicitly and record why.
   the 0001-0004 base and does not depend on 0005 or 0006.
 * `0008` is the job-to-assignment linkage, additive on top of 0003 + 0007. It
   changes **no grant**, so it does not widen or re-narrow anything 0002/0006
-  settled. Contract-wise it backs the **v1.2.1** addition, which is PROPOSED
-  and not part of the agreed v1.2 wire surface: the agreed v1.2 client never
-  sends `assignment_id`, and an unlinked job row is valid. The column is nullable, so older job rows and unlinked jobs remain
+  settled. Contract-wise it backs the **v1.2.1** addition, which is AGREED as
+  additive v1.2.1 (FCM `2b4720bc`; CM AGREED 2026-10-31, including the
+  `GET /v1/assignments/{assignment_id}/jobs` retrieval route this index was
+  written for) and is still not part of the agreed v1.2.0 wire surface: the
+  agreed v1.2.0 client never sends `assignment_id`, and an unlinked job row is
+  valid. The column is nullable, so older job rows and unlinked jobs remain
   valid; only newly created linked jobs populate it.
 
 **0003 is a DRAFT artifact** (`schema/postgres_v3_jobs.sql`): the file is

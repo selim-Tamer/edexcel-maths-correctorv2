@@ -18,7 +18,8 @@
 --   * composite FK (tenant_id, owner_subject, assignment_id) -> assignments:
 --     cross-owner/cross-tenant linkage is impossible even with a code bug;
 --   * no UPDATE/DELETE grant change: the column is written at INSERT time;
---   * index for the eventual "jobs for this assignment" read (no route yet);
+--   * index for the "jobs for this assignment" read, served by the AGREED
+--     v1.2.1 route GET /v1/assignments/{assignment_id}/jobs;
 --   * idempotent; rollback drops only the linkage, never job rows.
 
 -- 0. Preflight: jobs (0003) and assignments (0007) must exist and be marked.
@@ -61,7 +62,9 @@ BEGIN
     END IF;
 END $$;
 
--- 3. Read path for "jobs for one assignment" (additive later; no route yet).
+-- 3. Read path for "jobs for one assignment" (served by the AGREED v1.2.1
+--    route GET /v1/assignments/{assignment_id}/jobs; comment-only update, the
+--    index itself is unchanged).
 CREATE INDEX IF NOT EXISTS ix_marking_jobs_assignment
     ON marking_jobs (tenant_id, owner_subject, assignment_id)
     WHERE assignment_id IS NOT NULL;

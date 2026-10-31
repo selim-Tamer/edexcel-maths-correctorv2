@@ -10,8 +10,8 @@
       "runtime_routes_cors": "CM",
       "browser_client": "FCM"
     },
-    "backend_commit": "0668bf57a4294cec30009297c652ad273eee69fd (implementation head for v1.2.0 + v1.2.1; this contract commit is its direct child - pin updated from the stale e522b337 per FCM)",
-    "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. No server resource is invented for this contract and no route is added by it.",
+    "backend_commit": "313251b720da70e1f09f27faf10cb708a4670423 (implementation head for v1.2.0 + the AGREED v1.2.1 retrieval route; this contract commit is its direct child - the pin cannot reference itself, so it names the last code commit, per FCM's re-pin demand)",
+    "purpose": "The ONE shared browser API contract for the beta. It maps every live frontend call onto routes that already exist in the backend, or marks the call client-owned. The base v1.2.0 surface invents no server resource and adds no route; the AGREED additive v1.2.1 block adds exactly one retrieval route (GET /v1/assignments/{assignment_id}/jobs, FCM 2b4720bc item 3), recorded in server_routes with its additive_v1_2_1 marker.",
     "why_minimum": "The frontend's parallel model (assignments, uploads, drafts, finalize, submissions, queue) is a full server domain that would need its own schema, authorization, migration and review. The beta needs marking to work end-to-end: upload a private PDF, create and run a job, read the projection, record decisions. Everything else is local UI state until that loop is proven live.",
     "agreement_rule": "status may only become AGREED together with confirmed_by set to the teammate message id that confirmed this exact version. The test suite refuses AGREED without a confirmation reference.",
     "sources": [
@@ -119,6 +119,14 @@
       "implemented": true,
       "auth": "bearer",
       "purpose": "Newest-first page of THIS owner's assignments (owner_subject, mirroring documents ownership; a tenant-wide teacher view would be an additive later version). ?limit=1..100 (default 50) and an opaque ?cursor= from the previous page. 200 {assignments:[{assignment_id,title,created_at}], next_cursor: string|null}; 400 payload_invalid for a malformed cursor."
+    },
+    {
+      "method": "GET",
+      "path": "/v1/assignments/{assignment_id}/jobs",
+      "implemented": true,
+      "auth": "bearer",
+      "additive_v1_2_1": "AGREED v1.2.1 (FCM 2b4720bc-94e0-4b8a-93e1-086cb0784ae7 item 3; CM AGREED in reply): server-side assignment-scoped job retrieval - the recovery primitive that replaces a device-local assignment->job_id mapping as the only path. Implemented at backend_commit 313251b720da70e1f09f27faf10cb708a4670423.",
+      "purpose": "Newest-first page of THIS owner's jobs linked to one assignment. 200 {jobs:[<job payload objects exactly as GET /v1/jobs/{job_id} returns them, assignment_id present>], next_cursor: string|null}; ?limit=1..100 (default 50, bounds identical to GET /v1/assignments) and an opaque ?cursor=. Order created_at DESC, job_id DESC (keyset; no OFFSET; no duplicates or skips across pages). 400 payload_invalid for a malformed assignment_id or cursor; 404 assignment_not_found for an absent or other-owner assignment, indistinguishable from absent, never 403."
     }
   ],
   "frontend_calls": [
@@ -243,7 +251,7 @@
   },
   "idempotency": {
     "job_key_rule": "job-<first 32 hex chars of sha256(assignmentId + '|' + studentRef + '|' + document_digest)>",
-    "regenerate_only_when": "document_digest changes (a new upload is a new job)",
+    "regenerate_only_when": "the key is stable per (assignment, student, document) intent; it changes when any tuple member changes (assignmentId, studentRef or document_digest); a retry reuses the same key and POST /v1/jobs/{job_id}/run needs no new key",
     "retry_rule": "a retry is POST /v1/jobs/{job_id}/run with no new key",
     "decision_key_rule": "client-generated per (result_id, question_number, intended payload); replaying the same key with a different payload is refused with idempotency_key_payload_mismatch",
     "assignment_key_rule": "client-generated per intended (title) payload; same key + same title returns the SAME assignment (200), same key + different title is refused with idempotency_key_payload_mismatch (409)",
@@ -368,6 +376,7 @@
     },
     "out_of_scope_v1_2": [
       "renaming or deleting an assignment (no UPDATE/DELETE grant, no route)",
+      "job-to-assignment linkage: OUT of the v1.2.0 wire surface itself, but AGREED as the additive v1.2.1 block (see additive_after_v1_2) - never silently folded into v1.2.0; the agreed v1.2.0 client never sends assignment_id and an unlinked job payload stays byte-identical",
       "document-to-assignment linkage: POST /v1/documents does not accept assignment_id and no document-registration route exists to carry one; it MUST be agreed no later than v1.3 (which request carries it, and against which document identity) and may not slip silently past it",
       "tenant-wide teacher visibility",
       "richer scheme evidence"
@@ -388,8 +397,8 @@
   "additive_after_v1_2": {
     "version": "1.2.1",
     "status": "AGREED",
-    "confirmed_by": "20167dfe-f3a1-4d6e-9e0d-67a676a99afe (linkage required, jobs only) + 50d42e22 (variant answer: job-only linkage is sufficient for v1.2.1)",
-    "scope": "job-to-assignment linkage: optional assignment_id on POST /v1/jobs",
+    "confirmed_by": "20167dfe-f3a1-4d6e-9e0d-67a676a99afe (linkage required, jobs only) + 50d42e22 (variant answer: job-only linkage is sufficient for v1.2.1) + 2b4720bc-94e0-4b8a-93e1-086cb0784ae7 (FCM's exact v1.2.1 contract text: the server-backed retrieval route GET /v1/assignments/{assignment_id}/jobs is REQUIRED, device-local mapping rejected as the only path, plus the idempotency wording fix; CM AGREED in reply on 2026-10-31)",
+    "scope": "job-to-assignment linkage: optional assignment_id on POST /v1/jobs, PLUS the server-side assignment-scoped job retrieval route GET /v1/assignments/{assignment_id}/jobs (FCM 2b4720bc item 3)",
     "implemented": true,
     "in_agreed_v1_2": false,
     "wire": {
@@ -406,15 +415,23 @@
       },
       "database": "composite FK (tenant_id, owner_subject, assignment_id) -> assignments; cross-owner linkage refused even if the API check regresses"
     },
-    "known_gap": "Resolved for v1.2.1 by agreement (FCM 50d42e22): job-only linkage is sufficient - the document is identified inside the job by document_digest, so the link ties an assignment to its marking work and the client keeps the assignment->job_id mapping. What is explicitly NOT in v1.2.1 and MUST be decided no later than v1.3: (a) a server-side assignment-scoped job enumeration route, and (b) document-to-assignment linkage.",
+    "retrieval_route": {
+      "route": "GET /v1/assignments/{assignment_id}/jobs",
+      "query": "limit=1..100 (default 50, bounds identical to GET /v1/assignments) and an opaque cursor taken from the previous next_cursor",
+      "response": "200 {jobs: [<job payload objects exactly as GET /v1/jobs/{job_id} returns them, assignment_id present>], next_cursor: string|null}",
+      "order": "created_at DESC, job_id DESC (keyset; no OFFSET; no duplicates or skips across pages)",
+      "errors": "400 payload_invalid for a malformed assignment_id or cursor; 404 assignment_not_found for an absent or other-owner assignment, indistinguishable from absent, never 403",
+      "implemented_at": "313251b720da70e1f09f27faf10cb708a4670423 (spec.backend_commit; this contract commit is its direct child)"
+    },
+    "known_gap": "RESOLVED inside v1.2.1 by agreement (FCM 2b4720bc-94e0-4b8a-93e1-086cb0784ae7 item 3, implemented at 313251b720da70e1f09f27faf10cb708a4670423): server-side assignment-scoped job retrieval exists as GET /v1/assignments/{assignment_id}/jobs, so cross-device recovery no longer depends on a device-local assignment->job_id mapping (FCM explicitly rejected (b) client-side mapping as the only path). Job-only linkage remains sufficient for the document side (the document is identified inside the job by document_digest). What is explicitly NOT in v1.2.1 and MUST be decided no later than v1.3: document-to-assignment linkage.",
     "document_linkage": "NOT defined here and explicitly deferred: POST /v1/documents has no assignment_id and no document-registration route exists to carry one; MUST be agreed no later than v1.3 (FCM 50d42e22 confirmed this deferral).",
-    "confirmed_at": "2026-10-27",
+    "confirmed_at": "2026-10-31 (re-confirmed with the retrieval route folded into v1.2.1 per FCM 2b4720bc; the earlier 2026-10-27 agreement covered linkage only)",
     "association_boundaries": {
       "assignment_to_jobs": "1..N via assignment_id on marking_jobs (server-validated)",
       "job_to_document": "exactly 1 via document_digest (already in the agreed v1.2.0 job body)",
       "job_to_result": "0..1 via result_id (unchanged from agreed v1.2.0)",
       "document_to_assignment": "NOT linked in v1.2.1 - no route exists to carry it; MUST be defined by v1.3",
-      "assignment_job_enumeration": "NOT served in v1.2.1: there is no GET /v1/assignments/{id}/jobs. The client keeps its own assignment->job_id mapping (FCM owns this client-side state); adding a server enumeration route is deferred and MUST be decided no later than v1.3 together with document linkage",
+      "assignment_job_enumeration": "SERVED in v1.2.1: GET /v1/assignments/{assignment_id}/jobs (FCM 2b4720bc item 3; implemented at 313251b720da70e1f09f27faf10cb708a4670423) is the server-side source of truth for an assignment's jobs; a client-side assignment->job_id map may exist only as a cache, never as the only recovery path (this replaces the earlier deferral text, which listed this route as a v1.3 decision)",
       "identity": "assignment_id is server-minted (asg_ + 24 lowercase hex), immutable, never client-supplied as identity; tenant and owner come only from the verified bearer token",
       "ownership_validation": "API layer: shape check, then lookup under verified tenant+owner, 404 assignment_not_found indistinguishable from absent (never 403); database layer: composite FK (tenant_id, owner_subject, assignment_id) makes cross-owner linkage physically unrepresentable",
       "idempotency_retry": "one stable job idempotency key per create intent; replay with the same (document_digest, assignment_id) pair replays the stored job; replay with a different pair is 409 idempotency_key_payload_mismatch; POST /v1/jobs/{job_id}/run retries the SAME job and never regenerates the key"
