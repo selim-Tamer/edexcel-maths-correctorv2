@@ -272,10 +272,12 @@ explicitly rejected "client-side mapping only" for this:
   tenant+owner, exactly like `GET /v1/assignments`.
 * Every item reuses the `GET /v1/jobs/{job_id}` payload builder, so the bytes
   cannot drift between the two reads; linked rows always carry `assignment_id`.
-* Implemented at backend commit
-  `313251b720da70e1f09f27faf10cb708a4670423` (the pinned
-  `spec.backend_commit`; offline API tests plus a real-PostgreSQL contract
-  test cover it).
+* The route landed at backend commit
+  `313251b720da70e1f09f27faf10cb708a4670423`; the pinned
+  `spec.backend_commit` is the current code head
+  `14fc57be97bb57cf0872a7f580e22363e9db5b81` (which adds only the pypdf
+  6.21.4 security pin required by the dependency-audit gate). Offline API
+  tests plus a real-PostgreSQL contract test cover the route.
 
 **Status: AGREED as additive v1.2.1 (FCM messages
 `20167dfe-f3a1-4d6e-9e0d-67a676a99afe` - linkage required, jobs only -
