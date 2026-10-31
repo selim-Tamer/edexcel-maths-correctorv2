@@ -263,6 +263,66 @@ class PostgresJobStoreContractTests(unittest.TestCase):
                 ("job-cross-link-0001",)).fetchone()[0]
         self.assertEqual(0, count)
 
+    def test_list_jobs_for_assignment_pages_newest_first_and_scopes(self):
+        """The v1.2.1 recovery read against real PostgreSQL.
+
+        Keyset order is ``(created_at DESC, job_id DESC)`` with a strict
+        "after" comparison (no duplicates, no gaps even inside one
+        ``created_at`` second), rows are filtered to the exact assignment,
+        and the read is owner+tenant scoped at the store level.
+        """
+        assignment_id = "asg_" + "c" * 24
+        with psycopg.connect(_dsn(), autocommit=True) as admin:
+            admin.execute(
+                "INSERT INTO assignments (tenant_id, owner_subject,"
+                " assignment_id, idempotency_key, title, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s)",
+                (TENANT, OWNER, assignment_id, "assign-page-key",
+                 "Paged", int(time.time())))
+        linked = [
+            postgres_job_store.create_job(
+                self.connection, tenant_id=TENANT, owner=OWNER,
+                idempotency_key=f"page-key-{index}",
+                document_digest="e" * 64, assignment_id=assignment_id)
+            for index in range(2)]
+        unlinked = postgres_job_store.create_job(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            idempotency_key="page-unlinked", document_digest="f" * 64)
+        first = postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=1)
+        self.assertEqual(1, len(first))
+        second = postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=1,
+            after_created_at=first[0]["created_at"],
+            after_job_id=first[0]["job_id"])
+        self.assertEqual(1, len(second))
+        self.assertGreater(
+            (first[0]["created_at"], first[0]["job_id"]),
+            (second[0]["created_at"], second[0]["job_id"]),
+            "pages must walk strictly downward in (created_at, job_id)")
+        seen = {first[0]["job_id"], second[0]["job_id"]}
+        self.assertEqual(seen, {job["job_id"] for job in linked})
+        self.assertNotIn(unlinked["job_id"], seen,
+                         "an unlinked job must never appear")
+        # Owner scoping holds at the store level, not only in the API.
+        self.assertEqual([], postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=TENANT, owner=OTHER_OWNER,
+            assignment_id=assignment_id, limit=10))
+        self.assertEqual([], postgres_job_store.list_jobs_for_assignment(
+            self.connection, tenant_id=OTHER_TENANT, owner=OWNER,
+            assignment_id=assignment_id, limit=10))
+        # Bounds mirror GET /v1/assignments: 1..100, else payload_invalid.
+        for bad_limit in (0, 101):
+            with self.subTest(limit=bad_limit):
+                with self.assertRaises(JobStoreError) as caught:
+                    postgres_job_store.list_jobs_for_assignment(
+                        self.connection, tenant_id=TENANT, owner=OWNER,
+                        assignment_id=assignment_id, limit=bad_limit)
+                self.assertEqual("payload_invalid", caught.exception.detail)
+
+
     def test_create_is_idempotent_and_refuses_retargeting(self):
         created = postgres_job_store.create_job(
             self.connection, tenant_id=TENANT, owner=OWNER,

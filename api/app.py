@@ -268,6 +268,27 @@ def _decode_assignment_cursor(cursor: Optional[str]):
 
 
 
+def _encode_job_cursor(created_at: int, job_id: str) -> str:
+    raw = f"{int(created_at)}:{job_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_job_cursor(cursor: Optional[str]):
+    """Return ``(created_at, job_id)``; malformed cursors are 400."""
+    if cursor is None or not cursor.strip():
+        return 0, ""
+    try:
+        padded = cursor.strip() + "=" * (-len(cursor.strip()) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        created_at, _, job_id = raw.partition(":")
+        if not job_id.startswith("job:") or not created_at.isdigit():
+            raise ValueError("shape")
+        return int(created_at), job_id
+    except Exception:
+        raise ApiError("payload_invalid", "cursor is not a valid page cursor")
+
+
+
 def _now() -> str:
     return f"{time.time():.0f}"
 
@@ -1189,6 +1210,62 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             next_cursor = _encode_assignment_cursor(
                 last["created_at"], last["assignment_id"])
         return {"assignments": rows, "next_cursor": next_cursor}
+
+    @app.get("/v1/assignments/{assignment_id}/jobs")
+    def list_assignment_jobs(
+            assignment_id: str, who=Depends(actor),
+            limit: int = Query(assignment_store.DEFAULT_PAGE_SIZE,
+                               ge=1,
+                               le=assignment_store.MAX_PAGE_SIZE),
+            cursor: Optional[str] = Query(None)):
+        """Newest-first page of THIS owner's jobs linked to one assignment.
+
+        The server-side recovery primitive agreed for v1.2.1 (FCM proposal
+        msg 2b4720bc item 3): assignment-owned job retrieval survives
+        browser-storage loss, so recovery never depends on a device-local
+        mapping. The ownership check happens FIRST and exactly mirrors
+        ``GET /v1/assignments``: a malformed id is 400 ``payload_invalid``,
+        and an id owned by someone else is the same indistinguishable 404
+        ``assignment_not_found`` - never 403. Each item is the byte-identical
+        payload of ``GET /v1/jobs/{job_id}`` (``job_payload``), so a linked
+        job carries ``assignment_id`` and an unlinked shape is never emitted
+        here (the WHERE clause only returns linked rows). ``next_cursor`` is
+        opaque, null on a not-full page, and keyset-paged on
+        ``created_at DESC, job_id DESC`` so pages never duplicate or skip.
+        """
+        subject, owner, tenant_id = who
+        if not re.fullmatch(r"asg_[0-9a-f]{24}", assignment_id or ""):
+            raise ApiError("payload_invalid",
+                           "assignment_id is not a server-minted id")
+        after_created_at, after_job_id = _decode_job_cursor(cursor)
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                assignment = _assignment_api().get_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    assignment_id=assignment_id)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment could not be read")
+        if assignment is None:
+            raise ApiError("assignment_not_found",
+                           "no assignment for this owner")
+        connection = require_job_connection()
+        try:
+            with closing(connection):
+                rows = _job_api().list_jobs_for_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    assignment_id=assignment_id, limit=limit,
+                    after_created_at=after_created_at,
+                    after_job_id=after_job_id)
+        except job_store.JobStoreError as failure:
+            raise ApiError(failure.detail, "the jobs could not be read")
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_cursor = _encode_job_cursor(
+                last["created_at"], last["job_id"])
+        return {"jobs": [job_payload(job) for job in rows],
+                "next_cursor": next_cursor}
 
     @app.post("/v1/jobs/{job_id}/run")
     def run_marking_job(job_id: str, who=Depends(actor)):

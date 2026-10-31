@@ -216,6 +216,49 @@ def get_job(connection, *, tenant_id: str, owner: str, job_id: str):
     return _rows_to_job(row) if row is not None else None
 
 
+def list_jobs_for_assignment(connection, *, tenant_id: str, owner: str,
+                             assignment_id: str, limit: int = 50,
+                             after_created_at: int = 0,
+                             after_job_id: str = ""):
+    """Newest-first keyset page of this owner+tenant's jobs for one assignment.
+
+    Production twin of ``job_store.list_jobs_for_assignment``: same
+    ``(created_at DESC, job_id DESC)`` keyset order and strict "after"
+    comparison, so pages never duplicate or skip rows. Tenant scoping is the
+    same transaction-local GUC binding as every other read (RLS is ENABLE +
+    FORCE on ``marking_jobs``); owner scoping is in the WHERE clause, so a
+    store-level caller cannot cross owner boundaries. The 0008 partial index
+    ``ix_marking_jobs_assignment`` covers the filter prefix.
+    """
+    limit = int(limit)
+    # Bounds mirror ``assignment_store``'s page size (contract: identical to
+    # GET /v1/assignments - default 50, maximum 100).
+    if limit < 1 or limit > 100:
+        raise JobStoreError("payload_invalid")
+    try:
+        with connection.transaction():
+            _bind_tenant(connection, tenant_id)
+            if after_job_id:
+                rows = connection.execute(
+                    "SELECT " + ", ".join(_JOB_COLUMNS) + " FROM marking_jobs"
+                    " WHERE tenant_id = %s AND owner_subject = %s"
+                    " AND assignment_id = %s AND (created_at, job_id)"
+                    " < (%s, %s)"
+                    " ORDER BY created_at DESC, job_id DESC LIMIT %s",
+                    (tenant_id, owner, assignment_id, int(after_created_at),
+                     after_job_id, limit)).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT " + ", ".join(_JOB_COLUMNS) + " FROM marking_jobs"
+                    " WHERE tenant_id = %s AND owner_subject = %s"
+                    " AND assignment_id = %s"
+                    " ORDER BY created_at DESC, job_id DESC LIMIT %s",
+                    (tenant_id, owner, assignment_id, limit)).fetchall()
+    except Exception as error:
+        raise JobStoreError("store_unusable") from error
+    return [_rows_to_job(row) for row in rows]
+
+
 def find_authorizable_job(connection, *, tenant_id: str, owner: str,
                           document_digest: str) -> Optional[str]:
     """A SUCCEEDED job for this exact owner+tenant+document, else ``None``.

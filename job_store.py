@@ -167,6 +167,54 @@ def get_job(connection: sqlite3.Connection, *, tenant_id: str, owner: str,
     return _row_to_job(row) if row is not None else None
 
 
+def list_jobs_for_assignment(connection: sqlite3.Connection, *,
+                             tenant_id: str, owner: str, assignment_id: str,
+                             limit: int = 50, after_created_at: int = 0,
+                             after_job_id: str = ""):
+    """Newest-first keyset page of this owner+tenant's jobs for one assignment.
+
+    The server-side recovery primitive behind
+    ``GET /v1/assignments/{assignment_id}/jobs``: keyset paging on
+    ``(created_at DESC, job_id DESC)`` with a strict "after" comparison, so
+    pages never duplicate or skip rows even when jobs share a ``created_at``
+    second. Rows are filtered by the exact ``assignment_id`` the caller
+    proved ownership of at the API layer; owner+tenant scoping is enforced
+    here too, so a store-level caller cannot cross scopes.
+    """
+    limit = int(limit)
+    # Bounds mirror ``assignment_store``'s page size (contract: identical to
+    # GET /v1/assignments - default 50, maximum 100).
+    if limit < 1 or limit > 100:
+        raise JobStoreError("payload_invalid")
+    try:
+        if after_job_id:
+            rows = connection.execute(
+                "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
+                " document_digest, status, attempts, max_attempts,"
+                " lease_until, result_id, error_code, created_at, updated_at,"
+                " assignment_id FROM marking_jobs"
+                " WHERE tenant_id = ? AND owner_subject = ?"
+                " AND assignment_id = ?"
+                " AND (created_at < ? OR"
+                " (created_at = ? AND job_id < ?))"
+                " ORDER BY created_at DESC, job_id DESC LIMIT ?",
+                (tenant_id, owner, assignment_id, int(after_created_at),
+                 int(after_created_at), after_job_id, limit)).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT tenant_id, owner_subject, job_id, idempotency_key,"
+                " document_digest, status, attempts, max_attempts,"
+                " lease_until, result_id, error_code, created_at, updated_at,"
+                " assignment_id FROM marking_jobs"
+                " WHERE tenant_id = ? AND owner_subject = ?"
+                " AND assignment_id = ?"
+                " ORDER BY created_at DESC, job_id DESC LIMIT ?",
+                (tenant_id, owner, assignment_id, limit)).fetchall()
+    except sqlite3.Error as error:
+        raise JobStoreError("store_unusable") from error
+    return [_row_to_job(row) for row in rows]
+
+
 def find_authorizable_job(connection: sqlite3.Connection, *, tenant_id: str,
                           owner: str, document_digest: str):
     """A SUCCEEDED job for this exact owner+tenant+document.
