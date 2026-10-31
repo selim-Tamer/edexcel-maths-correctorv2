@@ -23,10 +23,11 @@ requests>=2.31,<3
 # Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls).
 # pypdf 6.21.1 fixes CVE-2026-113786; 6.21.2 additionally fixes three
 # crafted-PDF long-runtime advisories on the xref/object-loading path
-# (GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4, GHSA-6c7f-9265-g8fw). Pillow
-# 13.0.0 fixes the 12.3.0 advisory set (dependency-audit job, S5). Bump only
-# via pip-audit-clean, CI-validated updates.
-pypdf==6.21.2
+# (GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4, GHSA-6c7f-9265-g8fw); 6.21.4
+# fixes the 2026-10-31 advisory set CVE-2026-119203..119209 found by the
+# dependency-audit job. Pillow 13.0.0 fixes the 12.3.0 advisory set (S5).
+# Bump only via pip-audit-clean, CI-validated updates.
+pypdf==6.21.4
 pypdfium2==5.14.0
 Pillow==13.0.0
 # OIDC ID-token verification for the API auth foundation (auth_oidc.py; IR
