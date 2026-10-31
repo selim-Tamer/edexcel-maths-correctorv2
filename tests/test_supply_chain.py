@@ -102,7 +102,8 @@ class ProductionRequirements(TestCase):
             "streamlit": ((1, 66, 1), (1, 67)),
             "google-genai": ((1, 40), (3,)),
             "pandas": ((2, 0), (4,)),
-            "requests": ((2, 31), (3,)),
+            # Reviewed maintenance/security baseline; minimum/latest CI coverage.
+            "requests": ((2, 34, 2), (3,)),
             "Authlib": ((1, 3, 2), (2,)),
             "fastapi": ((0, 162), (0, 163)),
             "uvicorn": ((0, 53), (0, 54)),
@@ -114,6 +115,10 @@ class ProductionRequirements(TestCase):
                           f"{name} lost its documented floor")
             self.assertEqual(specifiers[0][1], ".".join(map(str, floor)),
                              f"{name} floor drifted from the CI-validated baseline")
+            self.assertEqual(set(specifiers), {
+                (">=", ".".join(map(str, floor))),
+                ("<", ".".join(map(str, cap))),
+            }, f"{name} must preserve the reviewed floor AND upper bound")
 
 
 class AuthlibRetention(TestCase):

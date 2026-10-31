@@ -19,7 +19,9 @@ streamlit>=1.66.1,<1.67
 Authlib>=1.3.2,<2
 google-genai>=1.40,<3
 pandas>=2.0,<4
-requests>=2.31,<3
+# Reviewed maintenance baseline includes pre-2.34 security fixes and Python 3.14 support.
+# See DEPENDENCY_REQUESTS_REVIEW.md; CI tests the floor and latest <3.
+requests>=2.34.2,<3
 # Exact pins on the untrusted-PDF parsing/rendering stack (S3 controls).
 # pypdf 6.21.1 fixes CVE-2026-113786; 6.21.2 additionally fixes three
 # crafted-PDF long-runtime advisories on the xref/object-loading path
