@@ -259,10 +259,27 @@ gcloud run deploy marker-api \
 * Service account `marker-runner` gets only
   `roles/secretmanager.secretAccessor` on the three secrets. No Editor, no
   Storage Admin (Supabase is external), no Cloud SQL.
-* Public (`--allow-unauthenticated`) ingress is **not** part of this packet:
-  the API performs its own Google ID-token verification, but exposure is a
-  separate approval. Until then, use `--no-allow-unauthenticated` plus an
-  operator-issued identity token for synthetic acceptance.
+* Two ingress variants exist and must not be conflated (IR review
+  `Shared/IR_CLOUD_AUTH_RETENTION_REVIEW_2026-10-31.md` §1):
+  1. **Operator synthetic acceptance (this packet's default):**
+     `--no-allow-unauthenticated` plus an operator-issued identity token -
+     exactly as previously written; unchanged.
+  2. **Beta browser path (separate, explicitly user-gated command):**
+     `gcloud run services update marker-api --region europe-west3
+     --allow-unauthenticated` - authorized ONLY by an explicit owner action
+     recorded at the deploy gate. Public invocation is acceptable for beta
+     **because the service performs its own authentication**: the shipped
+     RS256-only GIS OIDC verifier (pinned iss/aud, azp check, fail-closed JWKS)
+     plus server-side membership + tenant enforcement on every request
+     (`api/app.py` `actor()`) - provided the disclosed caps remain
+     (`--max-instances 2`, per-endpoint body caps) and the missing
+     request-level limiter is either owner-accepted or mitigated in code.
+     Cloud Run IAM is not the authorization boundary for this service; the app
+     layer is.
+  * **CORS is a browser capability policy, not an authorization boundary.**
+    `AI_MARKER_ALLOWED_ORIGINS` protects the browser's data from other
+    origins; it does not stop a non-browser client from calling the API, and
+    no part of authentication depends on it.
 * CORS: `AI_MARKER_ALLOWED_ORIGINS` is an **exact-origin allowlist** parsed by
   `runtime_config.parse_allowed_origins` (`api/app.py` adds Starlette's
   `CORSMiddleware`). Production requires `https`, refuses a wildcard, a path,
@@ -298,8 +315,13 @@ could not reach the API at all. This slice fixes the CM-owned half:
 * **Status is `AGREED`.** v1.2.0 was confirmed by FCM in message
   `a6c33dfa-7938-424f-9ec1-a35a53a02d2b` (superseding `80fcb269`), and
   the additive v1.2.1 job-linkage block was confirmed in messages
-  `20167dfe-f3a1-4d6e-9e0d-67a676a99afe` + `50d42e22`. The artifact
-  records both (`spec` vs `additive_after_v1_2`) and the test suite
+  `20167dfe-f3a1-4d6e-9e0d-67a676a99afe` + `50d42e22`, and FCM's exact
+  v1.2.1 contract text in `2b4720bc-94e0-4b8a-93e1-086cb0784ae7` (adds the
+  server-backed retrieval route `GET /v1/assignments/{assignment_id}/jobs`,
+  rejects a device-local mapping as the only recovery path, fixes the
+  idempotency tuple wording), with CM's AGREED reply on 2026-10-31. The
+  artifact
+  records all of it (`spec` vs `additive_after_v1_2`) and the test suite
   refuses `AGREED` without a confirming message id. The client changes
   v1.2.0 implies (one upload
   instead of authorize+confirm, a `POST /v1/jobs` call it does not have
@@ -388,19 +410,34 @@ One image serves both commands above: the default CMD is
 1. User supplies: Supabase project ref, OAuth client ID, Pages URL, GCP
    project ID, and authorizes migration + deploy + billing (billing activation
    is its own gate - see §1.1).
-2. Create the 3 secrets (values entered directly in the console/CLI, never in
+2. **Create the account-side budget alert (user console action, its own
+   gate):** a budget alert at a small absolute monthly number the owner chooses
+   (e.g. ~25% of the estimated month). Recorded with a readback in the deploy
+   evidence bundle. **Honest limit: a budget alert notifies; it is not a hard
+   spend cap** - Cloud Run has no programmatic spend enforcement beyond
+   `--max-instances 2`; the free-tier discount is a billing-table discount,
+   not a cap.
+3. Create the 3 secrets (values entered directly in the console/CLI, never in
    chat).
-3. Take the pre-migration `pg_dump` (`schema/MIGRATIONS.md` §2).
-4. Apply v1, then v2; run the rollback drill on a scratch project first (Free
+4. Take the pre-migration `pg_dump` (`schema/MIGRATIONS.md` §2).
+5. Apply v1, then v2; run the rollback drill on a scratch project first (Free
    allows 2 projects) and keep the output with the PR.
-5. Create `marker_runtime`, grant `marker_app`, test a read as that role
+6. Create `marker_runtime`, grant `marker_app`, test a read as that role
    (unbound must return zero rows).
-6. Build and push the image; deploy with 0 minimum instances.
-7. Run the synthetic acceptance steps that do not need the paid engine
+7. **Pricing gate evidence (before the first deploy - region is a one-way
+   choice):** capture from the official Cloud Run pricing table (a) the exact
+   Tier-2 multipliers for `europe-west3` and (b) the EU internet-egress rate;
+   attach to the deploy evidence bundle. Do not carry priced assumptions.
+8. Build and push the image; **record the built image digest**
+   (`docker inspect --format='{{index .RepoDigests 0}}' ...` or the Artifact
+   Registry readback) in the deploy evidence bundle; deploy with 0 minimum
+   instances. Note: no CI job builds this image today - the build happens
+   here, at the gate, and its digest is the provenance record.
+9. Run the synthetic acceptance steps that do not need the paid engine
    (identity, membership, upload, job, results, correction, audit, restart,
    isolation), with the engine still off.
-8. Only after a separate cost decision: set `AI_MARKER_ENGINE_REAL=1` for one
-   synthetic document.
+10. Only after a separate cost decision: set `AI_MARKER_ENGINE_REAL=1` for one
+    synthetic document.
 
 ## 8. What this packet does NOT prove
 
