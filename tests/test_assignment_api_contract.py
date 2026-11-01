@@ -470,5 +470,320 @@ class AssignmentJobLinkageTests(unittest.TestCase):
                          " a forbidden leak")
 
 
+class AssignmentJobRetrievalTests(unittest.TestCase):
+    """Independent lane for the v1.2.1 recovery route (PR72 c308d6a).
+
+    ``GET /v1/assignments/{assignment_id}/jobs`` is the server-side recovery
+    primitive: after browser-storage loss it must return exactly this owner's
+    linked jobs, page them without gaps or duplicates, and never become an
+    enumeration oracle. Distinct from CM's happy-path tests: cross-tenant AND
+    cross-owner indistinguishability, cursor transplant across assignments,
+    unlinked/retarget refusals, registration persistence through a fresh app.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import hashlib
+        import pdf_cases
+        cls.pdf = pdf_cases.make_pdf()
+        cls.digest = hashlib.sha256(cls.pdf).hexdigest()
+
+    def setUp(self):
+        import audit_store
+        import document_store
+        import ingest_registry
+        import job_store
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self._env = {
+            assignment_store.PATH_ENV:
+                os.path.join(self.tmp.name, "assignments.sqlite3"),
+            assignment_store.ACK_ENV: "1",
+            job_store.PATH_ENV: os.path.join(self.tmp.name, "jobs.sqlite3"),
+            job_store.ACK_ENV: "1",
+            document_store.PATH_ENV:
+                os.path.join(self.tmp.name, "documents.sqlite3"),
+            document_store.ACK_ENV: "1",
+            ingest_registry.PATH_ENV:
+                os.path.join(self.tmp.name, "ingest.sqlite3"),
+            ingest_registry.ACK_ENV: "1",
+            "AI_MARKER_AUDIT_DEV_STORE":
+                os.path.join(self.tmp.name, "audit.sqlite3"),
+            "AI_MARKER_AUDIT_DEV_ONLY": "1",
+        }
+        for name, value in self._env.items():
+            os.environ[name] = value
+            self.addCleanup(os.environ.pop, name, None)
+        self.client = self._client(TENANT_ALPHA)
+        self._upload(self.client, "tok-a1", "work.pdf")
+
+    # --- harness ---------------------------------------------------------
+
+    def _client(self, tenant_id, membership=True):
+        def engine(data=None):
+            return {"questions": [{"question_number": "1",
+                                   "awarded_marks": 2, "max_marks": 3,
+                                   "student_answer": "SYNTHETIC-ANSWER"}]}
+        def resolver(subject):
+            return Membership(subject, tenant_id, "teacher") if membership \
+                else None
+        return TestClient(create_app(
+            verify_token=TOKENS.get,
+            membership_resolver=resolver,
+            manual_document_provenance_ok=lambda row: True,
+            engine=engine))
+
+    def _headers(self, token="tok-a1"):
+        return {"Authorization": f"Bearer {token}"}
+
+    def _upload(self, client, token, name):
+        response = client.post("/v1/documents", headers=self._headers(token),
+                               params={"filename": name}, content=self.pdf)
+        self.assertEqual(201, response.status_code, response.text)
+        return response
+
+    def _assignment(self, client, token, key, title="Retrieval paper"):
+        response = client.post(
+            "/v1/assignments", headers=self._headers(token) | {
+                "Idempotency-Key": key}, json={"title": title})
+        self.assertEqual(201, response.status_code, response.text)
+        return response.json()["assignment_id"]
+
+    def _job(self, client, token, key, assignment_id=None):
+        body = {"idempotency_key": key, "document_digest": self.digest}
+        if assignment_id is not None:
+            body["assignment_id"] = assignment_id
+        return client.post("/v1/jobs", headers=self._headers(token), json=body)
+
+    def _retrieve(self, client, token, assignment_id, **params):
+        return client.get(f"/v1/assignments/{assignment_id}/jobs",
+                          headers=self._headers(token),
+                          params=params or None)
+
+    def _seed_linked(self, assignment_id, count=1, token="tok-a1",
+                     client=None, prefix="ret"):
+        ids = []
+        for index in range(count):
+            created = self._job(client or self.client, token,
+                                f"{prefix}-key-{index:04d}", assignment_id)
+            self.assertEqual(201, created.status_code, created.text)
+            ids.append(created.json()["job_id"])
+        return ids
+
+    # --- identity / membership ------------------------------------------
+
+    def test_retrieval_requires_a_token_and_active_membership(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "guard-key-01")
+        self.assertEqual(
+            401, self.client.get(
+                f"/v1/assignments/{assignment_id}/jobs").status_code)
+        inactive = self._client(TENANT_ALPHA, membership=False)
+        denied = self._retrieve(inactive, "tok-a1", assignment_id)
+        self.assertEqual(403, denied.status_code, denied.text)
+        self.assertEqual("tenant_membership_required",
+                         denied.json()["error"]["code"])
+
+    def test_malformed_assignment_and_cursor_are_payload_invalid(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "guard-key-02")
+        for bad_id in ("not-an-id", "asg_" + "A" * 24, "asg_" + "a" * 23,
+                       "asg_" + "z" * 24):
+            with self.subTest(assignment_id=bad_id):
+                response = self._retrieve(self.client, "tok-a1", bad_id)
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+        for bad_cursor in ("....", "aGVsbG8=", "1:job_", "x:job_abc"):
+            with self.subTest(cursor=bad_cursor):
+                response = self._retrieve(self.client, "tok-a1",
+                                          assignment_id, cursor=bad_cursor)
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+
+    def test_missing_foreign_tenant_and_foreign_owner_are_indistinguishable(self):
+        """Every non-owning id must be the SAME 404 - never a 403 oracle."""
+        missing = "asg_" + "f" * 24
+
+        beta = self._client(TENANT_BETA)
+        self._upload(beta, "tok-b1", "beta.pdf")
+        foreign_tenant = self._assignment(beta, "tok-b1", "guard-key-03")
+
+        # Same tenant (alpha), different owner: tok-b1 resolves into alpha.
+        same_tenant = self._client(TENANT_ALPHA)
+        foreign_owner = self._assignment(same_tenant, "tok-b1", "guard-key-04")
+
+        bodies = []
+        for target in (missing, foreign_tenant, foreign_owner):
+            response = self._retrieve(self.client, "tok-a1", target)
+            self.assertEqual(404, response.status_code, response.text)
+            self.assertEqual("assignment_not_found",
+                             response.json()["error"]["code"])
+            bodies.append((response.json(),
+                           response.headers.get("content-length")))
+        self.assertEqual(bodies[0], bodies[1], "foreign tenant must not differ")
+        self.assertEqual(bodies[0], bodies[2], "foreign owner must not differ")
+
+    # --- filtering / linkage --------------------------------------------
+
+    def test_retrieval_filters_to_the_exact_assignment(self):
+        first = self._assignment(self.client, "tok-a1", "filter-key-01")
+        second = self._assignment(self.client, "tok-a1", "filter-key-02")
+        first_ids = self._seed_linked(first, count=2, prefix="filter-a")
+        second_ids = self._seed_linked(second, count=1, prefix="filter-b")
+        unlinked = self._job(self.client, "tok-a1", "filter-unlinked-01")
+        self.assertEqual(201, unlinked.status_code, unlinked.text)
+
+        page = self._retrieve(self.client, "tok-a1", first, limit=3).json()
+        seen = [row["job_id"] for row in page["jobs"]]
+        self.assertEqual(set(first_ids), set(seen))
+        self.assertNotIn(second_ids[0], seen)
+        self.assertNotIn(unlinked.json()["job_id"], seen)
+        self.assertIsNone(page["next_cursor"],
+                          "a short page has no cursor")
+
+        other = self._retrieve(self.client, "tok-a1", second).json()
+        self.assertEqual(second_ids,
+                         [row["job_id"] for row in other["jobs"]])
+        self.assertIsNone(other["next_cursor"])
+        for row in page["jobs"]:
+            self.assertEqual(first, row["assignment_id"])
+
+    def test_item_matches_the_job_read_payload_exactly(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "parity-key-01")
+        job_id = self._seed_linked(assignment_id, prefix="parity")[0]
+        page = self._retrieve(self.client, "tok-a1", assignment_id).json()
+        self.assertEqual(1, len(page["jobs"]))
+        status = self.client.get(f"/v1/jobs/{job_id}",
+                                 headers=self._headers())
+        self.assertEqual(200, status.status_code, status.text)
+        self.assertEqual(status.json(), page["jobs"][0],
+                         "recovery must be byte-identical to the direct read")
+
+    # --- keyset pagination ----------------------------------------------
+
+    def test_pages_walk_newest_first_without_gaps_or_duplicates(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "page-key-01")
+        linked = self._seed_linked(assignment_id, count=3, prefix="page")
+
+        first = self._retrieve(self.client, "tok-a1", assignment_id,
+                               limit=2).json()
+        self.assertEqual(2, len(first["jobs"]))
+        self.assertIsNotNone(first["next_cursor"])
+        second = self._retrieve(self.client, "tok-a1", assignment_id, limit=2,
+                                cursor=first["next_cursor"]).json()
+        self.assertEqual(1, len(second["jobs"]))
+        self.assertIsNone(second["next_cursor"])
+
+        walked = [row["job_id"] for row in first["jobs"] + second["jobs"]]
+        self.assertEqual(len(walked), len(set(walked)), "no duplicates")
+        self.assertEqual(set(linked), set(walked), "no gaps")
+        # Newest-first is (created_at DESC, job_id DESC); the API payload does
+        # not expose timestamps, so compare against the store's own rows.
+        import job_store
+        store = job_store.open_store(self._env[job_store.PATH_ENV])
+        self.addCleanup(store.close)
+        ordered = [(job_store.get_job(
+            store, tenant_id=TENANT_ALPHA, owner="google:teacher-alpha-1",
+            job_id=job_id)["created_at"], job_id) for job_id in walked]
+        self.assertEqual(sorted(ordered, reverse=True), ordered)
+
+    def test_cursor_from_another_assignment_or_owner_never_leaks(self):
+        mine = self._assignment(self.client, "tok-a1", "cursor-key-01")
+        other = self._assignment(self.client, "tok-a1", "cursor-key-02")
+        self._seed_linked(mine, count=2, prefix="cursor-mine")
+        other_ids = self._seed_linked(other, count=1, prefix="cursor-other")
+        mine_page = self._retrieve(self.client, "tok-a1", mine,
+                                   limit=1).json()
+        foreign_cursor = mine_page["next_cursor"]
+
+        crossed = self._retrieve(self.client, "tok-a1", other,
+                                 limit=1, cursor=foreign_cursor)
+        self.assertEqual(200, crossed.status_code, crossed.text)
+        self.assertEqual(other_ids,
+                         [row["job_id"] for row in crossed.json()["jobs"]])
+
+        # A tenant-B teacher carrying the alpha cursor is refused at the
+        # ownership gate before paging: still no alpha row, and the same
+        # indistinguishable 404 as any foreign assignment.
+        beta = self._client(TENANT_BETA)
+        leaked = self._retrieve(beta, "tok-b1", mine,
+                                limit=1, cursor=foreign_cursor)
+        self.assertEqual(404, leaked.status_code, leaked.text)
+        self.assertEqual("assignment_not_found",
+                         leaked.json()["error"]["code"])
+        self.assertNotIn(mine_page["jobs"][0]["job_id"], leaked.text)
+
+    def test_limit_boundaries_use_the_contract_vocabulary(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "limit-key-01")
+        self.assertEqual(200, self._retrieve(
+            self.client, "tok-a1", assignment_id, limit=1).status_code)
+        self.assertEqual(200, self._retrieve(
+            self.client, "tok-a1", assignment_id, limit=100).status_code)
+        for bad_limit in (0, 101, -5):
+            with self.subTest(limit=bad_limit):
+                response = self._retrieve(self.client, "tok-a1",
+                                          assignment_id, limit=bad_limit)
+                self.assertEqual(400, response.status_code, response.text)
+                self.assertEqual("payload_invalid",
+                                 response.json()["error"]["code"])
+
+    # --- retry conflicts / retargeting ----------------------------------
+
+    def test_retry_cannot_retarget_an_unlinked_job_into_an_assignment(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "retry-key-01")
+        unlinked = self._job(self.client, "tok-a1", "retarget-key-01")
+        self.assertEqual(201, unlinked.status_code, unlinked.text)
+        refused = self._job(self.client, "tok-a1", "retarget-key-01",
+                            assignment_id)
+        self.assertEqual(409, refused.status_code, refused.text)
+        self.assertEqual("idempotency_key_payload_mismatch",
+                         refused.json()["error"]["code"])
+        # The refusal must not have linked, consumed or mutated anything.
+        page = self._retrieve(self.client, "tok-a1", assignment_id).json()
+        self.assertEqual([], page["jobs"])
+        status = self.client.get(f"/v1/jobs/{unlinked.json()['job_id']}",
+                                 headers=self._headers()).json()
+        self.assertNotIn("assignment_id", status)
+
+    def test_retry_cannot_switch_an_already_linked_job(self):
+        first = self._assignment(self.client, "tok-a1", "switch-key-01")
+        second = self._assignment(self.client, "tok-a1", "switch-key-02")
+        job_id = self._seed_linked(first, prefix="switch")[0]
+        refused = self._job(self.client, "tok-a1", "switch-key-0000", second)
+        self.assertEqual(409, refused.status_code, refused.text)
+        self.assertEqual("idempotency_key_payload_mismatch",
+                         refused.json()["error"]["code"])
+        self.assertEqual([job_id], [row["job_id"] for row in self._retrieve(
+            self.client, "tok-a1", first).json()["jobs"]])
+        self.assertEqual([], self._retrieve(
+            self.client, "tok-a1", second).json()["jobs"])
+
+    # --- worker persistence / result registration -----------------------
+
+    def test_registration_survives_and_stays_retrievable_from_a_fresh_app(self):
+        assignment_id = self._assignment(self.client, "tok-a1", "worker-key-01")
+        job_id = self._seed_linked(assignment_id, prefix="worker")[0]
+        ran = self.client.post(f"/v1/jobs/{job_id}/run",
+                               headers=self._headers())
+        self.assertEqual(200, ran.status_code, ran.text)
+        self.assertEqual("succeeded", ran.json()["status"])
+        self.assertTrue(ran.json()["result_id"].startswith("manual:"))
+
+        # A fresh app/process re-opens the same stores from env only.
+        restarted = self._client(TENANT_ALPHA)
+        page = self._retrieve(restarted, "tok-a1", assignment_id).json()
+        self.assertEqual([job_id], [row["job_id"] for row in page["jobs"]])
+        row = page["jobs"][0]
+        self.assertEqual("succeeded", row["status"])
+        self.assertEqual(ran.json()["result_id"], row["result_id"])
+        self.assertEqual(assignment_id, row["assignment_id"])
+
+        # The registered result is itself readable by the same owner.
+        projection = restarted.get(
+            f"/v1/results/{row['result_id']}/projection",
+            headers=self._headers())
+        self.assertEqual(200, projection.status_code, projection.text)
+
+
 if __name__ == "__main__":
     unittest.main()
