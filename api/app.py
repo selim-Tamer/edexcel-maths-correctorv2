@@ -48,6 +48,8 @@ in-process with ``fastapi.testclient``.
 from __future__ import annotations
 
 import os
+import base64
+import re
 import hashlib
 import time
 from contextlib import closing
@@ -62,11 +64,13 @@ from pydantic import BaseModel, Field, field_validator
 import runtime_config
 
 import audit_store
+import assignment_store
 import decision_core
 import document_limits
 import document_store
 import ingest_registry
 import job_store
+import postgres_assignment_store
 import postgres_job_store
 import postgres_membership_store
 import supabase_document_store
@@ -100,6 +104,7 @@ _STATUS_BY_CODE = {
     "manual_document_provenance_required": 403,
     "tenant_membership_required": 403,
     "result_not_registered": 404,
+    "assignment_not_found": 404,
     "review_context_unavailable": 404,
     "review_question_unavailable": 404,
     "review_question_ambiguous": 409,
@@ -207,14 +212,81 @@ class IngestRequest(BaseModel):
 
 
 class JobRequest(BaseModel):
-    """``POST /v1/jobs`` body (PROPOSED contract addition).
+    """``POST /v1/jobs`` body (contract v1.2 addition, additive).
 
     The client supplies an idempotency key and the document it wants marked;
     it never chooses the job id, the owner, the tenant or the result id.
+    ``assignment_id`` is OPTIONAL server-validated linkage: the API verifies
+    that the assignment belongs to the same verified tenant+owner before the
+    row is written, and the database enforces the same reference.
     """
 
     idempotency_key: str = Field(min_length=8, max_length=128)
     document_digest: str = Field(min_length=64, max_length=64)
+    assignment_id: Optional[str] = Field(default=None,
+                                         min_length=1, max_length=64)
+
+
+class AssignmentRequest(BaseModel):
+    """``POST /v1/assignments`` body (contract v1.2, PROPOSED).
+
+    The client supplies a title and an idempotency key only. It never chooses
+    ``assignment_id``, the owner or the tenant: those are server decisions
+    derived from the verified token (and the id is minted here).
+
+    Idempotency is carried in the ``Idempotency-Key`` header (the canonical
+    wire form FCM asked for). The body field is an accepted alias so an early
+    client build that sent it does not break; when both are present they MUST
+    match, otherwise the request is refused rather than silently preferring
+    one.
+    """
+
+    title: str = Field(min_length=1, max_length=200)
+    idempotency_key: Optional[str] = Field(default=None, min_length=8,
+                                           max_length=128)
+
+
+
+def _encode_assignment_cursor(created_at: int, assignment_id: str) -> str:
+    raw = f"{int(created_at)}:{assignment_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_assignment_cursor(cursor: Optional[str]):
+    """Return ``(created_at, assignment_id)``; malformed cursors are 400."""
+    if cursor is None or not cursor.strip():
+        return 0, ""
+    try:
+        padded = cursor.strip() + "=" * (-len(cursor.strip()) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        created_at, _, assignment_id = raw.partition(":")
+        if not assignment_id.startswith("asg_") or not created_at.isdigit():
+            raise ValueError("shape")
+        return int(created_at), assignment_id
+    except Exception:
+        raise ApiError("payload_invalid", "cursor is not a valid page cursor")
+
+
+
+def _encode_job_cursor(created_at: int, job_id: str) -> str:
+    raw = f"{int(created_at)}:{job_id}".encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_job_cursor(cursor: Optional[str]):
+    """Return ``(created_at, job_id)``; malformed cursors are 400."""
+    if cursor is None or not cursor.strip():
+        return 0, ""
+    try:
+        padded = cursor.strip() + "=" * (-len(cursor.strip()) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        created_at, _, job_id = raw.partition(":")
+        if not job_id.startswith("job:") or not created_at.isdigit():
+            raise ValueError("shape")
+        return int(created_at), job_id
+    except Exception:
+        raise ApiError("payload_invalid", "cursor is not a valid page cursor")
+
 
 
 def _now() -> str:
@@ -264,6 +336,18 @@ def _job_api():
     error handling is identical either way.
     """
     return postgres_job_store if postgres_job_store.configured() else job_store
+
+
+def _assignment_api():
+    """The assignment store module for THIS process (same facade pattern).
+
+    Production: durable PostgreSQL (schema 0007) through
+    ``postgres_assignment_store`` when ``AI_MARKER_PG_DSN`` is configured.
+    Development: the opt-in SQLite store. Both share
+    ``AssignmentStoreError``, so call-site error handling is identical.
+    """
+    return (postgres_assignment_store
+            if postgres_assignment_store.configured() else assignment_store)
 
 
 def _default_membership_resolver():
@@ -889,6 +973,32 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         except job_store.JobStoreError:
             raise ApiError("store_unusable", "the job store is unusable")
 
+    def require_assignment_connection():
+        """The assignment store for THIS process, failing closed when absent.
+
+        Production: durable PostgreSQL (schema 0007) when
+        ``AI_MARKER_PG_DSN`` is configured. Development: the explicit
+        opt-in SQLite store. Neither path creates production schema.
+        """
+        if postgres_assignment_store.configured():
+            try:
+                return postgres_assignment_store.require_connection()
+            except assignment_store.AssignmentStoreError:
+                raise ApiError("store_unusable",
+                               "the assignment store is unusable")
+        path = (os.environ.get(assignment_store.PATH_ENV) or "").strip()
+        acknowledged = (os.environ.get(
+            assignment_store.ACK_ENV) or "").strip() == "1"
+        if not path or not acknowledged:
+            raise ApiError("dev_opt_in_required",
+                           "the assignment store is not configured for"
+                           " development")
+        try:
+            return assignment_store.open_store(path)
+        except assignment_store.AssignmentStoreError:
+            raise ApiError("store_unusable",
+                           "the assignment store is unusable")
+
     def _marks_only(owner: Optional[str], result_id: str):
         """Marks-only question projection for one registered result.
 
@@ -926,6 +1036,13 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                    "document_digest": job["document_digest"],
                    "result_id": job["result_id"],
                    "error_code": job["error_code"]}
+        # Absent-means-omit, like the projection question fields: an UNLINKED
+        # job's payload is byte-identical to the AGREED v1.2 shape, so a client
+        # that validates responses strictly (or predates the v1.2.1 addition)
+        # cannot be broken by a field it never asked for. Only a client that
+        # sent assignment_id ever sees it.
+        if job.get("assignment_id") is not None:
+            payload["assignment_id"] = job["assignment_id"]
         if job["status"] == "succeeded" and job.get("result_id"):
             questions = _marks_only(job.get("owner_subject"), job["result_id"])
             if questions is not None:
@@ -953,6 +1070,27 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                 or any(ord(c) < 32 for c in key)):
             raise ApiError("payload_invalid",
                            "idempotency_key is not a valid server-safe id")
+        assignment_id = (None if body.assignment_id is None
+                         else body.assignment_id.strip())
+        if assignment_id is not None:
+            if (not assignment_id
+                    or not re.fullmatch(r"asg_[0-9a-f]{24}", assignment_id)):
+                raise ApiError("payload_invalid",
+                               "assignment_id is not a server-minted id")
+            try:
+                assignment_connection = require_assignment_connection()
+                with closing(assignment_connection):
+                    linked = _assignment_api().get_assignment(
+                        assignment_connection, tenant_id=tenant_id,
+                        owner=owner, assignment_id=assignment_id)
+            except assignment_store.AssignmentStoreError as failure:
+                raise ApiError(failure.detail,
+                               "the assignment link could not be verified")
+            if linked is None:
+                # Same indistinguishability rule as documents/jobs: an id
+                # owned by someone else is not found, not "forbidden".
+                raise ApiError("assignment_not_found",
+                               "no assignment for this owner")
         with closing(require_document_connection()) as documents:
             stored = _document_api().find_document(
                 documents, tenant_id=tenant_id, owner=owner,
@@ -964,7 +1102,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             with closing(connection):
                 created = _job_api().create_job(
                     connection, tenant_id=tenant_id, owner=owner,
-                    idempotency_key=key, document_digest=digest)
+                    idempotency_key=key, document_digest=digest,
+                    assignment_id=assignment_id)
                 current = _job_api().get_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=created["job_id"])
@@ -991,6 +1130,142 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         if job is None:
             raise ApiError("result_not_registered", "no job for this owner")
         return job_payload(job)
+
+    @app.post("/v1/assignments", status_code=201)
+    def create_assignment(
+            body: AssignmentRequest,
+            idempotency_key_header: Optional[str] = Header(
+                default=None, alias="Idempotency-Key"),
+            who=Depends(actor)):
+        """Create (or replay) one server-owned teacher assignment.
+
+        Identity is the verified token: ``tenant_id``/``owner_subject`` come
+        from ``actor`` and the body can neither set nor override them.
+        ``assignment_id`` is minted server-side; the client only supplies an
+        idempotency key - canonically in the ``Idempotency-Key`` header, with
+        the body field accepted as an equal alias. Supplying both with
+        different values is refused (payload_invalid), never resolved by
+        precedence. Same key + same title replays the SAME assignment (200);
+        same key + different title is refused 409
+        ``idempotency_key_payload_mismatch``.
+        """
+        subject, owner, tenant_id = who
+        header_key = (idempotency_key_header or "").strip()
+        body_key = (body.idempotency_key or "").strip()
+        if header_key and body_key and header_key != body_key:
+            raise ApiError("payload_invalid",
+                           "Idempotency-Key and the body key must match")
+        key_value = header_key or body_key
+        if not key_value:
+            raise ApiError("payload_invalid",
+                           "an Idempotency-Key header is required")
+        try:
+            key = assignment_store.normalize_idempotency_key(key_value)
+            title = assignment_store.normalize_title(body.title)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment payload is invalid")
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                created = _assignment_api().create_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    idempotency_key=key, title=title)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment could not be created")
+        payload = {"assignment_id": created["assignment_id"],
+                   "title": created["title"],
+                   "created_at": created["created_at"]}
+        if not created["created"]:
+            return JSONResponse(status_code=200, content=payload)
+        return payload
+
+    @app.get("/v1/assignments")
+    def list_assignments(who=Depends(actor),
+                         limit: int = Query(assignment_store.DEFAULT_PAGE_SIZE,
+                                            ge=1,
+                                            le=assignment_store.MAX_PAGE_SIZE),
+                         cursor: Optional[str] = Query(None)):
+        """Newest-first page of THIS owner's assignments.
+
+        Owner-scoped (``owner_subject``), mirroring documents ownership. A
+        tenant-wide teacher view would be an additive later version, not a
+        silent change here. ``next_cursor`` is opaque and null when the page
+        is not full; a malformed cursor is 400 ``payload_invalid``.
+        """
+        subject, owner, tenant_id = who
+        after_created_at, after_assignment_id = _decode_assignment_cursor(
+            cursor)
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                rows = _assignment_api().list_assignments(
+                    connection, tenant_id=tenant_id, owner=owner, limit=limit,
+                    after_created_at=after_created_at,
+                    after_assignment_id=after_assignment_id)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignments could not be read")
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_cursor = _encode_assignment_cursor(
+                last["created_at"], last["assignment_id"])
+        return {"assignments": rows, "next_cursor": next_cursor}
+
+    @app.get("/v1/assignments/{assignment_id}/jobs")
+    def list_assignment_jobs(
+            assignment_id: str, who=Depends(actor),
+            limit: int = Query(assignment_store.DEFAULT_PAGE_SIZE,
+                               ge=1,
+                               le=assignment_store.MAX_PAGE_SIZE),
+            cursor: Optional[str] = Query(None)):
+        """Newest-first page of THIS owner's jobs linked to one assignment.
+
+        The server-side recovery primitive agreed for v1.2.1 (FCM proposal
+        msg 2b4720bc item 3): assignment-owned job retrieval survives
+        browser-storage loss, so recovery never depends on a device-local
+        mapping. The ownership check happens FIRST and exactly mirrors
+        ``GET /v1/assignments``: a malformed id is 400 ``payload_invalid``,
+        and an id owned by someone else is the same indistinguishable 404
+        ``assignment_not_found`` - never 403. Each item is the byte-identical
+        payload of ``GET /v1/jobs/{job_id}`` (``job_payload``), so a linked
+        job carries ``assignment_id`` and an unlinked shape is never emitted
+        here (the WHERE clause only returns linked rows). ``next_cursor`` is
+        opaque, null on a not-full page, and keyset-paged on
+        ``created_at DESC, job_id DESC`` so pages never duplicate or skip.
+        """
+        subject, owner, tenant_id = who
+        if not re.fullmatch(r"asg_[0-9a-f]{24}", assignment_id or ""):
+            raise ApiError("payload_invalid",
+                           "assignment_id is not a server-minted id")
+        after_created_at, after_job_id = _decode_job_cursor(cursor)
+        connection = require_assignment_connection()
+        try:
+            with closing(connection):
+                assignment = _assignment_api().get_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    assignment_id=assignment_id)
+        except assignment_store.AssignmentStoreError as failure:
+            raise ApiError(failure.detail, "the assignment could not be read")
+        if assignment is None:
+            raise ApiError("assignment_not_found",
+                           "no assignment for this owner")
+        connection = require_job_connection()
+        try:
+            with closing(connection):
+                rows = _job_api().list_jobs_for_assignment(
+                    connection, tenant_id=tenant_id, owner=owner,
+                    assignment_id=assignment_id, limit=limit,
+                    after_created_at=after_created_at,
+                    after_job_id=after_job_id)
+        except job_store.JobStoreError as failure:
+            raise ApiError(failure.detail, "the jobs could not be read")
+        next_cursor = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_cursor = _encode_job_cursor(
+                last["created_at"], last["job_id"])
+        return {"jobs": [job_payload(job) for job in rows],
+                "next_cursor": next_cursor}
 
     @app.post("/v1/jobs/{job_id}/run")
     def run_marking_job(job_id: str, who=Depends(actor)):
