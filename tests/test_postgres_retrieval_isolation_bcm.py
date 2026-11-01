@@ -13,6 +13,7 @@ skips with an explicit reason. It applies 0001/0002/0003/0007/0008 to an
 isolated database, exactly like the other PG contracts. No production system,
 migration or data is touched.
 """
+import contextlib
 import os
 import secrets
 import unittest
@@ -72,30 +73,45 @@ class PostgresRetrievalIsolationTests(unittest.TestCase):
         cls.admin.execute(sqlmod.SQL(
             "CREATE ROLE {} LOGIN PASSWORD {}").format(
                 sqlmod.Identifier(APP_ROLE), sqlmod.Literal(APP_PASSWORD)))
-        with psycopg.connect(_dsn(), autocommit=True) as setup:
-            for name in ("postgres_v1.sql", "postgres_v2_tenant_rls.sql",
-                         "postgres_v3_jobs.sql",
-                         "postgres_v7_assignments.sql",
-                         "postgres_v8_job_assignment_linkage.sql"):
-                _apply(setup, name)
-            setup.execute(sqlmod.SQL("GRANT marker_app TO {}").format(
-                sqlmod.Identifier(APP_ROLE)))
-            setup.execute(
-                "INSERT INTO tenants (tenant_id) VALUES (%s), (%s)",
-                (TENANT_A, TENANT_B))
+        try:
+            with psycopg.connect(_dsn(), autocommit=True) as setup:
+                for name in ("postgres_v1.sql", "postgres_v2_tenant_rls.sql",
+                             "postgres_v3_jobs.sql",
+                             "postgres_v4_documents.sql",
+                             "postgres_v7_assignments.sql",
+                             "postgres_v8_job_assignment_linkage.sql"):
+                    _apply(setup, name)
+                setup.execute(sqlmod.SQL("GRANT marker_app TO {}").format(
+                    sqlmod.Identifier(APP_ROLE)))
+                setup.execute(
+                    "INSERT INTO tenants (tenant_id) VALUES (%s), (%s)",
+                    (TENANT_A, TENANT_B))
+        except Exception:
+            # A half-applied cluster must not poison sibling PG suites: role
+            # memberships and db-level grants are cluster-wide.
+            cls._drop_cluster()
+            raise
         cls.jobs = postgres_job_store.open_store(_dsn())
+
+    @classmethod
+    def _drop_cluster(cls):
+        with contextlib.suppress(Exception):
+            cls.admin.execute(sqlmod.SQL("REVOKE marker_app FROM {}").format(
+                sqlmod.Identifier(APP_ROLE)))
+        with contextlib.suppress(Exception):
+            cls.admin.execute(sqlmod.SQL("DROP ROLE IF EXISTS {}").format(
+                sqlmod.Identifier(APP_ROLE)))
+        with contextlib.suppress(Exception):
+            cls.admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()", (TEST_DB,))
+        with contextlib.suppress(Exception):
+            cls.admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
 
     @classmethod
     def tearDownClass(cls):
         cls.jobs.close()
-        cls.admin.execute(sqlmod.SQL("REVOKE marker_app FROM {}").format(
-            sqlmod.Identifier(APP_ROLE)))
-        cls.admin.execute(sqlmod.SQL("DROP ROLE IF EXISTS {}").format(
-            sqlmod.Identifier(APP_ROLE)))
-        cls.admin.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = %s AND pid <> pg_backend_pid()", (TEST_DB,))
-        cls.admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
+        cls._drop_cluster()
         cls.admin.close()
 
     def _seed(self, tenant_id, owner, key, digest, assignment_id, created):
