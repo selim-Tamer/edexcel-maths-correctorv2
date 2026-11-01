@@ -115,12 +115,16 @@ class PostgresRetrievalIsolationTests(unittest.TestCase):
         cls.admin.close()
 
     def _seed(self, tenant_id, owner, key, digest, assignment_id, created):
-        self.admin.execute(
-            "INSERT INTO assignments (tenant_id, owner_subject,"
-            " assignment_id, idempotency_key, title, created_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-            (tenant_id, owner, assignment_id, key, "BCM isolation paper",
-             created))
+        # The row must exist in THIS test database (the admin handle points at
+        # the cluster's default database), because 0008 makes the job's
+        # assignment reference a composite foreign key.
+        with psycopg.connect(_dsn(), autocommit=True) as db_admin:
+            db_admin.execute(
+                "INSERT INTO assignments (tenant_id, owner_subject,"
+                " assignment_id, idempotency_key, title, created_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (tenant_id, owner, assignment_id, key, "BCM isolation paper",
+                 created))
         return postgres_job_store.create_job(
             self.jobs, tenant_id=tenant_id, owner=owner,
             idempotency_key=key + "-job", document_digest=digest,
