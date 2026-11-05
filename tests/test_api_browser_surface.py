@@ -58,8 +58,9 @@ class CorsTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app_with([ALLOWED]))
 
-    def preflight(self, origin, method="POST", headers="authorization"):
-        return self.client.options("/v1/jobs", headers={
+    def preflight(self, origin, method="POST", headers="authorization",
+                 path="/v1/jobs"):
+        return self.client.options(path, headers={
             "Origin": origin,
             "Access-Control-Request-Method": method,
             "Access-Control-Request-Headers": headers,
@@ -78,6 +79,36 @@ class CorsTests(unittest.TestCase):
     def test_preflight_for_any_other_origin_is_refused(self):
         response = self.preflight(OTHER)
         self.assertEqual(response.status_code, 400)
+        self.assertNotIn("access-control-allow-origin", response.headers)
+
+    def test_assignment_create_preflight_grants_the_idempotency_key(self):
+        # The browser sends Idempotency-Key on POST /v1/assignments; if the
+        # preflight does not allow it the real request never leaves the
+        # browser (BR-01), so the grant must name all three headers.
+        response = self.preflight(
+            ALLOWED, method="POST",
+            headers="authorization,content-type,idempotency-key",
+            path="/v1/assignments")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["access-control-allow-origin"],
+                         ALLOWED)
+        granted = {h.strip().lower() for h in
+                   response.headers["access-control-allow-headers"].split(",")}
+        for header in ("authorization", "content-type", "idempotency-key"):
+            self.assertIn(header, granted)
+        self.assertIn("POST",
+                      response.headers["access-control-allow-methods"])
+        # The only change is the header list: credentials stay off.
+        self.assertNotIn("access-control-allow-credentials", response.headers)
+
+    def test_assignment_preflight_from_a_foreign_origin_gets_no_grant(self):
+        # Same preflight, origin not on the allowlist. Assert the CORS
+        # semantics only - no allow-origin grant - rather than a status the
+        # middleware happens to choose.
+        response = self.preflight(
+            OTHER, method="POST",
+            headers="authorization,content-type,idempotency-key",
+            path="/v1/assignments")
         self.assertNotIn("access-control-allow-origin", response.headers)
 
     def test_actual_response_carries_the_origin_and_never_credentials(self):

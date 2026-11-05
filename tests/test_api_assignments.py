@@ -17,6 +17,7 @@ import tempfile
 import unittest
 
 import assignment_store
+import membership_store
 from api.app import create_app
 from membership_store import Membership
 from fastapi.testclient import TestClient
@@ -214,6 +215,150 @@ class AssignmentApiTests(unittest.TestCase):
     def test_unauthenticated_request_is_401(self):
         response = self.client.get("/v1/assignments")
         self.assertEqual(401, response.status_code)
+
+
+class AssignmentAccessControlTests(unittest.TestCase):
+    """Fail-closed auth/membership and cross-tenant denial for assignments.
+
+    The create/replay/conflict happy paths live in ``AssignmentApiTests``;
+    this class pins the denial paths a browser client must see once CORS
+    lets the request through: 401 without a verified token, 403 without an
+    ACTIVE membership, and a foreign tenant that can neither read, replay
+    nor address the owner's rows.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        os.environ[assignment_store.PATH_ENV] = os.path.join(
+            self.tmp.name, "assignments.sqlite3")
+        self.addCleanup(os.environ.pop, assignment_store.PATH_ENV, None)
+        os.environ[assignment_store.ACK_ENV] = "1"
+        self.addCleanup(os.environ.pop, assignment_store.ACK_ENV, None)
+
+    def _client(self, resolver):
+        return TestClient(create_app(
+            verify_token=TOKENS.get, membership_resolver=resolver))
+
+    @staticmethod
+    def _active(subject):
+        return Membership(subject, TENANT, "teacher")
+
+    @staticmethod
+    def _two_tenants(subject):
+        # Subject A stays in tenant-beta; subject B is a different tenant.
+        return Membership(subject, TENANT if subject == SUBJECT_A
+                          else "tenant-gamma", "teacher")
+
+    def _create(self, client, key="access-key-0001", title="Year 10 Paper 1",
+                token="tok-a"):
+        headers = {"Authorization": f"Bearer {token}",
+                   "Idempotency-Key": key}
+        return client.post("/v1/assignments", headers=headers,
+                           json={"title": title})
+
+    # --- authentication ---------------------------------------------------
+
+    def test_missing_or_unverifiable_token_is_401(self):
+        client = self._client(self._active)
+        for headers in ({"Idempotency-Key": "auth-key-00001"},
+                        {"Authorization": "Bearer not-a-token",
+                         "Idempotency-Key": "auth-key-00002"},
+                        {"Authorization": "Basic dXNlcjpwdw==",
+                         "Idempotency-Key": "auth-key-00003"}):
+            with self.subTest(headers=headers):
+                response = client.post("/v1/assignments", headers=headers,
+                                       json={"title": "Nope"})
+                self.assertEqual(401, response.status_code, response.text)
+                self.assertEqual("authentication_required",
+                                 response.json()["error"]["code"])
+        # No row was written by any refused attempt.
+        self.assertEqual([], client.get(
+            "/v1/assignments",
+            headers={"Authorization": "Bearer tok-a"}).json()["assignments"])
+
+    # --- membership -------------------------------------------------------
+
+    def test_inactive_unknown_or_mismatched_membership_is_403(self):
+        # resolver None => no ACTIVE row for the verified subject, whether
+        # the membership is inactive or simply unknown.
+        inactive = self._client(lambda subject: None)
+        response = self._create(inactive, key="inactive-key-0001")
+        self.assertEqual(403, response.status_code, response.text)
+        self.assertEqual("tenant_membership_required",
+                         response.json()["error"]["code"])
+
+        # A row that does not belong to the verified subject fails closed
+        # with the same non-enumerating envelope.
+        mismatched = self._client(
+            lambda subject: Membership("someone-else", TENANT, "teacher"))
+        response = self._create(mismatched, key="mismatched-key-0001")
+        self.assertEqual(403, response.status_code, response.text)
+        self.assertEqual("tenant_membership_required",
+                         response.json()["error"]["code"])
+
+        # A failing membership store is 403 too - never 500, never 401.
+        def broken(subject):
+            raise membership_store.MembershipError("membership_unavailable")
+        failing = self._client(broken)
+        response = self._create(failing, key="broken-key-00001")
+        self.assertEqual(403, response.status_code, response.text)
+        self.assertEqual("tenant_membership_required",
+                         response.json()["error"]["code"])
+
+    # --- tenant isolation -------------------------------------------------
+
+    def test_foreign_tenant_is_denied_rows_keys_and_jobs(self):
+        client = self._client(self._two_tenants)
+        created = self._create(client, key="cross-key-0001", title="Mine")
+        self.assertEqual(201, created.status_code, created.text)
+
+        foreign = {"Authorization": "Bearer tok-b"}
+        # Another tenant reads an empty list, not the owner's row.
+        listed = client.get("/v1/assignments", headers=foreign)
+        self.assertEqual(200, listed.status_code, listed.text)
+        self.assertEqual([], listed.json()["assignments"])
+
+        # The SAME key in the other tenant is its own reservation, not a
+        # replay of - nor a conflict with - the first tenant's row.
+        other = self._create(client, key="cross-key-0001", title="Theirs",
+                             token="tok-b")
+        self.assertEqual(201, other.status_code, other.text)
+        self.assertNotEqual(created.json()["assignment_id"],
+                            other.json()["assignment_id"])
+
+        # Addressing the owner's assignment from the other tenant is the
+        # indistinguishable 404, never a 403 oracle or a data grant.
+        jobs = client.get(
+            f"/v1/assignments/{created.json()['assignment_id']}/jobs",
+            headers=foreign)
+        self.assertEqual(404, jobs.status_code, jobs.text)
+        self.assertEqual("assignment_not_found", jobs.json()["error"]["code"])
+
+        # The owner's rows are untouched by all of the above.
+        mine = client.get("/v1/assignments",
+                          headers={"Authorization": "Bearer tok-a"})
+        self.assertEqual(1, len(mine.json()["assignments"]))
+
+    # --- representative routes --------------------------------------------
+
+    def test_representative_routes_keep_their_existing_contracts(self):
+        client = self._client(self._two_tenants)
+        health = client.get("/v1/healthz")
+        self.assertEqual(200, health.status_code)
+        self.assertEqual({"status": "ok"}, health.json())
+
+        created = self._create(client, key="route-key-00001")
+        self.assertEqual(201, created.status_code, created.text)
+        self.assertEqual({"assignment_id", "title", "created_at"},
+                         set(created.json()))
+
+        listed = client.get("/v1/assignments",
+                            headers={"Authorization": "Bearer tok-a"})
+        self.assertEqual(200, listed.status_code, listed.text)
+        self.assertEqual({"assignments", "next_cursor"}, set(listed.json()))
+        # No Origin on the request, so no CORS grant is invented.
+        self.assertNotIn("access-control-allow-origin", listed.headers)
 
 
 if __name__ == "__main__":
