@@ -123,6 +123,26 @@ idempotent, which is what makes a retry after a network failure safe.
 * `submissionId` is the `result_id` the job returns. There is no separate
   submission resource.
 
+### 3.1 Production result persistence (BR-02)
+
+* When `AI_MARKER_PG_DSN` is configured, the API and the trusted marking
+  worker persist results, reviews and audit events in PostgreSQL. The opt-in
+  SQLite stores remain **development/test only**; a production process with a
+  missing DSN, unreachable server or absent `result_context_version = '1'`
+  capability refuses to start or fails the request `store_unusable` - it never
+  falls back to a development registry.
+* The complete original marking output is stored once, in an immutable
+  `result_context` row committed atomically with its existing marks-only audit
+  anchor. Reviews append audit events and advance `result_revision`; they never
+  rewrite the original. Reads are restart-safe and second-instance-safe and
+  return original output and events from one consistent snapshot.
+* Membership foreign keys use the raw verified subject; audit attribution uses
+  the canonical `google:<subject>` owner. Both representations are recorded on
+  the context row.
+* This is an implementation contract note, not a deployment or retention
+  guarantee: applying `schema/postgres_v9_result_context.sql` and storing real
+  student data require separate operator/privacy approval.
+
 ## 4. Idempotency
 
 * Job key: `job-` + first 32 hex chars of

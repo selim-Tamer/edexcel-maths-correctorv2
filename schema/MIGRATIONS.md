@@ -46,6 +46,7 @@ Reuse it; do not recreate it.
 | 0006 | `schema/postgres_v6_result_narrowing.sql` | Least privilege on `results`: drops the table-wide `UPDATE` and grants **`UPDATE (result_revision)` only** to `marker_app` / `marker_worker` - the single column `postgres_store.commit()` writes. Every other column becomes non-writable by a runtime role, so the immutable original result cannot be rewritten. **No DELETE.** | `schema_meta.results_update_version = '1'` | `schema/postgres_v6_result_narrowing_rollback.sql` (restores the 0002 table-wide UPDATE; refuses when 0006 was never applied; touches no rows) |
 | 0007 | `schema/postgres_v7_assignments.sql` | Server-owned teacher `assignments`: server-minted `assignment_id`, unique `(tenant_id, owner_subject, idempotency_key)`, title 1..200, created_at epoch. RLS **ENABLE + FORCE** + `tenant_isolation`; `SELECT, INSERT` for `marker_app` and **no UPDATE / no DELETE** in v1.2. | `schema_meta.assignments_version = '1'` | `schema/postgres_v7_assignments_rollback.sql` (drops the table and therefore every assignment row - dump first) |
 | 0008 | `schema/postgres_v8_job_assignment_linkage.sql` | Adds nullable `marking_jobs.assignment_id` plus composite FK `(tenant_id, owner_subject, assignment_id) -> assignments(tenant_id, owner_subject, assignment_id)` (`ON UPDATE CASCADE ON DELETE RESTRICT`), a partial index for the eventual "jobs for one assignment" read, and **no grant change** (written at INSERT time). Cross-owner/cross-tenant linkage is refused by the database even if the API check regresses; the API still verifies ownership first so the client sees 404 `assignment_not_found`, not a 500. | `schema_meta.job_assignment_linkage_version = '1'` | `schema/postgres_v8_job_assignment_linkage_rollback.sql` (drops constraint, index, column and marker; **deletes no job rows** - linked jobs simply lose the link) |
+| 0009 | `schema/postgres_v9_result_context.sql` | BR-02 immutable original-result context: `result_context` stores the complete original marking output, its digest, document digest, raw membership subject **and** canonical `google:<subject>` owner, plus only genuinely available trusted links (job, assignment, Classroom references). Composite FK to the existing `results` anchor and to `tenant_membership`; scoped uniqueness; RLS **ENABLE + FORCE**; **`SELECT, INSERT` only** for `marker_app` / `marker_worker` (trigger refuses UPDATE/DELETE); **no membership-table grant for `marker_worker`** - worker ownership mapping is resolved outside this grant. | `schema_meta.result_context_version = '1'` (`schema_version` stays `'1'`) | `schema/postgres_v1.sql` has no rollback counterpart. This file (`schema/postgres_v9_result_context_rollback.sql`) is the v9 **draft** rollback, retained pending independent IR diff review and separate SQL execution approval. |
 
 Backout asymmetry (disclosed in the rollback file): it restores the v1 shape
 but cannot restore Supabase `anon` / `authenticated` default grants it revoked.
@@ -168,6 +169,7 @@ rollback path is known-good before it is ever needed.
 | 6 | Smoke test as the login: one `BEGIN; select set_config('app.tenant_id','<tenant>',true); select count(*) from results; COMMIT;` and one unbound `select count(*) from results;` | bound sees that tenant only; unbound sees `0` | none (read only) |
 | 7 | Apply `postgres_v5_membership_access.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.membership_access_version = '1'`; `pg_policies` shows **6** rows incl. `membership_self_read` (SELECT) on `tenant_membership`; `information_schema.role_column_grants` shows exactly the five resolver columns for `marker_app`; `role_table_grants` for `tenant_membership` is **0 rows**; an **unbound** `select count(*) from tenant_membership` as the runtime login returns **0** | `postgres_v5_membership_access_rollback.sql` -> re-run the section 4 shape check -> re-apply 0005 |
 | 8 | Apply `postgres_v6_result_narrowing.sql` on the **direct/session (5432)** connection as the project owner | `schema_meta.results_update_version = '1'`; `has_table_privilege('marker_app','results','UPDATE')` is **false**; `has_column_privilege(...,'result_revision','UPDATE')` is **true**; every other column is false; the adapter-shaped `UPDATE results SET result_revision` still returns 1 row and a rewrite of `original_scores` is refused | `postgres_v6_result_narrowing_rollback.sql` -> re-run the 4.5 shape check -> re-apply 0006 |
+| 8b | Apply `postgres_v9_result_context.sql` on the **direct/session (5432)** connection as the project owner, only after 0001-0008 | §4.6: `schema_version='1'`, `result_context_version='1'`; RLS enabled **and forced**; `marker_app`/`marker_worker` hold exactly SELECT + INSERT on `result_context`; the immutability trigger exists; a runtime UPDATE/DELETE is refused | None for v1: `schema/postgres_v1.sql` has no rollback counterpart. The v9 **draft** rollback (`schema/postgres_v9_result_context_rollback.sql`) is retained pending independent IR diff review and separate SQL execution approval |
 | 9 | **First-membership seeding (operator, once per tenant/subject)** - section 4.4, **document only, not executed**: run as the project owner/superuser on the direct 5432 connection | the seeding verification in 4.4 returns exactly one `active = true` row for the subject; the runtime resolver probe returns that tenant; an unbound or other-subject probe returns nothing | deactivate the seeded row as the owner (`update ... set active = false`); no runtime role holds UPDATE/DELETE on membership |
 | 10 | Record evidence: dump id, the section 2 emptiness output (or the drill transcript), section 4 verification output, the 0005 verification output, the 0006 verification output, the seeding record (who/when/tenant/subject - never the token), who applied what, errors | section 4 + 4.2 + 4.5 + 4.4 | - |
 
@@ -510,6 +512,74 @@ rollback;
 Rollback restores the 0002 shape (table-wide UPDATE) and **refuses when 0006
 was never applied**, so a mistaken backout cannot silently widen the grant.
 It touches no rows.
+
+### 4.6 0009 verification (result context, BR-02)
+
+Apply **after** 0001-0008. Run on the **direct/session (5432)** connection as
+the project owner; record the output. It must not be applied to production or
+any non-disposable database.
+
+```sql
+-- Capability marker is separate from the fixed schema_version.
+select key, value from schema_meta
+ where key in ('schema_version','result_context_version');
+-- expected: schema_version=1, result_context_version=1
+
+-- RLS enabled AND forced on the new table.
+select relname, relrowsecurity, relforcerowsecurity
+ from pg_class where relname = 'result_context';
+-- expected: true, true
+
+-- Runtime roles: SELECT + INSERT only, never UPDATE/DELETE.
+select grantee, privilege_type
+ from information_schema.role_table_grants
+ where table_name = 'result_context'
+   and grantee in ('marker_app','marker_worker')
+ order by grantee, privilege_type;
+-- expected: exactly SELECT and INSERT per role
+
+-- Membership resolution columns: 0005 grants the five-column SELECT to
+-- marker_app ONLY. marker_worker holds NO membership privilege (no column
+-- and no table grant) - worker ownership mapping is resolved outside the
+-- schema. Nothing here is claimed as effectively deployed: these checks are
+-- run by the operator at deployment time and the output is recorded.
+select grantee, column_name, privilege_type
+ from information_schema.role_column_grants
+ where table_name = 'tenant_membership'
+   and grantee = 'marker_app'
+ order by column_name;
+-- expected: exactly the five resolution columns for marker_app
+
+-- Absence check: marker_worker must hold nothing on tenant_membership.
+select count(*) from information_schema.role_table_grants
+ where table_name = 'tenant_membership'
+   and grantee = 'marker_worker';
+-- expected: 0
+
+-- Immutability trigger exists.
+select tgname from pg_trigger
+ where tgrelid = 'result_context'::regclass and not tgisinternal;
+```
+
+Behavioural probes as a runtime login, tenant-bound:
+
+```sql
+begin;
+select set_config('app.tenant_id', '<tenant>', true);
+insert into result_context (...) values (...);   -- succeeds once
+update result_context set review_key = review_key; -- MUST fail (trigger)
+delete from result_context;                        -- MUST fail (trigger/privilege)
+rollback;
+```
+
+`schema/postgres_v1.sql` has no rollback counterpart. The v9 **draft**
+rollback (`schema/postgres_v9_result_context_rollback.sql`) is retained
+pending independent IR diff review and separate SQL execution approval. The
+draft requires the effective role to hold `rolsuper` or `rolbypassrls`,
+validates the expected table/marker state, locks `result_context` in
+`ACCESS EXCLUSIVE` mode before checking it is empty, and refuses while any
+row exists - populated original results are preserved by default and must
+be exported/retained through an approved process first.
 
 ---
 

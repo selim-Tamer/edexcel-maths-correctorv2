@@ -35,12 +35,17 @@ source of truth for what is *promised*; this module records what *runs*):
   store's latest event for the question, so it survives across clients.
 * Client ``expected_revision`` is enforced **by the store's transaction**
   (optimistic concurrency), and idempotent retries replay the prior commit
-  instead of appending a second event. The client ``idempotency_key`` is
-  accepted and echoed as a correlation token; the *authoritative* key stays
-  owner + result + payload, derived server-side exactly as the application
-  does. Making the client key authoritative would need one additive optional
-  parameter in ``decision_core`` — recorded as an open contract question, not
-  silently decided here.
+  instead of appending a second event. The client ``idempotency_key`` is the
+  durable replay/conflict key (scoped by tenant+owner+result in storage): the
+  same key with the same payload returns the saved receipt, a changed payload
+  is refused ``idempotency_key_payload_mismatch``. The legacy session path in
+  ``decision_core`` omits the key and keeps the derived one explicitly.
+* **Result persistence composition** (BR-02): when ``AI_MARKER_PG_DSN`` is
+  configured the app opens the PostgreSQL result/audit service per request
+  (schema v9 context capability). There is no SQLite fallback in production;
+  a missing DSN/capability/connectivity fails closed through the existing
+  ``store_unusable`` vocabulary. The opt-in development SQLite path is only
+  used when no PostgreSQL DSN is configured.
 
 No endpoint here is served by any process in CI: tests drive the app
 in-process with ``fastapi.testclient``.
@@ -52,7 +57,7 @@ import base64
 import re
 import hashlib
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, Header, Query, Request
@@ -68,11 +73,13 @@ import assignment_store
 import decision_core
 import document_limits
 import document_store
+import identity_context
 import ingest_registry
 import job_store
 import postgres_assignment_store
 import postgres_job_store
 import postgres_membership_store
+import result_service
 import supabase_document_store
 import marking_engine
 import question_review
@@ -383,9 +390,11 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                reverify: Optional[Callable[[dict], tuple]] = None,
                membership_resolver: Optional[Callable[[str], Any]] = None,
                authorize_ingest: Optional[Callable[[str, str, dict], bool]] = None,
+               result_service_factory: Optional[Callable[[str, str], Any]] = None,
                engine: Any = _ENGINE_UNSET,
                now: Callable[[], str] = _now,
-               allowed_origins: Optional[Iterable[str]] = None) -> FastAPI:
+               allowed_origins: Optional[Iterable[str]] = None,
+               production_mode: bool = False) -> FastAPI:
     """Build the app with explicitly injected trust boundaries.
 
     Defaults are the REAL controls, not a bypass:
@@ -420,7 +429,45 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                   docs_url=None, redoc_url=None, openapi_url=None)
     registry_rows = ingest_registry.default_provider()
     store_provider = store_provider or _default_store_provider()
-    provenance_ok = manual_document_provenance_ok or (lambda row: False)
+    # BR-02A: production composition. ``AI_MARKER_PG_DSN`` selects the
+    # PostgreSQL result/audit service; there is deliberately no fallback to
+    # the opt-in development SQLite store or the ingest registry. A test may
+    # inject ``result_service_factory(subject, tenant_id)`` to exercise the
+    # production route shapes offline.
+    service_factory = result_service_factory
+    # F4: explicit production classification. Requires AI_MARKER_RUNTIME=production
+    # (not just a PG_DSN), no injected factory, and a configured PG DSN.
+    production = bool(production_mode) or runtime_config.is_production_runtime()
+    production_results = (service_factory is None
+                          and production
+                          and result_service.configured())
+    # F5: fail-closed fresh-result-completion gate (evaluated at startup).
+    # Production security policy is determined solely by explicit
+    # RUNTIME_ENV=production, independent of DSN or DI. Normal production must
+    # deny fresh completion by default even if an
+    # explicit fresh_completion_denied=False is passed; the gate flag is
+    # non-delegable from production runtime policy. Only non-production
+    # synthetic/injection paths may omit the denial.
+    fresh_result_completion_denied = bool(production)
+    if production:
+        # Validate configuration on production only, before dependency access.
+        fresh_result_completion_denied = (
+            runtime_config.fresh_result_completion_denied())
+    if production_results:
+        def service_factory(subject: str, tenant_id: str):
+            identity = identity_context.from_verified_subject(subject, tenant_id)
+            return result_service.open_service(identity,
+                                               fresh_completion_denied=
+                                               fresh_result_completion_denied)
+
+    def deny_fresh_completion():
+        """Refuse any fresh production result completion during the
+        foundations package. Safe errors without credentials or result bodies."""
+        if fresh_result_completion_denied:
+            raise ApiError("store_unusable",
+                           "fresh result completion is disabled during "
+                           "the foundations package")
+    provenance_ok = manual_document_provenance_ok
     reverify_row = reverify or _refuse_classroom
     membership_resolver = membership_resolver or _default_membership_resolver()
     if engine is _ENGINE_UNSET:
@@ -549,6 +596,62 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                            f"({DEV_STORE_ENV} + {DEV_ONLY_ENV}=1)")
         return store
 
+    def open_result_service(subject: str, owner: str, tenant_id: str,
+                            *, trusted_job_id: Optional[str] = None):
+        """The production result service for this request, or ``None`` (dev).
+
+        Opening fails closed: a missing/unreachable database, absent schema
+        capability, invalid identity mapping or missing active membership is
+        reported with the store's own static code. There is no fallback.
+        """
+        if service_factory is None:
+            return None
+        try:
+            if production_results and trusted_job_id is not None:
+                # Trusted worker/job path: the owner was read from the
+                # persisted job, so map it back to exactly one active
+                # membership subject for the tenant.
+                return result_service.open_owner_service(
+                    owner, tenant_id,
+                    fresh_completion_denied=fresh_result_completion_denied)
+            return service_factory(subject, tenant_id)
+        except audit_store.AuditStoreError as failure:
+            raise ApiError(failure.code,
+                           "persistence is unavailable for this request")
+        except identity_context.IdentityContextError as failure:
+            raise ApiError(failure.detail, "the identity context is invalid")
+        except Exception:
+            raise ApiError("store_unusable",
+                           "persistence is unavailable for this request")
+
+    @contextmanager
+    def result_session(subject: str, owner: str, tenant_id: str,
+                       *, trusted_job_id: Optional[str] = None):
+        """Close the production service on success AND failure."""
+        service = open_result_service(subject, owner, tenant_id,
+                                      trusted_job_id=trusted_job_id)
+        if service is None:
+            yield None
+            return
+        try:
+            yield service
+        finally:
+            try:
+                service.close()
+            except Exception:
+                pass
+
+    def result_context(who=Depends(actor)):
+        """Request-scoped production result service (or ``None`` in dev).
+
+        FastAPI closes the generator dependency after the response, including
+        on refusal paths, so every opened PostgreSQL connection is released
+        exactly once.
+        """
+        subject, owner, tenant_id = who
+        with result_session(subject, owner, tenant_id) as service:
+            yield who, service
+
     def stream_revision(store, owner: str, result_id: str) -> int:
         try:
             current = store.current_revision(owner=owner, result_id=result_id)
@@ -562,14 +665,24 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def healthz():
         return {"status": "ok"}
 
-    def visible_row(subject: str, owner: str, tenant_id: str, result_id: str):
+    def visible_row(subject: str, owner: str, tenant_id: str, result_id: str,
+                    service=None):
         """The ONE owner-visible row whose durable identity equals result_id.
 
         Shared by reads and writes so both obey the same visibility rule:
         if the provider no longer lists the row for this owner, NOTHING
         about that stream is reachable - history included (finding O-1
         decision: reads are gated too; audit-export paths are future work).
+        In production this is a DIRECT tenant/owner/result lookup in the
+        result-context table; it never enumerates a registry.
         """
+        if service is not None:
+            try:
+                return service.visible_row(result_id)
+            except audit_store.AuditStoreError as failure:
+                raise ApiError(failure.code, "store read failed")
+            except Exception:
+                raise ApiError("audit_store_unavailable", "store read failed")
         candidates = (rows_for(subject, owner) if rows_for is not None
                       else registry_rows(subject, owner, tenant_id))
         rows = [row for row in (candidates or [])
@@ -586,46 +699,107 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                     limit: Optional[int] = Query(default=None, ge=1, le=500),
                     who=Depends(actor)):
         subject, owner, tenant_id = who
-        if visible_row(subject, owner, tenant_id, result_id) is None:
-            # Same indistinguishable denial as the write path.
-            raise ApiError("result_not_registered", "no result for this owner")
-        store = require_store()
-        revision = stream_revision(store, owner, result_id)
-        if store.current_revision(owner=owner, result_id=result_id) is None:
-            # A registered zero-event stream is valid; absence stays private.
-            raise ApiError("result_not_registered", "no result for this owner")
-        try:
-            events = store.events(owner=owner, result_id=result_id, limit=limit)
-        except audit_store.AuditStoreError as failure:
-            raise ApiError(failure.code, "event history read failed")
-        return {"result_id": result_id, "events": events,
-                "result_revision": revision}
+        with result_session(subject, owner, tenant_id) as service:
+            if visible_row(subject, owner, tenant_id, result_id,
+                           service) is None:
+                # Same indistinguishable denial as the write path.
+                raise ApiError("result_not_registered",
+                               "no result for this owner")
+            if service is not None:
+                # One read transaction: revision and chain cannot disagree.
+                try:
+                    history = service.history(result_id=result_id, limit=limit)
+                except audit_store.AuditStoreError as failure:
+                    raise ApiError(failure.code, "event history read failed")
+                return {"result_id": result_id,
+                        "events": history["events"],
+                        "result_revision": history["result_revision"]}
+            store = require_store()
+            revision = stream_revision(store, owner, result_id)
+            if store.current_revision(owner=owner, result_id=result_id) is None:
+                # A registered zero-event stream is valid; absence stays private.
+                raise ApiError("result_not_registered",
+                               "no result for this owner")
+            try:
+                events = store.events(owner=owner, result_id=result_id,
+                                      limit=limit)
+            except audit_store.AuditStoreError as failure:
+                raise ApiError(failure.code, "event history read failed")
+            return {"result_id": result_id, "events": events,
+                    "result_revision": revision}
 
     def job_backed_ingest_authorizer(subject: str, tenant_id: str,
-                                     row: dict) -> bool:
+                                     row: dict):
         """Default provenance gate: a COMPLETED server-side job authorizes.
 
-        The row's ``snapshot_context`` is the document digest; client ingest
-        is allowed only when this exact owner+tenant has a SUCCEEDED marking
-        job for that document (the genuine output is already registered).
-        Unconfigured job store, missing row, an in-flight ``running`` job or
-        any store failure means False - the default fails closed, and the
-        claim->succeed window can never be pre-empted (finding J-1).
+        Returns the trusted succeeded ``job_id`` (a non-empty string) or
+        ``None``. The row's ``snapshot_context`` is the document digest;
+        client ingest is allowed only when this exact owner+tenant has a
+        SUCCEEDED marking job for that document (the genuine output is
+        already registered). Unconfigured job store, missing row, an
+        in-flight ``running`` job or any store failure means ``None`` - the
+        default fails closed, and the claim->succeed window can never be
+        pre-empted (finding J-1). The job id is the TRUSTED provenance link
+        persisted alongside the original context.
         """
         digest = str(row.get("snapshot_context") or "")
         owner = str(row.get("report_owner") or "")
         if not digest or not owner:
-            return False
+            return None
         try:
             with closing(_job_api().require_connection()) as connection:
                 job_id = _job_api().find_authorizable_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     document_digest=digest)
         except job_store.JobStoreError:
-            return False
-        return job_id is not None
+            return None
+        return job_id
 
     authorize_ingest = authorize_ingest or job_backed_ingest_authorizer
+
+    def trusted_manual_provenance_ok(row: dict) -> bool:
+        """BR-02C: manual provenance from TRUSTED stored relationships.
+
+        A manual decision is authorized only when the context row's recorded
+        trusted job is a SUCCEEDED job for the same tenant, canonical owner,
+        document digest and the exact durable result identity, and its stored
+        assignment link (when present) matches the row. No client value
+        participates. Any read failure or missing link denies.
+        """
+        owner = row.get("report_owner")
+        digest = row.get("snapshot_context")
+        tenant_id = row.get("tenant_id")
+        job_id = row.get("trusted_job_id")
+        if not all(isinstance(value, str) and value
+                   for value in (owner, digest, tenant_id, job_id)):
+            return False
+        expected_result = decision_core.durable_result_identity(row, "")
+        if not expected_result:
+            return False
+        try:
+            with closing(_job_api().require_connection()) as connection:
+                job = _job_api().get_job(connection, tenant_id=tenant_id,
+                                         owner=owner, job_id=job_id)
+        except job_store.JobStoreError:
+            return False
+        if not job:
+            return False
+        if not (job.get("status") == "succeeded"
+                and job.get("tenant_id") == tenant_id
+                and job.get("owner_subject") == owner
+                and job.get("document_digest") == digest
+                and job.get("result_id") == expected_result):
+            return False
+        linked = row.get("assignment_id")
+        if linked is not None and job.get("assignment_id") != linked:
+            return False
+        return True
+
+    if provenance_ok is None:
+        # Production defaults to the trusted stored-relationship gate; the
+        # development default stays the original fail-closed denial.
+        provenance_ok = (trusted_manual_provenance_ok if production_results
+                         else (lambda row: False))
 
     def runner_authority_ok(job_id: str, tenant_id: str, owner: str,
                             digest: str) -> bool:
@@ -653,7 +827,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     def finish_ingest(*, subject: str, owner: str, tenant_id: str,
                       scope: str, original: dict, digest: str,
                       review_key: str, result_id: str, revision: str,
-                      parts: dict, runner_job_id: str = None) -> dict:
+                      parts: dict, runner_job_id: str = None,
+                      trusted_assignment_id: str = None) -> dict:
         """Shared registration path for the API and the marking-job runner.
 
         Order (unchanged from the contract slice): shape validation of the
@@ -661,7 +836,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         registry row. Authority for the gate is EITHER the client-facing
         job-backed check (succeeded jobs only) OR, when the caller is the
         lease-holding runner, its live claim (``runner_job_id``).
+
+        BR-02: in production the anchor AND the complete original context are
+        committed by ONE ``ResultService.register`` transaction; the trusted
+        job/assignment links are persisted only when they were genuinely
+        obtained from server storage. Development keeps the opt-in SQLite
+        store + registry row.
         """
+        deny_fresh_completion()
         if not isinstance(original, dict):
             raise ApiError("original_output_invalid",
                            "original_output must be a mapping")
@@ -683,40 +865,91 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         # must authorize the exact owner/tenant/identity/output tuple. The
         # lease-holding runner authorizes with its own live claim instead of
         # the client-facing status check (finding J-1).
+        trusted_job_id = None
         if runner_job_id is not None:
             authorized = runner_authority_ok(runner_job_id, tenant_id,
                                              owner, digest)
+            if authorized:
+                trusted_job_id = runner_job_id
         else:
             try:
-                authorized = (authorize_ingest is not None and
-                              authorize_ingest(subject, tenant_id, row) is True)
+                authority = (authorize_ingest(subject, tenant_id, row)
+                             if authorize_ingest is not None else None)
             except Exception:
-                authorized = False
+                authority = None
+            if authorize_ingest is job_backed_ingest_authorizer:
+                # The default authorizer returns the trusted succeeded job id
+                # (its only authority). Any injected authorizer keeps the
+                # original contract: exactly ``True`` authorizes.
+                authorized = isinstance(authority, str) and bool(authority)
+                if authorized:
+                    trusted_job_id = authority
+            else:
+                authorized = authority is True
         if not authorized:
             raise ApiError("manual_document_provenance_required",
                            "a server-authorized result is required",
                            detail="ingest_authorization_required")
-        store = require_store()
+
+        with result_session(subject, owner, tenant_id,
+                            trusted_job_id=trusted_job_id) as service:
+            try:
+                if service is not None:
+                    assignment_id = trusted_assignment_id
+                    if assignment_id is None and trusted_job_id is not None:
+                        assignment_id = trusted_assignment_for(
+                            trusted_job_id, tenant_id, owner)
+                    classroom = dict(parts)
+                    classroom["revision"] = (revision
+                                             if scope == "classroom" else "")
+                    registered = service.register(
+                        result_id=result_id, original_output=original,
+                        scope=scope, review_key=review_key,
+                        document_digest=digest, job_id=trusted_job_id,
+                        assignment_id=assignment_id, classroom=classroom)
+                else:
+                    store = require_store()
+                    registered = store.register_result(
+                        owner=owner, result_id=result_id,
+                        original_output=original)
+                    with closing(
+                            ingest_registry.require_connection()) as connection:
+                        ingest_registry.put_row(
+                            connection, tenant_id=tenant_id, owner=owner,
+                            result_id=result_id, scope=scope,
+                            review_key=review_key, document_digest=digest,
+                            row=row)
+            except audit_store.AuditStoreError as failure:
+                raise ApiError(failure.code, "registration refused")
+            except ingest_registry.RegistryError as failure:
+                raise ApiError(failure.detail,
+                               "the ingest registry row could not be written",
+                               detail=failure.detail)
+            return {"result_id": result_id, "owner": owner,
+                    "result_revision": registered["result_revision"],
+                    # Interpretation of the contract's audit_reference for a
+                    # zero-event registration: the immutable original digest.
+                    "audit_reference": registered["original_digest"],
+                    "supersedes": None}
+
+    def trusted_assignment_for(job_id: str, tenant_id: str,
+                               owner: str) -> Optional[str]:
+        """The link stored on the TRUSTED succeeded job, else ``None``.
+
+        This is a server-side read keyed by the job the provenance gate just
+        verified. A missing/unusable job store yields no link rather than a
+        guessed one.
+        """
         try:
-            with closing(ingest_registry.require_connection()) as connection:
-                registered = store.register_result(
-                    owner=owner, result_id=result_id, original_output=original)
-                ingest_registry.put_row(
-                    connection, tenant_id=tenant_id, owner=owner,
-                    result_id=result_id, scope=scope, review_key=review_key,
-                    document_digest=digest, row=row)
-        except audit_store.AuditStoreError as failure:
-            raise ApiError(failure.code, "registration refused")
-        except ingest_registry.RegistryError as failure:
-            raise ApiError(failure.detail,
-                           "the ingest registry row could not be written",
-                           detail=failure.detail)
-        return {"result_id": result_id, "owner": owner,
-                "result_revision": registered["result_revision"],
-                # Interpretation of the contract's audit_reference for a
-                # zero-event registration: the immutable original digest.
-                "audit_reference": registered["original_digest"],
-                "supersedes": None}
+            with closing(_job_api().require_connection()) as connection:
+                job = _job_api().get_job(connection, tenant_id=tenant_id,
+                                         owner=owner, job_id=job_id)
+        except job_store.JobStoreError:
+            return None
+        if (not job or job.get("tenant_id") != tenant_id
+                or job.get("owner_subject") != owner):
+            return None
+        return job.get("assignment_id")
 
     @app.post("/v1/results", status_code=201)
     def ingest_result(body: IngestRequest, who=Depends(actor)):
@@ -786,6 +1019,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                          + parts["assignment"] + ":" + submission + ":"
                          + (revision or "unversioned"))
 
+        deny_fresh_completion()
         return finish_ingest(
             subject=subject, owner=owner, tenant_id=tenant_id, scope=scope,
             original=original, digest=digest, review_key=review_key,
@@ -803,64 +1037,83 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         untouched and the store is never mutated.
         """
         subject, owner, tenant_id = who
-        row = visible_row(subject, owner, tenant_id, result_id)
-        if row is None:
-            raise ApiError("result_not_registered", "no result for this owner")
-        store = require_store()
-        try:
-            original_record = store.original_record(
-                owner=owner, result_id=result_id)
-            events = store.replay(owner=owner, result_id=result_id)
-        except audit_store.AuditStoreError as failure:
-            raise ApiError(failure.code, "projection read failed")
-
-        pristine = row.get("ai_result") or row.get("result") or {}
-        if audit_store.digest_value(pristine) != original_record["original_digest"]:
-            raise ApiError("audit_record_invalid", "the original output changed")
-        questions = pristine.get("questions") if isinstance(pristine, dict) \
-            else None
-        if not isinstance(questions, list):
-            questions = []
-        latest = {}
-        for event in events:  # stream order: later events win
-            latest[str(event.get("question_number"))] = event
-        earned = 0.0
-        available = 0.0
-        projected = []
-        for question in questions:
-            number = str(question.get("question_number", ""))
-            original_marks = question.get("awarded_marks")
-            max_marks = question.get("max_marks")
-            event = latest.get(number)
-            status = (event or {}).get("review_status") or "unreviewed"
-            effective = original_marks
-            corrected = False
-            if status == "corrected":
+        with result_session(subject, owner, tenant_id) as service:
+            if service is not None:
+                # One read transaction: original output and event chain come
+                # from the same committed state, never a mixed snapshot.
                 try:
-                    effective = int((event or {}).get("new_score"))
-                except (TypeError, ValueError):
-                    raise ApiError("audit_record_invalid",
-                                   "a stored correction is unreadable")
-                corrected = True
-            entry = {"question_number": number, "max_marks": max_marks,
-                     "original_awarded_marks": original_marks,
-                     "effective_awarded_marks": effective,
-                     "corrected": corrected, "review_status": status}
-            if event is not None:
-                entry["last_action"] = event.get("action")
-                entry["last_reason"] = event.get("reason")
-            projected.append(entry)
-            if isinstance(effective, (int, float)):
-                earned += float(effective)
-            if isinstance(max_marks, (int, float)):
-                available += float(max_marks)
-        return {"result_id": result_id,
-                "result_revision": original_record["result_revision"],
-                "questions": projected,
-                "original_ai_output": pristine,
-                "totals": {"earned": earned, "available": available,
-                           "percentage": (round(earned * 100.0 / available, 2)
-                                          if available else 0.0)}}
+                    snapshot = service.snapshot(result_id=result_id)
+                except audit_store.AuditStoreError as failure:
+                    raise ApiError(failure.code, "projection read failed")
+                pristine = snapshot["original_output"]
+                original_digest = snapshot["original_digest"]
+                result_revision = snapshot["result_revision"]
+                events = snapshot["events"]
+            else:
+                row = visible_row(subject, owner, tenant_id, result_id)
+                if row is None:
+                    raise ApiError("result_not_registered",
+                                   "no result for this owner")
+                store = require_store()
+                try:
+                    original_record = store.original_record(
+                        owner=owner, result_id=result_id)
+                    events = store.replay(owner=owner, result_id=result_id)
+                except audit_store.AuditStoreError as failure:
+                    raise ApiError(failure.code, "projection read failed")
+                pristine = row.get("ai_result") or row.get("result") or {}
+                original_digest = original_record["original_digest"]
+                result_revision = original_record["result_revision"]
+
+            if (audit_store.digest_value(pristine)
+                    != original_digest):
+                raise ApiError("audit_record_invalid",
+                               "the original output changed")
+            questions = pristine.get("questions") if isinstance(pristine, dict) \
+                else None
+            if not isinstance(questions, list):
+                questions = []
+            latest = {}
+            for event in events:  # stream order: later events win
+                latest[str(event.get("question_number"))] = event
+            earned = 0.0
+            available = 0.0
+            projected = []
+            for question in questions:
+                number = str(question.get("question_number", ""))
+                original_marks = question.get("awarded_marks")
+                max_marks = question.get("max_marks")
+                event = latest.get(number)
+                status = (event or {}).get("review_status") or "unreviewed"
+                effective = original_marks
+                corrected = False
+                if status == "corrected":
+                    try:
+                        effective = int((event or {}).get("new_score"))
+                    except (TypeError, ValueError):
+                        raise ApiError("audit_record_invalid",
+                                       "a stored correction is unreadable")
+                    corrected = True
+                entry = {"question_number": number, "max_marks": max_marks,
+                         "original_awarded_marks": original_marks,
+                         "effective_awarded_marks": effective,
+                         "corrected": corrected, "review_status": status}
+                if event is not None:
+                    entry["last_action"] = event.get("action")
+                    entry["last_reason"] = event.get("reason")
+                projected.append(entry)
+                if isinstance(effective, (int, float)):
+                    earned += float(effective)
+                if isinstance(max_marks, (int, float)):
+                    available += float(max_marks)
+            return {"result_id": result_id,
+                    "result_revision": result_revision,
+                    "questions": projected,
+                    "original_ai_output": pristine,
+                    "totals": {"earned": earned, "available": available,
+                               "percentage": (round(earned * 100.0 / available,
+                                                    2)
+                                              if available else 0.0)}}
 
     def require_document_connection():
         """The document store for THIS process, failing closed when unconfigured.
@@ -909,10 +1162,18 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_document_connection()
         try:
             with closing(connection):
-                created = _document_api().put_document(
-                    connection, tenant_id=tenant_id, owner=owner,
-                    document_digest=digest, filename=filename or "",
-                    page_count=info.get("pages"), content=data)
+                adapter = _document_api()
+                if adapter is supabase_document_store:
+                    created = adapter.put_document(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        document_digest=digest, filename=filename or "",
+                        page_count=info.get("pages"), content=data,
+                        metadata_subject=subject)
+                else:
+                    created = adapter.put_document(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        document_digest=digest, filename=filename or "",
+                        page_count=info.get("pages"), content=data)
         except document_store.DocumentStoreError as failure:
             raise ApiError(failure.detail, "the document could not be stored")
         receipt = {"document_digest": digest, "owner": owner,
@@ -938,9 +1199,15 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         connection = require_document_connection()
         try:
             with closing(connection):
-                content = _document_api().find_document(
-                    connection, tenant_id=tenant_id, owner=owner,
-                    document_digest=digest)
+                adapter = _document_api()
+                if adapter is supabase_document_store:
+                    content = adapter.find_document(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        document_digest=digest, metadata_subject=subject)
+                else:
+                    content = adapter.find_document(
+                        connection, tenant_id=tenant_id, owner=owner,
+                        document_digest=digest)
         except document_store.DocumentStoreError as failure:
             raise ApiError(failure.detail, "the document could not be read")
         if content is None:
@@ -999,7 +1266,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             raise ApiError("store_unusable",
                            "the assignment store is unusable")
 
-    def _marks_only(owner: Optional[str], result_id: str):
+    def _marks_only(owner: Optional[str], result_id: str,
+                    tenant_id: Optional[str] = None):
         """Marks-only question projection for one registered result.
 
         Reads the audit store's stored ``original_scores`` (question number +
@@ -1007,12 +1275,27 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         whenever it cannot be read (unconfigured/unusable store, unknown
         result): the caller then omits the field instead of guessing, and the
         full result stays readable through the projection endpoint.
+
+        In production the lookup goes through the PostgreSQL result service
+        for the TRUSTED stored job owner (same mapping the worker uses); the
+        development SQLite store is never consulted.
         """
         if not owner:
             return None
         try:
-            store = require_store()
-            record = store.original_record(owner=owner, result_id=result_id)
+            if production_results:
+                if not tenant_id:
+                    return None
+                service = result_service.open_owner_service(owner, tenant_id)
+                try:
+                    record = service.original_record(owner=owner,
+                                                     result_id=result_id)
+                finally:
+                    service.close()
+            else:
+                store = require_store()
+                record = store.original_record(owner=owner,
+                                               result_id=result_id)
         except Exception:
             return None
         scores = record.get("original_scores") if isinstance(record, dict) else None
@@ -1044,7 +1327,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         if job.get("assignment_id") is not None:
             payload["assignment_id"] = job["assignment_id"]
         if job["status"] == "succeeded" and job.get("result_id"):
-            questions = _marks_only(job.get("owner_subject"), job["result_id"])
+            questions = _marks_only(job.get("owner_subject"), job["result_id"],
+                                    job.get("tenant_id"))
             if questions is not None:
                 payload["questions"] = questions
         return payload
@@ -1092,9 +1376,15 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                 raise ApiError("assignment_not_found",
                                "no assignment for this owner")
         with closing(require_document_connection()) as documents:
-            stored = _document_api().find_document(
-                documents, tenant_id=tenant_id, owner=owner,
-                document_digest=digest)
+            adapter = _document_api()
+            if adapter is supabase_document_store:
+                stored = adapter.find_document(
+                    documents, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest, metadata_subject=subject)
+            else:
+                stored = adapter.find_document(
+                    documents, tenant_id=tenant_id, owner=owner,
+                    document_digest=digest)
         if stored is None:
             raise ApiError("result_not_registered", "no document for this owner")
         connection = require_job_connection()
@@ -1279,6 +1569,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         without one this refuses 503 ``model_unavailable`` rather than
         fabricating a result.
         """
+        deny_fresh_completion()
         subject, owner, tenant_id = who
         connection = require_job_connection()
         try:
@@ -1292,9 +1583,12 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                     raise ApiError("model_unavailable",
                                    "no marking engine is configured")
                 with closing(require_document_connection()) as documents:
-                    content = _document_api().find_document(
+                    adapter = _document_api()
+                    metadata = ({"metadata_subject": subject}
+                                if adapter is supabase_document_store else {})
+                    content = adapter.find_document(
                         documents, tenant_id=tenant_id, owner=owner,
-                        document_digest=job["document_digest"])
+                        document_digest=job["document_digest"], **metadata)
                 claimed_job, claimed = _job_api().claim_job(
                     connection, tenant_id=tenant_id, owner=owner,
                     job_id=job_id)
@@ -1323,7 +1617,8 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
                         review_key=job_id,
                         result_id="manual:" + digest[:16] + ":" + job_id,
                         revision="", parts={},
-                        runner_job_id=job_id)
+                        runner_job_id=job_id,
+                        trusted_assignment_id=job.get("assignment_id"))
                 except ApiError as failure:
                     _job_api().settle_failure(
                         connection, tenant_id=tenant_id, owner=owner,
@@ -1346,14 +1641,14 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
 
     @app.post("/v1/results/{result_id}/decisions")
     def submit_decision(result_id: str, body: DecisionRequest,
-                        who=Depends(actor)):
-        subject, owner, tenant_id = who
-        store = require_store()
+                        context=Depends(result_context)):
+        (subject, owner, tenant_id), service = context
+        store = service if service is not None else require_store()
 
         # 1. Owner-scoped row resolution: the durable identity of a visible
         #    row must equal the requested result_id, else nothing is known
         #    about that stream for this owner (fail closed, leak nothing).
-        row = visible_row(subject, owner, tenant_id, result_id)
+        row = visible_row(subject, owner, tenant_id, result_id, service)
         if row is None:
             raise ApiError("result_not_registered", "no result for this owner")
 
@@ -1431,6 +1726,7 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         decision_core.apply_review_decision(
             state, student_key=student_key, question_number=body.question_number,
             action=body.action, reason=body.reason, corrected_mark=corrected_mark,
+            idempotency_key=body.idempotency_key,
             env=decision_core.DecisionEnv(
                 subject=subject,
                 owner=owner,
@@ -1457,7 +1753,9 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
         record = state.get(decision_core.DECISIONS_KEY, {}).get(
             decision_core.decision_key(student_key, body.question_number)) or {}
         reference = record.get("audit_reference") or {}
-        after = stream_revision(store, owner, result_id)
+        after = record.get("result_revision")
+        if after is None:
+            after = stream_revision(store, owner, result_id)
         return {
             "result_id": reference.get("result_id", result_id),
             "result_revision": after,
@@ -1465,7 +1763,9 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             # Provisional string form: stream + sequence are returned above;
             # the event id is the stable handle a client can quote back.
             "audit_reference": reference.get("event_id", ""),
-            "replayed": after == before and before > 0,
+            # The durable receipt is authoritative: a duplicate returns the
+            # saved sequence/event/revision, never an inferred state.
+            "replayed": bool(record.get("replayed")),
             "idempotency_key": body.idempotency_key,
         }
 
@@ -1475,8 +1775,6 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
     # no credentials, and a missing origin is refused rather than defaulted.
     # Added last so it is the outermost middleware: error envelopes and the
     # body-size refusal carry the same CORS decision as a success response.
-    production = ((os.environ.get(runtime_config.RUNTIME_ENV) or "")
-                  .strip().lower() == runtime_config.RUNTIME_PRODUCTION)
     try:
         origins = runtime_config.parse_allowed_origins(
             ",".join(allowed_origins) if allowed_origins is not None
@@ -1496,6 +1794,16 @@ def create_app(*, verify_token: Optional[Callable[[str], Optional[str]]] = None,
             "service_unavailable",
             [{"code": "service_unavailable",
               "detail": f"{runtime_config.ALLOWED_ORIGINS_ENV} is required in "
+                        f"production"}])
+    if production and not result_service.configured():
+        # BR-02A: a production app can never reach the development SQLite
+        # audit store / ingest registry. ``api/server.py`` proves capability
+        # at startup; this covers a direct create_app() caller that skipped
+        # the entrypoint.
+        raise runtime_config.RuntimeConfigError(
+            "store_unusable",
+            [{"code": "store_unusable",
+              "detail": f"{runtime_config.PG_DSN_ENV} is required in "
                         f"production"}])
     if origins:
         app.add_middleware(

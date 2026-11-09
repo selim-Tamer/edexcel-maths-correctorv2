@@ -130,12 +130,13 @@ class TransactionAttackTests(unittest.TestCase):
         newer = self.post(question_number="2", expected_revision=1,
                           idempotency_key="c2")
         self.assertEqual(newer.status_code, 200, newer.text)
-        # Job-retry reality: the ORIGINAL request is delivered again, late,
-        # with its stale expected_revision and a brand-new client key. It
+        # Job-retry reality: the ORIGINAL request (same client idempotency
+        # key) is delivered again, late, with its stale expected_revision. It
         # must replay the prior commit (same sequence, same event id), not
-        # append, not clobber and not fail on the revision.
+        # append, not clobber and not fail on the revision (BR-02C ordering:
+        # idempotency key before revision).
         retry = self.post(action="correct", new_score="2", reason="r1",
-                          idempotency_key="zzz-fresh-key",
+                          idempotency_key="c1",
                           expected_revision=0)
         self.assertEqual(retry.status_code, 200, retry.text)
         payload = retry.json()
@@ -161,25 +162,34 @@ class TransactionAttackTests(unittest.TestCase):
                         "logical decision after server normalisation")
         self.assertEqual(len(self.events()), 1)
 
-    def test_client_idempotency_key_can_neither_merge_nor_split(self):
-        # Same logical decision, different client keys -> still ONE event
-        # (client key cannot split a decision into duplicates)...
+    def test_client_idempotency_key_governs_replay_and_conflict(self):
+        # BR-02C: the supplied API idempotency key is the durable operation
+        # identity. The SAME key with the SAME logical decision replays the
+        # saved receipt...
         one = self.post(action="correct", new_score="2", reason="x",
                         idempotency_key="key-A")
         two = self.post(action="correct", new_score="2", reason="x",
-                        idempotency_key="key-B")
+                        idempotency_key="key-A")
         self.assertEqual((one.status_code, two.status_code), (200, 200))
         self.assertTrue(two.json()["replayed"])
         self.assertEqual(len(self.events()), 1)
-        # ...and two DIFFERENT decisions forced under ONE client key must
-        # both commit (client key cannot merge distinct payloads and so
-        # cannot suppress an audit event the second decision requires).
-        other = self.post(question_number="2", action="correct",
+        # ...the SAME key with DIFFERENT semantics is a conflict and appends
+        # nothing (a reused key must not suppress or duplicate an event)...
+        conflict = self.post(question_number="2", action="correct",
+                             new_score="2", reason="distinct payload",
+                             expected_revision=1, idempotency_key="key-A")
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        self.assertEqual(conflict.json()["error"]["code"],
+                         "idempotency_key_payload_mismatch")
+        self.assertEqual([e["sequence"] for e in self.events()], [1])
+        # ...and a FRESH key is a new operation, so the stale revision is
+        # enforced by the store transaction.
+        fresh = self.post(question_number="2", action="correct",
                           new_score="2", reason="distinct payload",
-                          expected_revision=1, idempotency_key="key-A")
-        self.assertEqual(other.status_code, 200, other.text)
-        self.assertFalse(other.json()["replayed"])
-        self.assertEqual([e["sequence"] for e in self.events()], [1, 2])
+                          expected_revision=0, idempotency_key="key-B")
+        self.assertEqual(fresh.status_code, 409, fresh.text)
+        self.assertEqual(fresh.json()["error"]["code"], "stale_revision")
+        self.assertEqual([e["sequence"] for e in self.events()], [1])
 
     # -- fault injection through HTTP ------------------------------------
 

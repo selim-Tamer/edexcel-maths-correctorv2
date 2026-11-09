@@ -33,6 +33,7 @@ import sys
 import time
 from contextlib import closing
 
+import result_service
 import runtime_config
 from api.app import ApiError, _job_api, create_app
 from job_store import JobStoreError
@@ -65,12 +66,17 @@ def tenants_from(environ: dict = None, cli_tenants=()) -> tuple:
     return tuple(ordered)
 
 
-def run_one(app, api, connection, *, tenant_id: str, now: int = None) -> dict:
+def run_one(app, api, connection, *, tenant_id: str, now: int = None,
+            fresh_result_completion_denied: bool = False) -> dict:
     """Discover and execute at most one job for one tenant.
 
     Returns a content-free outcome dict (ids, status, error code only): this
     is a log line, never student data.
     """
+    if runtime_config.is_production_runtime() or fresh_result_completion_denied:
+        # F5: refuse before work acquisition or any job-related side effect.
+        return {"executed": True, "tenant_id": tenant_id, "job_id": None,
+                "status": "error", "error_code": "store_unusable"}
     candidate = api.find_runnable_job(connection, tenant_id=tenant_id, now=now)
     if candidate is None:
         return {"executed": False, "tenant_id": tenant_id}
@@ -106,8 +112,21 @@ def main(argv=None) -> int:
                         help="sleep between discoveries in --loop mode")
     args = parser.parse_args(argv)
 
+    # F5: fail-closed fresh-result-completion gate (evaluated at startup).
+    # Denies fresh result registration and worker job execution during the
+    # foundations package. Defaults to denied in production; not applicable
+    # (False) in non-production composition.
+    fresh_result_completion_denied = False
     try:
-        runtime_config.require()
+        report = runtime_config.require()
+        if (report or {}).get("production"):
+            # BR-02A: the trusted worker path must use the same authoritative
+            # PostgreSQL result store; prove its schema capability before any
+            # job is claimed. No SQLite fallback exists here.
+            runtime_config.fresh_result_completion_denied()
+            print("worker: fresh completion disabled (store_unusable)",
+                  file=sys.stderr)
+            return EXIT_COMPOSITION
     except runtime_config.RuntimeConfigError as failure:
         print(f"worker: runtime composition refused ({failure.code})",
               file=sys.stderr)
@@ -131,7 +150,9 @@ def main(argv=None) -> int:
         for tenant_id in tenant_ids:
             try:
                 with closing(api.require_connection()) as connection:
-                    outcome = run_one(app, api, connection, tenant_id=tenant_id)
+                    outcome = run_one(app, api, connection, tenant_id=tenant_id,
+                                      fresh_result_completion_denied=
+                                      fresh_result_completion_denied)
             except JobStoreError as failure:
                 print(f"worker: job store unusable ({failure.detail})",
                       file=sys.stderr)

@@ -285,12 +285,15 @@ def restore_decision_session_snapshot(state: State, student_key: str,
 
 def commit_audit_decision(*, store, plan, actor, row, question_number, action,
                           review_status, old_score, corrected, reason, binding,
-                          evidence):
+                          evidence, idempotency_key=None):
     """Atomically commit one accepted decision together with its audit event.
 
-    Same payload/idempotency construction as the application path: the
-    audit-only authorization evidence rides on the event but never enters the
-    payload, so a legitimate retry stays idempotent while the optimistic
+    Same payload/idempotency construction as the application path, with one
+    BR-02 change: when the API supplied its own ``idempotency_key`` it is the
+    durable replay/conflict key (scoped by tenant+owner+result in storage).
+    The legacy session path omits it and keeps the derived key explicitly.
+    The audit-only authorization evidence rides on the event but never enters
+    the payload, so a legitimate retry stays idempotent while the optimistic
     revision is enforced by the commit itself.
     """
     payload = {
@@ -317,16 +320,20 @@ def commit_audit_decision(*, store, plan, actor, row, question_number, action,
     store.register_result(owner=actor, result_id=plan["result_id"],
                           original_output=(row.get("ai_result")
                                            or row.get("result") or {}))
+    supplied = (idempotency_key.strip()
+                if isinstance(idempotency_key, str) else "")
+    key = supplied or audit_store.make_idempotency_key(
+        owner=actor, result_id=plan["result_id"], payload=payload)
     return store.commit_correction(
         owner=actor, result_id=plan["result_id"],
         expected_revision=plan["expected_revision"],
-        idempotency_key=audit_store.make_idempotency_key(
-            owner=actor, result_id=plan["result_id"], payload=payload),
+        idempotency_key=key,
         payload=payload, event=event)
 
 
 def apply_review_decision(state: State, *, student_key, question_number,
-                          action, reason, corrected_mark, env: DecisionEnv) -> None:
+                          action, reason, corrected_mark, env: DecisionEnv,
+                          idempotency_key=None) -> None:
     """Record one teacher's question-level review decision (fail closed).
 
     This is the moved body of ``app5_1_automated.
@@ -430,7 +437,7 @@ def apply_review_decision(state: State, *, student_key, question_number,
                 review_status=new_status,
                 old_score=question.get("awarded_marks"),
                 corrected=corrected, reason=reason, binding=binding,
-                evidence=evidence)
+                evidence=evidence, idempotency_key=idempotency_key)
         except audit_store.AuditStoreError as failure:
             if snapshot is not None:
                 restore_decision_session_snapshot(state, student_key,
@@ -453,6 +460,10 @@ def apply_review_decision(state: State, *, student_key, question_number,
             "sequence": committed["sequence"],
             "event_id": committed["event_id"],
         }
+        # The durable receipt is authoritative for replay: a duplicate returns
+        # the saved sequence/event/revision, never an inferred current state.
+        record["replayed"] = committed.get("status") == "duplicate"
+        record["result_revision"] = committed.get("resulting_revision")
     state.setdefault(DECISIONS_KEY, {})[key] = record
     env.record_event(row, student_key, question_number, status, binding,
                      evidence)

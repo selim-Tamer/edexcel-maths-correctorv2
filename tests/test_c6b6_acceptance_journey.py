@@ -255,12 +255,13 @@ class JourneyTests(unittest.TestCase):
         self.assertEqual(self.store.current_revision(owner=OWNER,
                                                      result_id=rid), 1)
 
-        # -- stage 14: a late redelivery of stage 9 replays, never repeats
+        # -- stage 14: a late redelivery of stage 9 (same idempotency key) -----
+        # replays, never repeats
         replay = self.client.post(
             f"/v1/results/{rid}/decisions", headers=self.auth(),
             json={"question_number": "2", "action": "correct",
                   "new_score": "2", "reason": "scheme A1 earned",
-                  "expected_revision": 0, "idempotency_key": "j-9-late",
+                  "expected_revision": 0, "idempotency_key": "j-9",
                   "old_score": "1", "binding": binding,
                   "review_status": "corrected"})
         self.assertEqual(replay.status_code, 200, replay.text)

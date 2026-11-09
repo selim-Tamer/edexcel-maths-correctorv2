@@ -112,10 +112,17 @@ class ProductionStartupContractTests(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         self._clean_module()
-        with mock.patch.dict(os.environ, PRODUCTION_ENV, clear=True):
+        # BR-02A: production startup now proves the PostgreSQL result-schema
+        # capability by connecting. This offline packaging test owns no
+        # database, so it mocks ONLY that capability probe (the runtime
+        # composition itself is still the real one) and asserts the container
+        # entrypoint builds and serves liveness.
+        with mock.patch.dict(os.environ, PRODUCTION_ENV, clear=True), \
+                mock.patch("result_service.require_capability") as capability:
             server = importlib.import_module("api.server")
             client = TestClient(server.application)
             response = client.get("/v1/healthz")
+        capability.assert_called_once()
         self.assertEqual(200, response.status_code)
         self.assertEqual({"status": "ok"}, response.json())
 

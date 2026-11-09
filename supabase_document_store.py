@@ -161,7 +161,7 @@ def _valid_digest(document_digest: str) -> str:
 
 def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
                  document_digest: str, filename: str, page_count,
-                 content: bytes) -> bool:
+                 content: bytes, metadata_subject: Optional[str] = None) -> bool:
     """Store one document idempotently. Returns True when newly stored.
 
     A repeat upload of the same content for the same owner+tenant returns
@@ -174,12 +174,27 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
     ``ON CONFLICT ... DO UPDATE ... WHERE storage_key = '' RETURNING``, so a
     conflicting LIVE row (the winner) makes ours a no-op - we return False and
     keep the object both uploads wrote - while a tombstoned row is revived.
+
+    ``metadata_subject``, when provided, must be the raw membership subject
+    that ``pdf_references.owner_subject`` binds to. ``owner`` is the canonical
+    owner (``google:<subject>``); the object key uses ``owner`` unchanged, but
+    the SQL row binds ``metadata_subject``. When omitted, ``owner`` is used
+    directly for both the object key and the SQL column.
     """
     digest = _valid_digest(document_digest)
     payload = bytes(content)
     if len(payload) > MAX_DOCUMENT_BYTES:
         raise DocumentStoreError("document_too_large")
     key = storage_key(tenant_id, owner, digest)
+    # metadata_subject, when provided, must exactly match owner as
+    # 'google:' + metadata_subject; no trimming or guessing.
+    sql_owner = owner
+    if metadata_subject is not None:
+        if not isinstance(metadata_subject, str) or not metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        if owner != "google:" + metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        sql_owner = metadata_subject
     try:
         with store._conn.transaction():
             store._bind(tenant_id)
@@ -187,7 +202,7 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
                 "SELECT storage_key, size_bytes FROM pdf_references"
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND document_digest = %s",
-                (tenant_id, owner, digest)).fetchone()
+                (tenant_id, sql_owner, digest)).fetchone()
             if prior is not None and str(prior[0]):
                 # A LIVE row: idempotent repeat. A size mismatch means the
                 # store itself is inconsistent, so it fails closed.
@@ -209,7 +224,7 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
                 " size_bytes = EXCLUDED.size_bytes"
                 " WHERE pdf_references.storage_key = ''"
                 " RETURNING storage_key",
-                (tenant_id, owner, digest, key, len(payload))).fetchone()
+                (tenant_id, sql_owner, digest, key, len(payload))).fetchone()
             if inserted is None:
                 # CONFLICT-SAFE BENIGN RACE (IR finding, hardened per review):
                 # a LIVE row for these exact (tenant, owner, digest) already
@@ -232,21 +247,36 @@ def put_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
 
 
 def find_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
-                  document_digest: str):
+                  document_digest: str, metadata_subject: Optional[str] = None):
     """The stored bytes for this exact owner+tenant, or None (never leaked).
 
     A tombstoned row (``storage_key = ''``, i.e. purged) is a miss like any
     other: the retention decision is not a distinguishable error.
+
+    ``metadata_subject``, when provided, must be the raw membership subject
+    that ``pdf_references.owner_subject`` binds to; ``owner`` is the canonical
+    owner (``google:<subject>``). ``owner == 'google:' + metadata_subject`` is
+    required; no trimming or guessing. When omitted, ``owner`` is used
+    directly for the SQL column.
     """
     digest = _valid_digest(document_digest)
     key = storage_key(tenant_id, owner, digest)
+    # metadata_subject, when provided, binds the SQL owner_subject column;
+    # storage_key uses owner unchanged.
+    sql_owner = owner
+    if metadata_subject is not None:
+        if not isinstance(metadata_subject, str) or not metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        if owner != "google:" + metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        sql_owner = metadata_subject
     try:
         with store._conn.transaction():
             store._bind(tenant_id)
             row = store._conn.execute(
                 "SELECT storage_key FROM pdf_references WHERE tenant_id = %s"
                 " AND owner_subject = %s AND document_digest = %s",
-                (tenant_id, owner, digest)).fetchone()
+                (tenant_id, sql_owner, digest)).fetchone()
             if row is None or not str(row[0]):
                 return None
             status, body = store._request("GET", str(row[0]))
@@ -261,7 +291,8 @@ def find_document(store: SupabaseDocumentStore, *, tenant_id: str, owner: str,
 
 
 def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
-                    owner: str, document_digest: str) -> bool:
+                    owner: str, document_digest: str,
+                    metadata_subject: Optional[str] = None) -> bool:
     """RETENTION/PURGE verb: remove the bytes, keep the digest tombstone.
 
     The reviewed retention proposal deletes the object and KEEPS the
@@ -274,16 +305,31 @@ def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
     bound like everything else: a purge is per tenant with the binding set,
     never a privileged cross-tenant delete. Returns True when this call
     removed the object.
+
+    ``metadata_subject``, when provided, must be the raw membership subject
+    that ``pdf_references.owner_subject`` binds to; ``owner`` is the canonical
+    owner (``google:<subject>``). ``owner == 'google:' + metadata_subject`` is
+    required; no trimming or guessing. When omitted, ``owner`` is used
+    directly for the SQL column.
     """
     digest = _valid_digest(document_digest)
     key = storage_key(tenant_id, owner, digest)
+    # metadata_subject, when provided, binds the SQL owner_subject column;
+    # storage_key uses owner unchanged.
+    sql_owner = owner
+    if metadata_subject is not None:
+        if not isinstance(metadata_subject, str) or not metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        if owner != "google:" + metadata_subject:
+            raise DocumentStoreError("store_unusable")
+        sql_owner = metadata_subject
     try:
         with store._conn.transaction():
             store._bind(tenant_id)
             row = store._conn.execute(
                 "SELECT storage_key FROM pdf_references WHERE tenant_id = %s"
                 " AND owner_subject = %s AND document_digest = %s",
-                (tenant_id, owner, digest)).fetchone()
+                (tenant_id, sql_owner, digest)).fetchone()
             if row is None or not str(row[0]):
                 return False
             status, _ = store._request("DELETE", str(row[0]))
@@ -293,7 +339,7 @@ def delete_document(store: SupabaseDocumentStore, *, tenant_id: str,
                 "UPDATE pdf_references SET storage_key = '', size_bytes = NULL"
                 " WHERE tenant_id = %s AND owner_subject = %s"
                 " AND document_digest = %s",
-                (tenant_id, owner, digest))
+                (tenant_id, sql_owner, digest))
             return True
     except DocumentStoreError:
         raise

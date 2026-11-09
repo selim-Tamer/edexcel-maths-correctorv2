@@ -49,6 +49,11 @@ GEMINI_KEY_ENV = "GEMINI_API_KEY"
 PORT_ENV = "PORT"
 ALLOWED_ORIGINS_ENV = "AI_MARKER_ALLOWED_ORIGINS"
 WORKER_TENANTS_ENV = "AI_MARKER_WORKER_TENANTS"
+FRESH_RESULT_COMPLETION_ENABLED_ENV = "AI_MARKER_FRESH_RESULT_COMPLETION_ENABLED"
+
+# Values that deny fresh result completion (per-request denial during this
+# package). Any other non-empty value triggers a sanitized startup refusal.
+_FRESH_COMPLETION_DENY_VALUES = frozenset({"", "false", "0", "no", "off"})
 
 # Development-only SQLite paths. Any of these being set in the production
 # runtime means the process would serve development storage with production
@@ -335,3 +340,34 @@ def require(environ: Optional[dict] = None) -> dict:
 def secret_names() -> frozenset:
     """Names that must come from Secret Manager, never from plain env files."""
     return _SECRET_NAMES
+
+
+def is_production_runtime(environ: Optional[dict] = None) -> bool:
+    """Production policy is independent of repositories and dependency overrides."""
+    env = os.environ if environ is None else environ
+    return (env.get(RUNTIME_ENV) or "").strip().lower() == RUNTIME_PRODUCTION
+
+
+def fresh_result_completion_denied(environ: Optional[dict] = None) -> bool:
+    """Fail-closed fresh-result-completion policy (foundations package).
+
+    During this foundations package, production fresh result completion is
+    always denied. The environment variable controls *how* it is denied:
+
+    * unset / recognized false values -> deny per-request (returns True);
+    * "true" / malformed / any other non-empty value -> sanitized startup
+      refusal (raises RuntimeConfigError so the process cannot start).
+
+    No configuration value enables production fresh completion during this
+    package. This is evaluated once at app creation (startup) and the result
+    is cached by the caller for per-request gate checks.
+    """
+    env = dict(os.environ if environ is None else environ)
+    raw = (env.get(FRESH_RESULT_COMPLETION_ENABLED_ENV) or "").strip()
+    if raw.lower() in _FRESH_COMPLETION_DENY_VALUES:
+        return True
+    raise RuntimeConfigError(
+        "service_unavailable",
+        [{"code": "service_unavailable",
+          "detail": f"{FRESH_RESULT_COMPLETION_ENABLED_ENV} is not "
+                    f"permitted during the foundations package"}])

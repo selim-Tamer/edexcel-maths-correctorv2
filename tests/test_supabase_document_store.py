@@ -87,6 +87,45 @@ def make_store(transport, connection=None):
         transport=transport)
 
 
+class ExplicitMetadataIdentityTests(unittest.TestCase):
+    def test_canonical_object_key_and_raw_membership_sql_are_distinct(self):
+        raw = "google:synthetic-subject"
+        owner = "google:" + raw
+        connection = _FakeConnection([None, (storage_key("t", owner, DIGEST),)])
+        transport = _RecordingTransport(status=200)
+        store = make_store(transport, connection)
+        self.assertTrue(supabase_document_store.put_document(
+            store, tenant_id="t", owner=owner, metadata_subject=raw,
+            document_digest=DIGEST, filename="synthetic.pdf", page_count=1,
+            content=b"%PDF-synthetic"))
+        insert = next(params for _, sql, params in connection.statements
+                      if sql.startswith("INSERT INTO pdf_references"))
+        self.assertEqual(insert[1], raw)
+        self.assertEqual(insert[3], storage_key("t", owner, DIGEST))
+        self.assertIn(insert[3], transport.calls[0]["url"])
+
+    def test_invalid_metadata_identity_refuses_before_storage_access(self):
+        for raw in ("", 7, "someone-else"):
+            for operation in ("put", "find", "delete"):
+                with self.subTest(raw=raw, operation=operation):
+                    connection = _FakeConnection()
+                    transport = _RecordingTransport()
+                    store = make_store(transport, connection)
+                    kwargs = dict(tenant_id="t", owner="google:teacher",
+                                  metadata_subject=raw, document_digest=DIGEST)
+                    with self.assertRaises(DocumentStoreError):
+                        if operation == "put":
+                            supabase_document_store.put_document(
+                                store, **kwargs, filename="synthetic.pdf",
+                                page_count=1, content=b"%PDF-synthetic")
+                        elif operation == "find":
+                            supabase_document_store.find_document(store, **kwargs)
+                        else:
+                            supabase_document_store.delete_document(store, **kwargs)
+                    self.assertEqual(connection.statements, [])
+                    self.assertEqual(transport.calls, [])
+
+
 class StorageKeyTests(unittest.TestCase):
     def test_keys_are_deterministic_and_carry_no_identity(self):
         key = storage_key("school-a", "google:teacher-a", DIGEST)
