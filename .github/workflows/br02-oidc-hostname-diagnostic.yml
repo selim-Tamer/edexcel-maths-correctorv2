@@ -1,0 +1,42 @@
+{
+  "name": "BR-02 OIDC hostname-only diagnostic",
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "approve_diagnostic": {
+          "description": "Owner-authorized hostname-only observation; no token or database",
+          "type": "boolean",
+          "required": true,
+          "default": false
+        },
+        "approved_sha": {
+          "description": "Exact independently reviewed diagnostic workflow commit",
+          "type": "string",
+          "required": true
+        }
+      }
+    }
+  },
+  "permissions": {},
+  "concurrency": {
+    "group": "br02-oidc-hostname-diagnostic",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "hostname": {
+      "if": "github.event_name == 'workflow_dispatch' && inputs.approve_diagnostic && github.repository == 'selim-Tamer/edexcel-maths-correctorv2' && github.repository_id == '1389123218' && github.event.repository.private == false && github.actor_id == '329718877' && github.run_attempt == 1 && github.ref == 'refs/heads/br-02/postgres-result-persistence' && inputs.approved_sha == github.sha",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 2,
+      "permissions": {
+        "id-token": "write"
+      },
+      "steps": [
+        {
+          "name": "Observe validated OIDC request hostname only",
+          "shell": "bash",
+          "run": "python3 -I -B - <<'PY'\nimport json\nimport os\nimport re\nimport sys\nfrom urllib.parse import urlsplit\n\n\ndef empty_result():\n    return dict.fromkeys(('variable_present','value_nonempty','input_length_valid',\n        'input_clean','url_parsed','scheme_https','authority_dns_form','userinfo_absent','port_valid',\n        'fragment_absent','hostname_present','trailing_dot_removed',\n        'hostname_length_valid','hostname_syntax_valid','hostname_emitted',\n        'internal_error'),False)\n\n\ndef inspect_url(value,present):\n    result=empty_result()\n    result['variable_present']=present is True\n    if type(value) is not str: return result\n    result['value_nonempty']=bool(value)\n    result['input_length_valid']=0<len(value)<=8192\n    if not result['input_length_valid']: return result\n    result['input_clean']=not any(ord(c)<=32 or ord(c)==127 or c=='\\\\' for c in value)\n    if not result['input_clean']: return result\n    try:\n        address=urlsplit(value)\n        result['url_parsed']=True\n        result['scheme_https']=address.scheme=='https'\n        result['authority_dns_form']=address.netloc.isascii() and not any(c in address.netloc for c in '[]')\n        result['userinfo_absent']=address.username is None and address.password is None\n        result['fragment_absent']=not bool(address.fragment)\n        hostname=address.hostname\n        result['hostname_present']=bool(hostname)\n        try: result['port_valid']=address.port in (None,443)\n        except ValueError: pass\n        if not hostname: return result\n        hostname=hostname.lower()\n        if hostname.endswith('.'):\n            hostname=hostname[:-1]\n            result['trailing_dot_removed']=True\n        result['hostname_length_valid']=0<len(hostname)<=253\n        labels=hostname.split('.')\n        result['hostname_syntax_valid']=(hostname.isascii() and len(labels)>=2\n            and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) is not None for label in labels)\n            and re.search(r'[a-z]',labels[-1]) is not None)\n        safe=all(result[k] for k in ('variable_present','input_length_valid','input_clean',\n            'url_parsed','scheme_https','authority_dns_form','userinfo_absent','port_valid','fragment_absent',\n            'hostname_present','hostname_length_valid','hostname_syntax_valid'))\n        if safe:\n            result['hostname']=hostname\n            result['hostname_emitted']=True\n    except Exception: pass\n    return result\n\n\ndef main():\n    try:\n        key='ACTIONS_ID_TOKEN_REQUEST_URL'\n        result=inspect_url(os.environ.get(key),key in os.environ)\n    except Exception:\n        result=empty_result()\n        result['internal_error']=True\n    try: print(json.dumps(result,sort_keys=True,separators=(',',':')))\n    except Exception: return 2\n    return 0 if result['hostname_emitted'] else 1\n\n\nif __name__=='__main__': sys.exit(main())\nPY\n"
+        }
+      ]
+    }
+  }
+}
