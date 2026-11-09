@@ -494,7 +494,8 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
             with self.assertRaises(ci.CIDenied) as caught:ci._authenticated_identity(self.env() if env is None else env)
         event=json.loads(output.getvalue().split('BR02_CI_IDENTITY_DIAGNOSTIC ',1)[1])
         self.assertEqual(event['stage'],stage)
-        self.assertEqual(set(event),{'stage','reason','checks'} if stage=='claim_binding' else {'stage','reason'})
+        self.assertEqual(set(event),{'stage','reason','checks'} if stage=='claim_binding' else
+                         {'stage','reason','url_checks'} if stage=='request_url' else {'stage','reason'})
         self.assertNotIn(PAYLOAD,output.getvalue()+str(caught.exception))
         self.assertNotIn('synthetic.jwt.token',output.getvalue())
         self.assertFalse(ci.active())
@@ -550,6 +551,93 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
         with mock.patch('builtins.print',side_effect=OSError(PAYLOAD)):
             with self.assertRaises(ci.CIDenied):ci.authenticate(env)
         self.assertFalse(ci.active())
+
+
+class RequestUrlPredicateTests(unittest.TestCase):
+    fields={'url_parsed','scheme_allowed','hostname_allowed','username_allowed',
+            'password_allowed','port_parsed','port_allowed','query_parsed',
+            'audience_query_built','url_built'}
+
+    def refused(self,url,**changes):
+        env=IdentityDiagnosticProposalTests().env()
+        env['ACTIONS_ID_TOKEN_REQUEST_URL']=url;env.update(changes)
+        output=io.StringIO()
+        with mock.patch.object(ci.urllib.request,'build_opener') as opener, \
+                mock.patch.object(ci,'_verify_jwt') as verify,contextlib.redirect_stderr(output):
+            with self.assertRaises(ci.CIDenied) as caught:ci.authenticate(env)
+        self.assertEqual(str(caught.exception),'BR02_CI_IDENTITY')
+        opener.assert_not_called();verify.assert_not_called()
+        event=json.loads(output.getvalue().split('BR02_CI_IDENTITY_DIAGNOSTIC ',1)[1])
+        self.assertEqual(set(event),{'stage','reason','url_checks'})
+        self.assertEqual(event['stage'],'request_url')
+        self.assertEqual(set(event['url_checks']),self.fields)
+        self.assertTrue(all(type(v) is bool for v in event['url_checks'].values()))
+        self.assertNotIn(PAYLOAD,output.getvalue()+str(caught.exception))
+        self.assertFalse(ci.active())
+        return event['url_checks']
+
+    def test_accepted_urls_preserve_existing_origin_path_and_query_behavior(self):
+        for authority in ('vstoken.actions.githubusercontent.com',
+                          'VSTOKEN.ACTIONS.GITHUBUSERCONTENT.COM:443',
+                          '@vstoken.actions.githubusercontent.com'):
+            url='https://'+authority+'/synthetic/'+PAYLOAD+'?keep=one&blank=&dup=1&dup=2&audience=old#'+PAYLOAD
+            env=IdentityDiagnosticProposalTests().env();env['ACTIONS_ID_TOKEN_REQUEST_URL']=url
+            opener=mock.Mock();opener.open.return_value=io.BytesIO(b'{"value":"inert"}')
+            output=io.StringIO()
+            with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                    mock.patch.object(ci,'_verify_jwt',return_value=IdentityTests().claims()), \
+                    mock.patch.object(ci.time,'time',return_value=1000),contextlib.redirect_stderr(output):
+                identity,_=ci._authenticated_identity(env)
+            self.assertEqual(identity,{'run_id':'1234','sha':'a'*40,'attempt':'1'})
+            request=opener.open.call_args.args[0];address=ci.urlsplit(request.full_url)
+            self.assertEqual(address.path,'/synthetic/'+PAYLOAD)
+            self.assertEqual(dict(ci.parse_qsl(address.query)),{'keep':'one','dup':'2','audience':ci.AUDIENCE})
+            self.assertEqual(address.fragment,'');self.assertEqual(output.getvalue(),'')
+            self.assertTrue(all(ci._request_url_checks(url).values()))
+
+    def test_each_rejected_origin_predicate_is_distinguished_without_network(self):
+        cases=[('http://vstoken.actions.githubusercontent.com/','scheme_allowed'),
+               ('https://untrusted.invalid/','hostname_allowed'),
+               ('https://'+PAYLOAD+'@vstoken.actions.githubusercontent.com/','username_allowed'),
+               ('https://:'+PAYLOAD+'@vstoken.actions.githubusercontent.com/','password_allowed'),
+               ('https://vstoken.actions.githubusercontent.com:8443/','port_allowed')]
+        for url,field in cases:
+            with self.subTest(field=field):
+                flags=self.refused(url+'?opaque='+PAYLOAD)
+                self.assertTrue(flags['url_parsed']);self.assertFalse(flags[field])
+                for key in ('scheme_allowed','hostname_allowed','username_allowed','password_allowed','port_allowed'):
+                    if key!=field:self.assertTrue(flags[key])
+
+    def test_malformed_urls_distinguish_split_and_port_failures(self):
+        flags=self.refused('https://['+PAYLOAD)
+        self.assertFalse(flags['url_parsed']);self.assertFalse(any(flags.values()))
+        for port in (PAYLOAD,'65536','-1'):
+            flags=self.refused('https://vstoken.actions.githubusercontent.com:'+port+'/')
+            self.assertTrue(flags['url_parsed']);self.assertTrue(flags['hostname_allowed'])
+            self.assertFalse(flags['port_parsed']);self.assertFalse(flags['port_allowed'])
+            self.assertTrue(flags['url_built'])
+
+    def test_query_and_url_construction_exceptions_are_sanitized(self):
+        for name,field in (('parse_qsl','query_parsed'),('urlencode','audience_query_built'),('urlunsplit','url_built')):
+            with self.subTest(operation=name),mock.patch.object(ci,name,side_effect=ValueError(PAYLOAD)):
+                flags=self.refused('https://vstoken.actions.githubusercontent.com/'+PAYLOAD+'?opaque='+PAYLOAD)
+                self.assertTrue(flags['port_allowed']);self.assertFalse(flags[field])
+
+    def test_missing_url_has_boolean_only_unassessed_checks(self):
+        event=IdentityDiagnosticProposalTests().failure('request_url',env={
+            'GITHUB_ACTIONS':'true','GITHUB_SHA':'a'*40,'BR02_CI_APPROVED_SHA':'a'*40})
+        self.assertEqual(event['reason'],'missing_field')
+        self.assertEqual(set(event['url_checks']),self.fields)
+        self.assertTrue(all(type(v) is bool for v in event['url_checks'].values()))
+        self.assertFalse(any(event['url_checks'].values()))
+
+    def test_failed_diagnostic_observation_or_sink_does_not_change_refusal(self):
+        env=IdentityDiagnosticProposalTests().env();env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://untrusted.invalid/'+PAYLOAD
+        for owner,name in ((ci,'_request_url_checks'),(sys.modules['builtins'],'print')):
+            with self.subTest(operation=name),mock.patch.object(owner,name,side_effect=ValueError(PAYLOAD)):
+                with self.assertRaises(ci.CIDenied) as caught:ci.authenticate(env)
+                self.assertEqual(str(caught.exception),'BR02_CI_IDENTITY')
+                self.assertFalse(ci.active())
 
 
 def setUpModule():

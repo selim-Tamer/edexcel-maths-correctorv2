@@ -66,7 +66,39 @@ def validate_claims(claims, expected, now):
     return {'run_id':run,'sha':sha,'attempt':'1'}
 
 
-def _identity_diagnostic(stage, error=None, claims=None, expected=None):
+def _request_url_checks(value):
+    """Failure-only observations; never authorize or return URL components.
+
+    False also means unevaluated when its prerequisite parse/build failed.
+    """
+    checks=dict.fromkeys(('url_parsed','scheme_allowed','hostname_allowed',
+        'username_allowed','password_allowed','port_parsed','port_allowed',
+        'query_parsed','audience_query_built','url_built'),False)
+    if type(value) is not str: return checks
+    try:
+        address=urlsplit(value)
+        checks['url_parsed']=True
+        checks['scheme_allowed']=address.scheme=='https'
+        checks['hostname_allowed']=address.hostname=='vstoken.actions.githubusercontent.com'
+        checks['username_allowed']=not bool(address.username)
+        checks['password_allowed']=not bool(address.password)
+    except Exception: return checks
+    try:
+        port=address.port
+        checks['port_parsed']=True
+        checks['port_allowed']=port in (None,443)
+    except Exception: pass
+    try:
+        query=dict(parse_qsl(address.query)); checks['query_parsed']=True
+        query['audience']=AUDIENCE
+        encoded=urlencode(query); checks['audience_query_built']=True
+        urlunsplit((address.scheme,address.netloc,address.path,encoded,''))
+        checks['url_built']=True
+    except Exception: pass
+    return checks
+
+
+def _identity_diagnostic(stage, error=None, claims=None, expected=None, request_url=None):
     # Fixed vocabulary only: never stringify exceptions, tokens or claims.
     allowed={'environment','request_url','request_environment','token_acquisition',
              'token_response','jwt_verification','claim_binding'}
@@ -90,6 +122,7 @@ def _identity_diagnostic(stage, error=None, claims=None, expected=None):
     # This mirrors policy for diagnostics only and cannot affect issuance.
     try:
         event={'stage':stage,'reason':reason}
+        if stage=='request_url': event['url_checks']=_request_url_checks(request_url)
         if stage=='claim_binding' and type(claims) is dict and type(expected) is dict:
             fixed={'iss':ISSUER,'aud':AUDIENCE,'repository':REPOSITORY,'repository_id':REPOSITORY_ID,
                    'repository_owner_id':OWNER_ID,'actor_id':OWNER_ID,'event_name':'workflow_dispatch',
@@ -111,11 +144,12 @@ def _identity_diagnostic(stage, error=None, claims=None, expected=None):
 
 
 def _authenticated_identity(environ):
-    stage='environment'; claims=None; expected=None
+    stage='environment'; claims=None; expected=None; request_url=None
     try:
         if environ.get('GITHUB_ACTIONS') != 'true' or environ.get('BR02_CI_APPROVED_SHA') != environ.get('GITHUB_SHA'): deny('identity')
         stage='request_url'
-        address = urlsplit(environ['ACTIONS_ID_TOKEN_REQUEST_URL'])
+        request_url=environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+        address = urlsplit(request_url)
         if address.scheme != 'https' or address.hostname != 'vstoken.actions.githubusercontent.com' \
                 or address.username or address.password or address.port not in (None,443): deny('identity')
         query = dict(parse_qsl(address.query)); query['audience'] = AUDIENCE
@@ -138,10 +172,10 @@ def _authenticated_identity(environ):
         identity=validate_claims(claims, expected, time.time())
         return identity,claims['jti']
     except CIDenied as error:
-        _identity_diagnostic(stage,error,claims,expected)
+        _identity_diagnostic(stage,error,claims,expected,request_url)
         raise
     except Exception as error:
-        _identity_diagnostic(stage,error,claims,expected)
+        _identity_diagnostic(stage,error,claims,expected,request_url)
         raise CIDenied('identity') from None
 
 
