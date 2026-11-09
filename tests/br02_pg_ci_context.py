@@ -66,26 +66,83 @@ def validate_claims(claims, expected, now):
     return {'run_id':run,'sha':sha,'attempt':'1'}
 
 
+def _identity_diagnostic(stage, error=None, claims=None, expected=None):
+    # Fixed vocabulary only: never stringify exceptions, tokens or claims.
+    allowed={'environment','request_url','request_environment','token_acquisition',
+             'token_response','jwt_verification','claim_binding'}
+    if stage not in allowed: stage='environment'
+    reason='refused'
+    if stage=='jwt_verification':
+        try:
+            import jwt
+            for kind,label in ((jwt.InvalidAudienceError,'audience'),
+                               (jwt.InvalidIssuerError,'issuer'),
+                               (jwt.InvalidSignatureError,'signature'),
+                               (jwt.MissingRequiredClaimError,'missing_claim'),
+                               (jwt.ExpiredSignatureError,'expired'),
+                               (jwt.ImmatureSignatureError,'not_yet_valid'),
+                               (jwt.PyJWKClientError,'signing_key'),
+                               (jwt.InvalidTokenError,'invalid_token')):
+                if isinstance(error,kind): reason=label;break
+        except Exception: reason='verification_unavailable'
+    elif isinstance(error,KeyError): reason='missing_field'
+    # Only equality/shape booleans for verified claims, never observed values.
+    # This mirrors policy for diagnostics only and cannot affect issuance.
+    try:
+        event={'stage':stage,'reason':reason}
+        if stage=='claim_binding' and type(claims) is dict and type(expected) is dict:
+            fixed={'iss':ISSUER,'aud':AUDIENCE,'repository':REPOSITORY,'repository_id':REPOSITORY_ID,
+                   'repository_owner_id':OWNER_ID,'actor_id':OWNER_ID,'event_name':'workflow_dispatch',
+                   'ref':REF,'workflow_ref':WORKFLOW,'runner_environment':'github-hosted',
+                   'run_attempt':'1','repository_visibility':'public'}
+            checks={key:claims.get(key)==value for key,value in fixed.items()}
+            checks.update(sha_matches_environment=claims.get('sha')==expected.get('sha'),
+                          run_id_matches_environment=claims.get('run_id')==expected.get('run_id'),
+                          workflow_sha_matches_sha=claims.get('workflow_sha')==claims.get('sha'),
+                          sha_shape=type(claims.get('sha')) is str and re.fullmatch('[0-9a-f]{40}',claims['sha']) is not None,
+                          run_id_shape=type(claims.get('run_id')) is str and claims['run_id'].isascii() and claims['run_id'].isdigit(),
+                          timestamp_types=all(type(claims.get(k)) is int for k in ('exp','iat','nbf')),
+                          jti_present=type(claims.get('jti')) is str and bool(claims['jti']))
+            event['checks']=checks
+            if isinstance(error,CIDenied) and error.code=='expired':event['reason']='expired'
+        import sys
+        print('BR02_CI_IDENTITY_DIAGNOSTIC '+json.dumps(event,sort_keys=True),file=sys.stderr)
+    except Exception: pass  # A failed log sink never changes refusal.
+
+
 def _authenticated_identity(environ):
+    stage='environment'; claims=None; expected=None
     try:
         if environ.get('GITHUB_ACTIONS') != 'true' or environ.get('BR02_CI_APPROVED_SHA') != environ.get('GITHUB_SHA'): deny('identity')
+        stage='request_url'
         address = urlsplit(environ['ACTIONS_ID_TOKEN_REQUEST_URL'])
         if address.scheme != 'https' or address.hostname != 'vstoken.actions.githubusercontent.com' \
                 or address.username or address.password or address.port not in (None,443): deny('identity')
         query = dict(parse_qsl(address.query)); query['audience'] = AUDIENCE
         url = urlunsplit((address.scheme,address.netloc,address.path,urlencode(query),''))
+        stage='request_environment'
         request = urllib.request.Request(url, headers={'Authorization':'Bearer '+environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self,*args,**kwargs): deny('identity')
+        stage='token_acquisition'
         opener=urllib.request.build_opener(NoRedirect())
         with opener.open(request, timeout=10) as response:
             raw = response.read(32769)
+        stage='token_response'
         if len(raw)>32768: deny('identity')
-        claims = _verify_jwt(json.loads(raw)['value'])
-        identity=validate_claims(claims, {'run_id':environ['GITHUB_RUN_ID'],'sha':environ['GITHUB_SHA']}, time.time())
+        token=json.loads(raw)['value']
+        stage='jwt_verification'
+        claims = _verify_jwt(token)
+        stage='claim_binding'
+        expected={'run_id':environ['GITHUB_RUN_ID'],'sha':environ['GITHUB_SHA']}
+        identity=validate_claims(claims, expected, time.time())
         return identity,claims['jti']
-    except CIDenied: raise
-    except Exception: raise CIDenied('identity') from None
+    except CIDenied as error:
+        _identity_diagnostic(stage,error,claims,expected)
+        raise
+    except Exception as error:
+        _identity_diagnostic(stage,error,claims,expected)
+        raise CIDenied('identity') from None
 
 
 def validate_target(info, identity):

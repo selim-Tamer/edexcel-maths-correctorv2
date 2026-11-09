@@ -477,6 +477,81 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(calls[-2:], [('/usr/sbin/iptables','-F','BR02_1234'),('/usr/sbin/iptables','-X','BR02_1234')])
 
 
+class IdentityDiagnosticProposalTests(unittest.TestCase):
+    def env(self):
+        return {'GITHUB_ACTIONS':'true','GITHUB_SHA':'a'*40,'BR02_CI_APPROVED_SHA':'a'*40,
+                'GITHUB_RUN_ID':'1234','ACTIONS_ID_TOKEN_REQUEST_URL':'https://vstoken.actions.githubusercontent.com/inert',
+                'ACTIONS_ID_TOKEN_REQUEST_TOKEN':PAYLOAD}
+
+    def failure(self,stage,*,env=None,raw=b'{"value":"synthetic.jwt.token"}',claims=None,error=None):
+        opener=mock.Mock();opener.open.return_value=io.BytesIO(raw)
+        if stage=='token_acquisition':opener.open.side_effect=OSError(PAYLOAD)
+        value=IdentityTests().claims() if claims is None else claims
+        output=io.StringIO()
+        with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                mock.patch.object(ci,'_verify_jwt',side_effect=error,return_value=value), \
+                mock.patch.object(ci.time,'time',return_value=1000),contextlib.redirect_stderr(output):
+            with self.assertRaises(ci.CIDenied) as caught:ci._authenticated_identity(self.env() if env is None else env)
+        event=json.loads(output.getvalue().split('BR02_CI_IDENTITY_DIAGNOSTIC ',1)[1])
+        self.assertEqual(event['stage'],stage)
+        self.assertEqual(set(event),{'stage','reason','checks'} if stage=='claim_binding' else {'stage','reason'})
+        self.assertNotIn(PAYLOAD,output.getvalue()+str(caught.exception))
+        self.assertNotIn('synthetic.jwt.token',output.getvalue())
+        self.assertFalse(ci.active())
+        return event
+
+    def test_environment_and_missing_request_values_are_distinguished(self):
+        env=self.env();env['GITHUB_ACTIONS']='false';self.failure('environment',env=env)
+        for field,stage in [('ACTIONS_ID_TOKEN_REQUEST_URL','request_url'),('ACTIONS_ID_TOKEN_REQUEST_TOKEN','request_environment')]:
+            env=self.env();env.pop(field);self.assertEqual(self.failure(stage,env=env)['reason'],'missing_field')
+
+    def test_untrusted_origin_and_transport_failure_remain_refused(self):
+        env=self.env();env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://untrusted.invalid/?secret='+PAYLOAD
+        self.failure('request_url',env=env);self.failure('token_acquisition')
+
+    def test_malformed_response_never_reaches_claim_binding(self):
+        for raw in (b'not-json',b'{}',b'X'*32769):
+            with self.subTest(raw_length=len(raw)):self.failure('token_response',raw=raw)
+
+    def test_signature_issuer_audience_and_malformed_jwt_are_distinct(self):
+        import jwt
+        for kind,label in [(jwt.InvalidSignatureError,'signature'),(jwt.InvalidIssuerError,'issuer'),
+                           (jwt.InvalidAudienceError,'audience'),(jwt.DecodeError,'invalid_token'),
+                           (jwt.PyJWKClientError,'signing_key')]:
+            with self.subTest(reason=label):
+                self.assertEqual(self.failure('jwt_verification',error=kind(PAYLOAD))['reason'],label)
+
+    def test_every_bound_identity_mismatch_still_rejects(self):
+        for field in ('repository','repository_id','repository_owner_id','actor_id','event_name','ref',
+                      'workflow_ref','workflow_sha','sha','run_id','run_attempt','runner_environment','repository_visibility'):
+            value=IdentityTests().claims();value[field]=PAYLOAD
+            with self.subTest(field=field):
+                event=self.failure('claim_binding',claims=value)
+                self.assertTrue(any(flag is False for flag in event['checks'].values()))
+
+    def test_registration_commit_cannot_replace_feature_workflow_identity(self):
+        value=IdentityTests().claims();value['workflow_sha']='dde3979b0c20657263f5d07f9bebcd6cffbaae67'
+        self.failure('claim_binding',claims=value)
+        value=IdentityTests().claims();value['workflow_ref']=ci.REPOSITORY+'/.github/workflows/br02-postgres-integration.yml@refs/heads/main'
+        self.failure('claim_binding',claims=value)
+
+    def test_valid_feature_identity_has_no_diagnostic_and_same_return(self):
+        opener=mock.Mock();opener.open.return_value=io.BytesIO(b'{"value":"synthetic.jwt.token"}')
+        output=io.StringIO();claims=IdentityTests().claims()
+        with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                mock.patch.object(ci,'_verify_jwt',return_value=claims), \
+                mock.patch.object(ci.time,'time',return_value=1000),contextlib.redirect_stderr(output):
+            identity,jti=ci._authenticated_identity(self.env())
+        self.assertEqual(identity,{'run_id':'1234','sha':'a'*40,'attempt':'1'})
+        self.assertEqual(jti,'inert-jti');self.assertEqual(output.getvalue(),'')
+
+    def test_diagnostic_sink_failure_does_not_issue_authority(self):
+        env=self.env();env['GITHUB_ACTIONS']='false'
+        with mock.patch('builtins.print',side_effect=OSError(PAYLOAD)):
+            with self.assertRaises(ci.CIDenied):ci.authenticate(env)
+        self.assertFalse(ci.active())
+
+
 def setUpModule():
     global ci,runner,target
     ci=importlib.import_module('tests.br02_pg_ci_context')
