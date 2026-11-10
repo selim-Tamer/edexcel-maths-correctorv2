@@ -26,4 +26,4 @@ PyJWT[crypto]==2.15.1
 # driver. Test/CI-only for now - no API deployment is authorized, so it stays
 # out of requirements.txt; the CI postgres-tests service container is the
 # authoritative integration run (local runs skip without a DSN).
-psycopg[binary]==3.3.6
+psycopg[binary]==3.3.8
