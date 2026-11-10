@@ -297,6 +297,82 @@ class DeleteDocumentTests(unittest.TestCase):
             [s for s in connection.statements if s[0] == "DELETE"], [],
             "purge must not delete the metadata row")
 
+    def test_the_tombstone_commits_before_the_object_delete_starts(self):
+        # IR's stronger ordering (finding C): row locks are never held
+        # across the Storage network call. Proof: when the object DELETE is
+        # issued, the tombstone UPDATE is already in the statement log. A
+        # crash from that point on leaves tombstone + orphan, which the
+        # sweep reclaims and put_document's tombstone-revive accepts.
+        connection = _FakeConnection(
+            answers=[(storage_key("school-a", "o", DIGEST),)])
+        seen = {}
+
+        def transport(method, url, headers, body):
+            seen["statements_at_delete"] = list(connection.statements)
+            return 200, b""
+
+        store = make_store(transport, connection)
+        removed = supabase_document_store.delete_document(
+            store, tenant_id="school-a", owner="o", document_digest=DIGEST)
+        self.assertTrue(removed)
+        verbs = [s[0] for s in seen["statements_at_delete"]]
+        self.assertIn(
+            "UPDATE", verbs,
+            "the tombstone must be committed before the Storage call")
+
+    def test_the_object_delete_targets_the_recomputed_key(self):
+        # The post-commit DELETE never trusts a stored key: it is recomputed
+        # from (tenant, owner, digest), so a corrupted row value cannot
+        # redirect the purge at another object and no row read is needed.
+        connection = _FakeConnection(answers=[("objects/wrong-key",)])
+        seen = {}
+
+        def transport(method, url, headers, body):
+            seen["url"] = url
+            return 204, b""
+
+        store = make_store(transport, connection)
+        self.assertTrue(supabase_document_store.delete_document(
+            store, tenant_id="school-a", owner="o", document_digest=DIGEST))
+        self.assertTrue(
+            seen["url"].endswith(storage_key("school-a", "o", DIGEST)),
+            "the DELETE must use the deterministically recomputed key")
+
+    def test_a_storage_failure_after_commit_is_sweep_cleanable(self):
+        # IR ruling: after the tombstone commits, a Storage failure (network,
+        # 5xx) must NOT surface as an error - the purge's authoritative
+        # effect already happened; the orphan object is the sweep's to
+        # reclaim and a re-upload revives the tombstone.
+        def failing(method, url, headers, body):
+            raise DocumentStoreError("store_unusable")
+
+        connection = _FakeConnection(
+            answers=[(storage_key("school-a", "o", DIGEST),)])
+        store = make_store(failing, connection)
+        removed = supabase_document_store.delete_document(
+            store, tenant_id="school-a", owner="o", document_digest=DIGEST)
+        self.assertTrue(removed,
+                        "the committed tombstone is the authoritative effect")
+        updates = [s for s in connection.statements if s[0] == "UPDATE"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(
+            [s for s in connection.statements if s[0] == "DELETE"], [],
+            "purge must not delete the metadata row")
+
+    def test_any_terminal_storage_status_still_counts_as_tombstoned(self):
+        # 200/204 removed the object; 404 counts as already-deleted; a 5xx
+        # leaves a sweep-cleanable orphan. In every case the committed
+        # tombstone is what the call reports.
+        for status in (200, 204, 404, 500):
+            with self.subTest(status=status):
+                connection = _FakeConnection(
+                    answers=[(storage_key("school-a", "o", DIGEST),)])
+                store = make_store(_RecordingTransport(status=status),
+                                   connection)
+                self.assertTrue(supabase_document_store.delete_document(
+                    store, tenant_id="school-a", owner="o",
+                    document_digest=DIGEST))
+
     def test_purge_is_idempotent(self):
         transport = _RecordingTransport()
         # storage_key '' means "already purged": no object call, no rewrite.
