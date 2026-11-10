@@ -1185,6 +1185,201 @@ class IntegrationLifecycleRegressionTests(unittest.TestCase):
         self.assertTrue(all(c.info.transaction_status==TransactionStatus.IDLE for c in connections))
 
 
+class RemainingIntegrationRegressionTests(unittest.TestCase):
+    """Real fixture/caller paths over inert boundaries, never live PG proof."""
+
+    def test_decision_fixtures_preserve_trusted_job_and_assignment_links(self):
+        from tests import test_br02_pg_api as live
+        import br02_pg_fixtures
+        class Captured(Exception): pass
+        for name in ('test_decisions_commit_saved_receipts_and_replay',
+                     'test_stale_revision_is_refused'):
+            case=live.ProductionApiLiveTests(name)
+            case.bundle=br02_pg_fixtures.build_bundle('offline-links')
+            store=mock.Mock();store.register_with_context.side_effect=Captured
+            case.fixture_store=lambda:store
+            with self.assertRaises(Captured):getattr(case,name)()
+            args=store.register_with_context.call_args.kwargs
+            self.assertEqual(args.get('job_id'),case.bundle.job_id)
+            self.assertEqual(args.get('assignment_id'),case.bundle.assignment_id)
+            store.close.assert_called_once()
+
+    def test_authentication_fixture_really_uses_an_invalid_token(self):
+        from tests import test_br02_pg_api as live
+        import br02_pg_fixtures,auth_oidc
+        class Captured(Exception): pass
+        case=live.ProductionApiLiveTests('test_authentication_precedes_idempotent_replay')
+        case.bundle=br02_pg_fixtures.build_bundle('offline-auth')
+        case.fixture_store=lambda:mock.Mock();case.production_app=lambda:None
+        client=mock.MagicMock();client.__enter__.return_value=client
+        client.post.side_effect=Captured;case._client=lambda app:client
+        with self.assertRaises(Captured):case.test_authentication_precedes_idempotent_replay()
+        header=client.post.call_args.kwargs['headers']['Authorization']
+        with self.assertRaises(auth_oidc.OidcError):
+            live._synthetic_api_verify_token(header.split(' ',1)[1])
+        # A valid but nonmember subject must remain a membership refusal.
+        self.assertEqual(live._synthetic_api_verify_token('synthetic-subject:nope'),'nope')
+
+
+
+    def test_transaction_boundary_maps_driver_errors_and_preserves_python_faults(self):
+        import postgres_store,audit_store,psycopg
+        from psycopg.pq import TransactionStatus
+        from contextlib import nullcontext
+        connection=SimpleNamespace(info=SimpleNamespace(transaction_status=TransactionStatus.IDLE),
+            transaction=lambda:nullcontext(),execute=lambda *a:SimpleNamespace(fetchone=lambda:('1',)))
+        store=postgres_store.PostgresAuditStore(connection,tenant_id='offline-tenant')
+        for error in (psycopg.OperationalError(PAYLOAD),RuntimeError(PAYLOAD),audit_store.AuditStoreError('injected','fixed')):
+            with mock.patch.object(connection,'execute',side_effect=error):
+                with self.assertRaises(audit_store.AuditStoreError if isinstance(error,psycopg.Error) else type(error)) as caught:
+                    with store._transaction():self.fail('unreachable')
+            if isinstance(error,psycopg.Error):
+                self.assertEqual(caught.exception.code,'store_unusable')
+                self.assertIs(caught.exception.__cause__,error)
+                self.assertNotIn(PAYLOAD,str(caught.exception))
+            else:self.assertIs(caught.exception,error)
+
+    def test_child_failure_stages_are_fixed_and_fail_closed(self):
+        from tests import br02_pg_api_child as child
+        import runtime_config
+        previous=ci._current.get()
+        env={runtime_config.RUNTIME_ENV:'production',runtime_config.PG_DSN_ENV:'inert-app'}
+        try:
+            with child_native(child_payload()):ci.adopt_child(child_env())
+            for failing,code in (('guard',70),('application',71),('server_import',72),('server_run',73),('server_exit',73)):
+                app=mock.Mock(side_effect=ValueError(PAYLOAD) if failing=='application' else None)
+                server=SimpleNamespace(run=mock.Mock(side_effect=SystemExit(1) if failing=='server_exit' else ValueError(PAYLOAD) if failing=='server_run' else None))
+                with mock.patch.dict(os.environ,env,clear=True), \
+                        mock.patch.object(child,'install_child_loopback_only_block',side_effect=ValueError(PAYLOAD) if failing=='guard' else None), \
+                        mock.patch.object(child,'build_child_application',app), \
+                        mock.patch.dict(sys.modules,{'uvicorn':None if failing=='server_import' else server}):
+                    self.assertEqual(child.child_main(['--serve','--port','8123']),code)
+        finally:ci._current.set(previous)
+        # No context still refuses before app or server machinery.
+        with mock.patch.object(child,'build_child_application') as app,contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(child.child_main(['--serve','--port','8123']),3)
+            app.assert_not_called()
+
+    def test_child_exit_diagnostics_never_serialize_unapproved_attributes(self):
+        from tests import br02_pg_api_child as child
+        test=unittest.FunctionTestCase(lambda:None)
+        for stage in (*child.CHILD_FAILURE_STAGES.values(),'child_ready',PAYLOAD):
+            result=runner.StrictResult();failure=child._child_failure(stage)
+            result.addError(test,(RuntimeError,failure,None))
+            detail=result.diagnostics[0]
+            self.assertNotIn(PAYLOAD,json.dumps(detail))
+            self.assertEqual('child_stage' in detail,stage!=PAYLOAD)
+            self.assertFalse(result.passed([test.id()]))
+
+    def test_child_parent_reports_fixed_exit_stage_and_closes_capability_transport(self):
+        from tests import br02_pg_api_child as child
+        import socket,subprocess
+        for code,stage in (*child.CHILD_FAILURE_STAGES.items(),(255,'child_ready')):
+            process=mock.Mock(returncode=code);process.poll.return_value=code
+            probe=mock.Mock();probe.getsockname.return_value=('127.0.0.1',8123)
+            stream=mock.Mock();stream.fileno.return_value=17
+            with issued_context() as context, \
+                    mock.patch.object(socket,'socket',return_value=probe), \
+                    mock.patch.object(ci,'child_transport',return_value=(stream,{'BR02_CI_FD':'17'})), \
+                    mock.patch.object(subprocess,'Popen',return_value=process) as spawn:
+                with self.assertRaises(RuntimeError) as caught:
+                    child.run_child_server(context.approval)
+                self.assertEqual(caught.exception.br02_child_stage,stage)
+                self.assertNotIn(PAYLOAD,str(caught.exception))
+                self.assertEqual(spawn.call_args.kwargs['pass_fds'],(17,))
+                self.assertEqual(spawn.call_args.kwargs['stderr'],subprocess.DEVNULL)
+                stream.close.assert_called_once();probe.close.assert_called_once()
+                process.terminate.assert_not_called()
+
+    def test_partial_child_start_failure_reaps_previously_started_child(self):
+        from tests import test_br02_pg_processes as live
+        first=mock.Mock(pid=1234)
+        case=live.ChildProcessLiveTests('test_concurrent_http_competition_across_independent_pids')
+        case.approval=object();case.register_original=lambda:None
+        failure=RuntimeError(PAYLOAD)
+        with mock.patch.object(live.api_child,'run_child_server',side_effect=[first,failure]):
+            with self.assertRaises(RuntimeError) as caught:
+                case.test_concurrent_http_competition_across_independent_pids()
+        self.assertIs(caught.exception,failure)
+        first.stop.assert_called_once()
+
+    def test_direct_event_fixtures_round_trip_strict_evidence_decoder(self):
+        from tests import test_br02_pg_transactions as transactions
+        from tests import test_postgres_api_pg_contract as adapter
+        import br02_pg_fixtures,audit_store
+        bundle=br02_pg_fixtures.build_bundle('offline-evidence')
+        case=transactions.FaultStageTransactionTests('test_fault_after_event_insert_rolls_back_the_event')
+        case.bundle=bundle
+        event,_=case.correction_event()
+        captured=[]
+        class Captured(Exception): pass
+        other=adapter.PostgresStoreAdapterLiveContractTests('test_idempotent_commit_correction_replays_saved_receipt')
+        other.bundle=bundle;store=mock.Mock()
+        def commit(**kwargs):captured.append(kwargs['event']);raise Captured
+        store.commit_correction.side_effect=commit;other.fixture_store=lambda:store
+        with self.assertRaises(Captured):other.test_idempotent_commit_correction_replays_saved_receipt()
+        for event in (event,*captured):
+            fields=audit_store._event_fields(event)
+            row=(1,'evt','key','digest',fields['event_type'],'1','correct','corrected',
+                 '2','3','rework',0,1,None,bundle.canonical_owner,'',
+                 json.dumps(fields['authorization_evidence']),'0')
+            decoded=audit_store._row_to_event(row)
+            self.assertEqual(set(decoded['authorization_evidence']),set(audit_store.EVIDENCE_FIELDS))
+        # Do not make the reader accept absent/tampered evidence.
+        bad=list(row);bad[-2]='{}'
+        with self.assertRaises(audit_store.AuditStoreError):audit_store._row_to_event(bad)
+
+    def test_interruption_proxy_delegates_status_and_owned_close(self):
+        from tests import test_br02_pg_transactions as live
+        from tests.test_br02_pg_registration import _RegistrationConnection
+        import br02_pg_fixtures
+        connection=_RegistrationConnection();connection.closed=False
+        connection.close=lambda:setattr(connection,'closed',True)
+        case=live.FaultStageTransactionTests('test_own_connection_interruption_is_reaped_and_replaced')
+        case.bundle=br02_pg_fixtures.build_bundle('offline-proxy');case.dsn='inert'
+        case.register_original=lambda:None
+        case.store=lambda:SimpleNamespace(snapshot=lambda **kw:{'result_revision':0,'events':[]},close=lambda:None)
+        with mock.patch.object(live.psycopg,'connect',return_value=connection):
+            case.test_own_connection_interruption_is_reaped_and_replaced()
+        self.assertTrue(connection.closed)
+
+    def test_role_probe_uses_an_existing_privileged_role(self):
+        from tests import test_br02_pg_rls_grants as live
+        import psycopg
+        runtime=mock.Mock();admin=mock.Mock()
+        def execute(sql,params=None):
+            text=sql.as_string() if hasattr(sql,'as_string') else sql
+            if text.lower().startswith('set role'):
+                if 'postgres' in text:raise psycopg.errors.UndefinedObject('inert missing role')
+                raise psycopg.errors.InsufficientPrivilege('inert denied')
+            raise psycopg.errors.InsufficientPrivilege('inert denied')
+        runtime.execute.side_effect=execute
+        admin.execute.return_value=SimpleNamespace(fetchone=lambda:('br02_bootstrap',),
+            fetchall=lambda:[('marker_app',False,False,False,False,False),('marker_worker',False,False,False,False,False)])
+        # Return a scalar count for the existing inherited-edge assertion.
+        def admin_execute(sql,params=None):
+            if 'count(*)' in sql:return SimpleNamespace(fetchone=lambda:(0,))
+            return admin.execute.return_value
+        admin.execute.side_effect=admin_execute
+        case=live.RlsFailClosedTests('test_runtime_roles_hold_no_elevation_on_their_own_login')
+        case.conn=admin;case.app_connection=runtime
+        case.test_runtime_roles_hold_no_elevation_on_their_own_login()
+
+    def test_acl_snapshot_does_not_construct_zero_dimensional_acl_arrays(self):
+        from tests import test_br02_pg_rls_grants as live
+        import psycopg
+        seen=[]
+        def execute(sql,params=None):
+            seen.append(sql)
+            if 'ARRAY[]::pg_catalog.aclitem[]' in sql:
+                # PostgreSQL 17 check_acl rejects ARR_NDIM != 1.
+                raise psycopg.errors.InvalidParameterValue('inert ACL dimensionality')
+            return SimpleNamespace(fetchone=lambda:(False,),fetchall=lambda:[])
+        report=live._runtime_privilege_snapshot(SimpleNamespace(execute=execute))
+        self.assertIn('column_acls',report)
+        self.assertEqual(sum('aclexplode' in sql for sql in seen),4)
+
+
 def setUpModule():
     global ci,runner,target
     ci=importlib.import_module('tests.br02_pg_ci_context')

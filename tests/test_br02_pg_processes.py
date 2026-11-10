@@ -358,9 +358,11 @@ class ChildProcessLiveTests(_LiveProcessesBase):
 
     def test_concurrent_http_competition_across_independent_pids(self):
         self.register_original()
-        children = [api_child.run_child_server(self.approval)
-                    for _ in range(2)]
+        children = []
         try:
+            # Own the first child even if constructing the second one fails.
+            for _ in range(2):
+                children.append(api_child.run_child_server(self.approval))
             self.assertNotEqual(children[0].pid, children[1].pid)
             path = f"/v1/results/{self.bundle.result_id}/decisions"
             barrier = threading.Barrier(4, timeout=60)

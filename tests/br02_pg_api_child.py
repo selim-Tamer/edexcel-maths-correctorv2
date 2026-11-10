@@ -84,6 +84,18 @@ CHILD_ENV_ALLOWLIST = (
 # Controlled values the child always receives regardless of the parent.
 CHILD_ENGINE_REAL = "0"  # engine disabled: no external engine calls
 
+# Failure-only CLI codes; the parent serializes only these fixed stage names.
+# No stderr, arbitrary exception strings, environment or credentials cross.
+CHILD_FAILURE_STAGES = {3: 'child_authorization', 70: 'child_network_guard',
+                        71: 'child_application', 72: 'child_server_import',
+                        73: 'child_server_run'}
+
+
+def _child_failure(stage):
+    failure = RuntimeError('BR02 child exited before readiness')
+    failure.br02_child_stage = stage
+    return failure
+
 
 def _loopback(host: str) -> bool:
     host = (host or "").strip("[]").lower()
@@ -304,18 +316,30 @@ def child_main(argv=None) -> int:
         parser.print_usage(sys.stderr)
         return 2
 
-    install_child_loopback_only_block()
+    try:
+        install_child_loopback_only_block()
+    except Exception:
+        return 70
     import os
 
     environ = dict(os.environ)
     environ["BR02_CHILD_PORT"] = str(args.port)
     approval = ci._current.get().approval if ci.active() else None
-    app = build_child_application(environ, approval=approval)
+    try:
+        app = build_child_application(environ, approval=approval)
+    except Exception:
+        return 71
 
-    import uvicorn  # delayed behind the gate
+    try:
+        import uvicorn  # delayed behind the gate
+    except Exception:
+        return 72
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port,
-                log_level="warning", access_log=False)
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=args.port,
+                    log_level="warning", access_log=False)
+    except (Exception, SystemExit):
+        return 73
     return 0
 
 
@@ -415,8 +439,8 @@ def run_child_server(approval, *, ready_timeout_seconds: float = 15.0,
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(
-                    "BR02 child exited before readiness")
+                raise _child_failure(CHILD_FAILURE_STAGES.get(
+                    process.returncode, 'child_ready'))
             try:
                 status, _headers, _body = handle.request(
                     "GET", "/v1/healthz", timeout=1.0)

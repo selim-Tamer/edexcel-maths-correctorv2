@@ -84,8 +84,9 @@ def _runtime_privilege_snapshot(connection):
 
     PUBLIC is never passed to has_*_privilege as a role argument: PUBLIC is
     not a role. Its grants are read from the ACL inventory, where grantee OID
-    0 is rendered as the literal 'PUBLIC'. Empty ACL arrays are cast as
-    ``pg_catalog.aclitem[]`` (the aclexplode argument type), never ``acl``."""
+    0 is rendered as the literal 'PUBLIC'. NULL catalog ACLs yield no explicit
+    ACL rows; effective/default privileges are measured separately above.
+    Do not construct zero-dimensional ARRAY[] inputs to aclexplode."""
     snapshot = {"effective": [], "column_privileges": [],
                 "sequence_privileges": [], "table_acls": [],
                 "column_acls": [], "schema_acls": [], "sequence_acls": [],
@@ -127,8 +128,7 @@ def _runtime_privilege_snapshot(connection):
         "select cls.relname, coalesce(rol.rolname, 'PUBLIC'),"
         " acl.privilege_type"
         " from pg_class cls,"
-        " lateral aclexplode(coalesce(cls.relacl,"
-        " ARRAY[]::pg_catalog.aclitem[])) acl"
+        " lateral aclexplode(cls.relacl) acl"
         " left join pg_roles rol on rol.oid = acl.grantee"
         " where cls.relnamespace = 'public'::regnamespace"
         "   and cls.relkind in ('r', 'p')"
@@ -138,8 +138,7 @@ def _runtime_privilege_snapshot(connection):
         " coalesce(rol.rolname, 'PUBLIC'), acl.privilege_type"
         " from pg_attribute att"
         " join pg_class cls on cls.oid = att.attrelid,"
-        " lateral aclexplode(coalesce(att.attacl,"
-        " ARRAY[]::pg_catalog.aclitem[])) acl"
+        " lateral aclexplode(att.attacl) acl"
         " left join pg_roles rol on rol.oid = acl.grantee"
         " where cls.relnamespace = 'public'::regnamespace"
         "   and cls.relkind in ('r', 'p')"
@@ -149,8 +148,7 @@ def _runtime_privilege_snapshot(connection):
         "select nsp.nspname, coalesce(rol.rolname, 'PUBLIC'),"
         " acl.privilege_type"
         " from pg_namespace nsp,"
-        " lateral aclexplode(coalesce(nsp.nspacl,"
-        " ARRAY[]::pg_catalog.aclitem[])) acl"
+        " lateral aclexplode(nsp.nspacl) acl"
         " left join pg_roles rol on rol.oid = acl.grantee"
         " where nsp.nspname = 'public'"
         " order by 1, 2, 3").fetchall()]
@@ -158,8 +156,7 @@ def _runtime_privilege_snapshot(connection):
         "select cls.relname, coalesce(rol.rolname, 'PUBLIC'),"
         " acl.privilege_type"
         " from pg_class cls,"
-        " lateral aclexplode(coalesce(cls.relacl,"
-        " ARRAY[]::pg_catalog.aclitem[])) acl"
+        " lateral aclexplode(cls.relacl) acl"
         " left join pg_roles rol on rol.oid = acl.grantee"
         " where cls.relnamespace = 'public'::regnamespace"
         "   and cls.relkind = 'S'"
@@ -400,8 +397,16 @@ class RlsFailClosedTests(_LiveRlsBase):
     def test_runtime_roles_hold_no_elevation_on_their_own_login(self):
         # On the RESTRICTED login session (not an admin session, which keeps
         # SET ROLE authority and would make this probe vacuous):
+        # The approved image uses a named bootstrap superuser; a role named
+        # postgres need not exist. Probe a real elevated role, never count
+        # UndefinedObject as evidence that escalation was denied.
+        from psycopg import sql
+        privileged = self.conn.execute(
+            "select rolname from pg_roles where rolsuper order by rolname limit 1").fetchone()
+        self.assertIsNotNone(privileged)
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):
-            self.app_connection.execute("set role postgres")
+            self.app_connection.execute(
+                sql.SQL('set role {}').format(sql.Identifier(privileged[0])))
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):
             self.app_connection.execute(
                 "create table probe_elevation (id int)")

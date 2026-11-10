@@ -520,7 +520,11 @@ class PostgresStoreAdapterLiveContractTests(_LivePgBase):
         event = {"actor": self.bundle.canonical_owner,
                  "question_number": "1", "action": "correct",
                  "review_status": "corrected", "old_score": "2",
-                 "new_score": "3", "reason": "rework", "binding": ""}
+                 "new_score": "3", "reason": "rework", "binding": "",
+                 "authorization_evidence": {
+                     "scope": "manual", "actor": self.bundle.canonical_owner,
+                     "authorization_revision": self.bundle.document_digest,
+                     "row_revision": "", "verified_at": "1700000000"}}
         payload = {"question_number": "1", "action": "correct",
                    "review_status": "corrected", "old_score": "2",
                    "new_score": "3", "reason": "rework", "binding": ""}

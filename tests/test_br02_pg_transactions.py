@@ -102,6 +102,10 @@ class _DelegatingConnectionProxy:
     def closed(self):
         return self._connection.closed
 
+    @property
+    def info(self):
+        return self._connection.info
+
 
 class _LiveTransactionsBase(unittest.TestCase):
     """Live base: gate in setUpClass, one unique seeded bundle and one owned
@@ -172,7 +176,11 @@ class _LiveTransactionsBase(unittest.TestCase):
         return ({"actor": self.bundle.canonical_owner,
                  "question_number": question, "action": "correct",
                  "review_status": "corrected", "old_score": "2",
-                 "new_score": "3", "reason": reason, "binding": ""},
+                 "new_score": "3", "reason": reason, "binding": "",
+                 "authorization_evidence": {
+                     "scope": "manual", "actor": self.bundle.canonical_owner,
+                     "authorization_revision": self.bundle.document_digest,
+                     "row_revision": "", "verified_at": "1700000000"}},
                 {"question_number": question, "action": "correct",
                  "review_status": "corrected", "old_score": "2",
                  "new_score": "3", "reason": reason, "binding": ""})
@@ -317,7 +325,8 @@ class FaultStageTransactionTests(_LiveTransactionsBase):
         identity = __import__("identity_context").from_verified_subject(
             self.bundle.raw_subject, self.bundle.tenant_id)
         store = postgres_result_store.PostgresResultStore(
-            proxy, identity=identity, fresh_completion_denied=False)
+            proxy, identity=identity, owns_connection=True,
+            fresh_completion_denied=False)
         proxy.interrupted = True
         try:
             with self.assertRaises(audit_store.AuditStoreError):

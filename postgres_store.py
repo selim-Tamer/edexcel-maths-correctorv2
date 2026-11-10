@@ -160,6 +160,7 @@ class PostgresAuditStore:
 
     @contextmanager
     def _transaction(self):
+        from psycopg import Error as DatabaseError
         from psycopg.pq import TransactionStatus
 
         with self._lock:
@@ -171,10 +172,17 @@ class PostgresAuditStore:
                 # or roll back a caller-owned transaction to hide that error.
                 raise AuditStoreError("store_unusable",
                                       "store requires an idle dedicated connection")
-            with self._conn.transaction():
-                self._fault_point("begin")
-                _bind_tenant(self._conn, self.tenant_id)
-                yield
+            try:
+                with self._conn.transaction():
+                    self._fault_point("begin")
+                    _bind_tenant(self._conn, self.tenant_id)
+                    yield
+            except DatabaseError as error:
+                # Connection/bind/commit failures have the same store boundary
+                # as statement failures. Preserve the driver cause for trusted
+                # callers; never expose its potentially sensitive text.
+                raise AuditStoreError("store_unusable",
+                                      "database transaction failed") from error
 
     def close(self) -> None:
         if not self._closed:

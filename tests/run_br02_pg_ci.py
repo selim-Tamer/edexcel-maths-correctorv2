@@ -167,8 +167,18 @@ class StrictResult(unittest.TestResult):
         # IDs are emitted separately by the existing exact-inventory runner.
         # No dynamic name, message, path, locals, SQL or cause is serialized.
         if len(self.diagnostics)<100:
-            self.diagnostics.append({'outcome_index':len(self.outcomes)-1,
-                                     'phase':phase,'exception':category})
+            detail={'outcome_index':len(self.outcomes)-1,
+                    'phase':phase,'exception':category}
+            # A child launcher may add only a fixed failure-stage capability.
+            # Arbitrary exception attributes are never serialized.
+            if err[0] is RuntimeError:
+                stage=vars(err[1]).get('br02_child_stage')
+                if type(stage) is str and stage in (
+                        'child_authorization','child_network_guard',
+                        'child_application','child_server_import',
+                        'child_server_run','child_ready'):
+                    detail['child_stage']=stage
+            self.diagnostics.append(detail)
     def addSuccess(self,test): self.outcomes.append((test.id(),'pass'))
     def addError(self,test,err):
         self.outcomes.append((test.id(),'error')); self.errors.append((test.id(),'sanitized'))

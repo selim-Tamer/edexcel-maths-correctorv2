@@ -410,7 +410,9 @@ class ProductionApiLiveTests(_LiveApiBase):
                 result_id=self.bundle.result_id,
                 original_output=self.bundle.original_output,
                 scope="manual", review_key=self.bundle.review_key,
-                document_digest=self.bundle.document_digest)
+                document_digest=self.bundle.document_digest,
+                job_id=self.bundle.job_id,
+                assignment_id=self.bundle.assignment_id)
         finally:
             store.close()
         app = self.production_app()
@@ -453,7 +455,9 @@ class ProductionApiLiveTests(_LiveApiBase):
                 result_id=self.bundle.result_id,
                 original_output=self.bundle.original_output,
                 scope="manual", review_key=self.bundle.review_key,
-                document_digest=self.bundle.document_digest)
+                document_digest=self.bundle.document_digest,
+                job_id=self.bundle.job_id,
+                assignment_id=self.bundle.assignment_id)
         finally:
             store.close()
         app = self.production_app()
@@ -478,7 +482,7 @@ class ProductionApiLiveTests(_LiveApiBase):
         with self._client(app) as client:
             unauthenticated = client.post(
                 f"/v1/results/{self.bundle.result_id}/decisions",
-                headers={"Authorization": "Bearer synthetic-subject:nope"},
+                headers={"Authorization": "Bearer not-a-synthetic-token"},
                 json=self.decision_body())
         self.assertEqual(unauthenticated.status_code, 401)
         self.assertEqual(
@@ -516,27 +520,32 @@ class ProductionApiLiveTests(_LiveApiBase):
                 json={"scope": "manual",
                       "original_output": self.bundle.original_output,
                       "manual_identity": {
-                          "review_key": self.bundle.review_key,
+                          "submission_ref": self.bundle.review_key,
                           "document_digest": self.bundle.document_digest}})
             decision = client.post(
                 f"/v1/results/{self.bundle.result_id}/decisions",
                 headers=self.auth_headers(), json=self.decision_body(
                     action="flag", question_number="1"))
         self.assertNotEqual(ingest.status_code, 201, ingest.text)
-        self.assertIn(ingest.status_code, (403, 409, 422),
-                      "a fresh production completion must be refused by the "
-                      "fail-closed vocabulary, never created")
+        self.assertEqual(ingest.status_code, 503)
+        self.assertEqual(ingest.json()['error']['code'], 'store_unusable')
         # The direct production service path refuses with the exact F5 code.
         import identity_context
         import result_service
         identity = identity_context.from_verified_subject(
             self.bundle.raw_subject, self.bundle.tenant_id)
-        env = {runtime_config.RUNTIME_ENV: runtime_config.RUNTIME_PRODUCTION,
-               runtime_config.PG_DSN_ENV: self.dsn}
-        with mock.patch.dict(os.environ, env):
-            with self.assertRaises(runtime_config.RuntimeConfigError) as caught:
-                result_service.require_capability(env)
+        service = result_service.open_service(identity, dsn=_restricted_app_dsn(self.approval))
+        try:
+            import audit_store
+            with self.assertRaises(audit_store.AuditStoreError) as caught:
+                service.register(
+                    result_id=self.bundle.result_id,
+                    original_output=self.bundle.original_output,
+                    scope='manual', review_key=self.bundle.review_key,
+                    document_digest=self.bundle.document_digest)
             self.assertEqual(caught.exception.code, "store_unusable")
+        finally:
+            service.close()
         after = self.conn.execute(
             "select count(*) from results where tenant_id=%s",
             (self.bundle.tenant_id,)).fetchone()[0]
