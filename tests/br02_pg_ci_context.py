@@ -23,6 +23,8 @@ REF = 'refs/heads/br-02/postgres-result-persistence'
 WORKFLOW = REPOSITORY + '/.github/workflows/br02-postgres-integration.yml@' + REF
 ISSUER = 'https://token.actions.githubusercontent.com'
 AUDIENCE = 'omnigrade-br02-isolated-ci'
+REQUEST_HOSTS = frozenset(('vstoken.actions.githubusercontent.com',
+    'run-actions-2-azure-eastus.actions.githubusercontent.com'))
 IMAGE = 'postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac'
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ('postgres_v1.sql','postgres_v2_tenant_rls.sql','postgres_v3_jobs.sql',
@@ -79,7 +81,7 @@ def _request_url_checks(value):
         address=urlsplit(value)
         checks['url_parsed']=True
         checks['scheme_allowed']=address.scheme=='https'
-        checks['hostname_allowed']=address.hostname=='vstoken.actions.githubusercontent.com'
+        checks['hostname_allowed']=address.hostname in REQUEST_HOSTS
         checks['username_allowed']=not bool(address.username)
         checks['password_allowed']=not bool(address.password)
     except Exception: return checks
@@ -150,7 +152,7 @@ def _authenticated_identity(environ):
         stage='request_url'
         request_url=environ['ACTIONS_ID_TOKEN_REQUEST_URL']
         address = urlsplit(request_url)
-        if address.scheme != 'https' or address.hostname != 'vstoken.actions.githubusercontent.com' \
+        if address.scheme != 'https' or address.hostname not in REQUEST_HOSTS \
                 or address.username or address.password or address.port not in (None,443): deny('identity')
         query = dict(parse_qsl(address.query)); query['audience'] = AUDIENCE
         url = urlunsplit((address.scheme,address.netloc,address.path,urlencode(query),''))

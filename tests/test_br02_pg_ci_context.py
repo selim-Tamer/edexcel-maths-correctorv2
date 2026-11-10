@@ -579,6 +579,8 @@ class RequestUrlPredicateTests(unittest.TestCase):
     def test_accepted_urls_preserve_existing_origin_path_and_query_behavior(self):
         for authority in ('vstoken.actions.githubusercontent.com',
                           'VSTOKEN.ACTIONS.GITHUBUSERCONTENT.COM:443',
+                          'run-actions-2-azure-eastus.actions.githubusercontent.com',
+                          'RUN-ACTIONS-2-AZURE-EASTUS.ACTIONS.GITHUBUSERCONTENT.COM:443',
                           '@vstoken.actions.githubusercontent.com'):
             url='https://'+authority+'/synthetic/'+PAYLOAD+'?keep=one&blank=&dup=1&dup=2&audience=old#'+PAYLOAD
             env=IdentityDiagnosticProposalTests().env();env['ACTIONS_ID_TOKEN_REQUEST_URL']=url
@@ -594,6 +596,48 @@ class RequestUrlPredicateTests(unittest.TestCase):
             self.assertEqual(dict(ci.parse_qsl(address.query)),{'keep':'one','dup':'2','audience':ci.AUDIENCE})
             self.assertEqual(address.fragment,'');self.assertEqual(output.getvalue(),'')
             self.assertTrue(all(ci._request_url_checks(url).values()))
+
+    def test_exact_host_policy_rejects_lookalikes_and_subdomain_confusion(self):
+        host='run-actions-2-azure-eastus.actions.githubusercontent.com'
+        self.assertEqual(ci.REQUEST_HOSTS,frozenset((host,'vstoken.actions.githubusercontent.com')))
+        for authority in (host+'.attacker.invalid','attacker.'+host,
+                          host.replace('eastus','westus'),host.replace('run-actions-2','run-actions-3'),
+                          host.replace('githubusercontent','githubusercontenT-attacker'),
+                          host+'.',host+'%2eattacker.invalid','',
+                          'vstoken.actions.githubusercontent.com.attacker.invalid'):
+            with self.subTest(authority=authority):
+                flags=self.refused('https://'+authority+'/?opaque='+PAYLOAD)
+                self.assertFalse(flags['hostname_allowed'])
+
+    def test_verified_host_preserves_transport_and_malformed_url_refusals(self):
+        host='run-actions-2-azure-eastus.actions.githubusercontent.com'
+        for url,field in (('http://'+host+'/','scheme_allowed'),
+                          ('https://'+PAYLOAD+'@'+host+'/','username_allowed'),
+                          ('https://:'+PAYLOAD+'@'+host+'/','password_allowed'),
+                          ('https://'+host+':8443/','port_allowed'),
+                          ('https://'+host+':invalid/','port_parsed'),
+                          ('https://['+host,'url_parsed')):
+            with self.subTest(field=field):self.assertFalse(self.refused(url)[field])
+
+    def test_verified_host_preserves_query_construction_failure_refusals(self):
+        for name,field in (('parse_qsl','query_parsed'),('urlencode','audience_query_built'),('urlunsplit','url_built')):
+            with self.subTest(operation=name),mock.patch.object(ci,name,side_effect=ValueError(PAYLOAD)):
+                flags=self.refused('https://run-actions-2-azure-eastus.actions.githubusercontent.com/?opaque='+PAYLOAD)
+                self.assertTrue(flags['hostname_allowed']);self.assertFalse(flags[field])
+
+    def test_verified_host_still_requires_verified_and_bound_identity(self):
+        import jwt
+        helper=IdentityDiagnosticProposalTests()
+        env=helper.env()
+        env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://run-actions-2-azure-eastus.actions.githubusercontent.com/inert'
+        for kind,label in ((jwt.InvalidSignatureError,'signature'),(jwt.InvalidIssuerError,'issuer'),
+                           (jwt.InvalidAudienceError,'audience')):
+            with self.subTest(reason=label):
+                self.assertEqual(helper.failure('jwt_verification',env=env,error=kind(PAYLOAD))['reason'],label)
+        for field in ('iss','aud','repository','repository_id','repository_owner_id','actor_id','event_name',
+                      'ref','workflow_ref','workflow_sha','sha','run_id','run_attempt','runner_environment','repository_visibility'):
+            claims=IdentityTests().claims();claims[field]=PAYLOAD
+            with self.subTest(claim=field):helper.failure('claim_binding',env=env,claims=claims)
 
     def test_each_rejected_origin_predicate_is_distinguished_without_network(self):
         cases=[('http://vstoken.actions.githubusercontent.com/','scheme_allowed'),
