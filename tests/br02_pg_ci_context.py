@@ -12,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import time
 from urllib.parse import urlsplit, parse_qsl, urlencode, urlunsplit
 import urllib.request
+import urllib.error
 
 REPOSITORY = 'selim-Tamer/edexcel-maths-correctorv2'
 REPOSITORY_ID = '1389123218'
@@ -23,9 +25,9 @@ REF = 'refs/heads/br-02/postgres-result-persistence'
 WORKFLOW = REPOSITORY + '/.github/workflows/br02-postgres-integration.yml@' + REF
 ISSUER = 'https://token.actions.githubusercontent.com'
 AUDIENCE = 'omnigrade-br02-isolated-ci'
-REQUEST_HOSTS = frozenset(('vstoken.actions.githubusercontent.com',
-    'run-actions-1-azure-eastus.actions.githubusercontent.com',
-    'run-actions-2-azure-eastus.actions.githubusercontent.com'))
+# GitHub documents this service namespace for OIDC retrieval. Request routing
+# is distinct from identity: only ISSUER's signed, bound JWT can issue a ticket.
+REQUEST_DOMAIN = 'actions.githubusercontent.com'
 IMAGE = 'postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac'
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ('postgres_v1.sql','postgres_v2_tenant_rls.sql','postgres_v3_jobs.sql',
@@ -69,36 +71,57 @@ def validate_claims(claims, expected, now):
     return {'run_id':run,'sha':sha,'attempt':'1'}
 
 
-def _request_url_checks(value):
-    """Failure-only observations; never authorize or return URL components.
+def _request_hostname_allowed(hostname):
+    return (type(hostname) is str and len(hostname)<=253
+        and hostname.endswith('.'+REQUEST_DOMAIN)
+        and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label)
+                for label in hostname.split('.')))
 
-    False also means unevaluated when its prerequisite parse/build failed.
+
+def _request_url_policy(value):
+    """One parser/builder for authorization and bounded diagnostic booleans.
+
+    Keep the runner's opaque path/query; replace every audience parameter.
+    No URL, query or credentials are returned in diagnostic checks.
     """
     checks=dict.fromkeys(('url_parsed','scheme_allowed','hostname_allowed',
         'username_allowed','password_allowed','port_parsed','port_allowed',
-        'query_parsed','audience_query_built','url_built'),False)
-    if type(value) is not str: return checks
+        'query_parsed','audience_query_built','url_built','input_allowed',
+        'authority_allowed','fragment_absent'),False)
+    if type(value) is not str: return None,checks
+    checks['input_allowed']=(0<len(value)<=8192 and value.isascii()
+        and not any(ord(c)<=32 or ord(c)==127 or c=='\\' for c in value)
+        and re.search(r'%(?![0-9a-fA-F]{2})',value) is None)
+    if not checks['input_allowed']: return None,checks
     try:
         address=urlsplit(value)
         checks['url_parsed']=True
         checks['scheme_allowed']=address.scheme=='https'
-        checks['hostname_allowed']=address.hostname in REQUEST_HOSTS
-        checks['username_allowed']=not bool(address.username)
-        checks['password_allowed']=not bool(address.password)
-    except Exception: return checks
+        checks['hostname_allowed']=_request_hostname_allowed(address.hostname)
+        checks['username_allowed']=address.username is None
+        checks['password_allowed']=address.password is None
+        checks['authority_allowed']=address.netloc.lower() in (
+            address.hostname, str(address.hostname)+':443')
+        checks['fragment_absent']='#' not in value
+    except Exception: return None,checks
     try:
         port=address.port
         checks['port_parsed']=True
         checks['port_allowed']=port in (None,443)
     except Exception: pass
     try:
-        query=dict(parse_qsl(address.query)); checks['query_parsed']=True
-        query['audience']=AUDIENCE
+        query=parse_qsl(address.query,keep_blank_values=True,encoding='utf-8',errors='strict',max_num_fields=64)
+        checks['query_parsed']=True
+        query=[(key,val) for key,val in query if key!='audience']+ [('audience',AUDIENCE)]
         encoded=urlencode(query); checks['audience_query_built']=True
-        urlunsplit((address.scheme,address.netloc,address.path,encoded,''))
+        url=urlunsplit(('https',address.netloc.lower(),address.path,encoded,''))
         checks['url_built']=True
     except Exception: pass
-    return checks
+    return (url if all(checks.values()) else None),checks
+
+
+def _request_url_checks(value):
+    return _request_url_policy(value)[1]
 
 
 def _request_hostname_observation(value):
@@ -192,22 +215,30 @@ def _authenticated_identity(environ):
         if environ.get('GITHUB_ACTIONS') != 'true' or environ.get('BR02_CI_APPROVED_SHA') != environ.get('GITHUB_SHA'): deny('identity')
         stage='request_url'
         request_url=environ['ACTIONS_ID_TOKEN_REQUEST_URL']
-        address = urlsplit(request_url)
-        if address.scheme != 'https' or address.hostname not in REQUEST_HOSTS \
-                or address.username or address.password or address.port not in (None,443): deny('identity')
-        query = dict(parse_qsl(address.query)); query['audience'] = AUDIENCE
-        url = urlunsplit((address.scheme,address.netloc,address.path,urlencode(query),''))
+        url,_ = _request_url_policy(request_url)
+        if url is None: deny('identity')
         stage='request_environment'
-        request = urllib.request.Request(url, headers={'Authorization':'Bearer '+environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+        credential=environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+        if type(credential) is not str or not 0<len(credential)<=16384 \
+                or not credential.isascii() or any(ord(c)<=32 or ord(c)>=127 for c in credential): deny('identity')
+        request = urllib.request.Request(url, headers={'Authorization':'Bearer '+credential})
         class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self,*args,**kwargs): deny('identity')
+            def redirect_request(self,req,fp,code,msg,headers,newurl):
+                with contextlib.suppress(Exception): fp.close()
+                deny('identity')
         stage='token_acquisition'
-        opener=urllib.request.build_opener(NoRedirect())
+        opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),NoRedirect())
         with opener.open(request, timeout=10) as response:
+            if response.status!=200: deny('identity')
             raw = response.read(32769)
         stage='token_response'
         if len(raw)>32768: deny('identity')
-        token=json.loads(raw)['value']
+        payload=json.loads(raw)
+        if type(payload) is not dict: deny('identity')
+        token=payload['value']
+        if type(token) is not str or not 0<len(token)<=32768 or not token.isascii() \
+                or any(ord(c)<=32 or ord(c)>=127 for c in token): deny('identity')
         stage='jwt_verification'
         claims = _verify_jwt(token)
         stage='claim_binding'
@@ -218,6 +249,10 @@ def _authenticated_identity(environ):
         _identity_diagnostic(stage,error,claims,expected,request_url)
         raise
     except Exception as error:
+        # HTTPError owns a response even when opener.open raises before the
+        # context manager starts. Close it without exposing exception text.
+        if isinstance(error,urllib.error.HTTPError):
+            with contextlib.suppress(Exception): error.close()
         _identity_diagnostic(stage,error,claims,expected,request_url)
         raise CIDenied('identity') from None
 

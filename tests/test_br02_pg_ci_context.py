@@ -24,6 +24,10 @@ ci=runner=target=None
 PAYLOAD='synthetic-error-text-not-a-real-secret'
 
 
+class TokenResponse(io.BytesIO):
+    status=200
+
+
 _jtis=itertools.count()
 
 def issue_ticket(*,claims=None,environ=None):
@@ -34,7 +38,7 @@ def issue_ticket(*,claims=None,environ=None):
          'GITHUB_RUN_ID':'1234','ACTIONS_ID_TOKEN_REQUEST_URL':'https://vstoken.actions.githubusercontent.com/inert',
          'ACTIONS_ID_TOKEN_REQUEST_TOKEN':'inert-not-a-token'}
     if environ:env.update(environ)
-    opener=mock.Mock();opener.open.return_value=io.BytesIO(b'{"value":"inert-signed-token"}')
+    opener=mock.Mock();opener.open.return_value=TokenResponse(b'{"value":"inert-signed-token"}')
     with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
             mock.patch.object(ci,'_verify_jwt',return_value=value) as verify:
         result=ci.authenticate(env)
@@ -270,7 +274,7 @@ class ProvenanceRegressionTests(unittest.TestCase):
             claims=IdentityTests().claims();now=int(time.time())
             claims.update(iat=now-1,nbf=now-1,exp=now+60,jti='invalid-'+str(next(_jtis)));claims.update(change)
             with self.assertRaises(ci.CIDenied):issue_ticket(claims=claims)
-        response=mock.Mock();response.open.return_value=io.BytesIO(b'{"value":"inert"}')
+        response=mock.Mock();response.open.return_value=TokenResponse(b'{"value":"inert"}')
         with mock.patch.object(ci.urllib.request,'build_opener',return_value=response), \
                 mock.patch.object(ci,'_verify_jwt',side_effect=ValueError(PAYLOAD)):
             with self.assertRaises(ci.CIDenied) as caught:
@@ -484,7 +488,7 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
                 'ACTIONS_ID_TOKEN_REQUEST_TOKEN':PAYLOAD}
 
     def failure(self,stage,*,env=None,raw=b'{"value":"synthetic.jwt.token"}',claims=None,error=None):
-        opener=mock.Mock();opener.open.return_value=io.BytesIO(raw)
+        opener=mock.Mock();opener.open.return_value=TokenResponse(raw)
         if stage=='token_acquisition':opener.open.side_effect=OSError(PAYLOAD)
         value=IdentityTests().claims() if claims is None else claims
         output=io.StringIO()
@@ -537,7 +541,7 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
         self.failure('claim_binding',claims=value)
 
     def test_valid_feature_identity_has_no_diagnostic_and_same_return(self):
-        opener=mock.Mock();opener.open.return_value=io.BytesIO(b'{"value":"synthetic.jwt.token"}')
+        opener=mock.Mock();opener.open.return_value=TokenResponse(b'{"value":"synthetic.jwt.token"}')
         output=io.StringIO();claims=IdentityTests().claims()
         with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
                 mock.patch.object(ci,'_verify_jwt',return_value=claims), \
@@ -554,9 +558,15 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
 
 
 class RequestUrlPredicateTests(unittest.TestCase):
+    def test_rotating_documented_service_endpoints_reach_signed_verification(self):
+        for host in ('run-actions-3-azure-eastus', 'run-actions-99-other-region', 'future-service'):
+            with self.subTest(host=host):
+                issue_ticket(environ={'ACTIONS_ID_TOKEN_REQUEST_URL':
+                    'https://'+host+'.actions.githubusercontent.com/inert'})
+
     fields={'url_parsed','scheme_allowed','hostname_allowed','username_allowed',
             'password_allowed','port_parsed','port_allowed','query_parsed',
-            'audience_query_built','url_built'}
+            'audience_query_built','url_built','input_allowed','authority_allowed','fragment_absent'}
 
     def refused(self,url,**changes):
         env=IdentityDiagnosticProposalTests().env()
@@ -583,10 +593,11 @@ class RequestUrlPredicateTests(unittest.TestCase):
                           'RUN-ACTIONS-1-AZURE-EASTUS.ACTIONS.GITHUBUSERCONTENT.COM:443',
                           'run-actions-2-azure-eastus.actions.githubusercontent.com',
                           'RUN-ACTIONS-2-AZURE-EASTUS.ACTIONS.GITHUBUSERCONTENT.COM:443',
-                          '@vstoken.actions.githubusercontent.com'):
-            url='https://'+authority+'/synthetic/'+PAYLOAD+'?keep=one&blank=&dup=1&dup=2&audience=old#'+PAYLOAD
+                          'run-actions-3-azure-eastus.actions.githubusercontent.com',
+                          'future.actions.githubusercontent.com'):
+            url='https://'+authority+'/synthetic/'+PAYLOAD+'?keep=one&blank=&dup=1&dup=2&audience=old&audience=second&%61udience=third'
             env=IdentityDiagnosticProposalTests().env();env['ACTIONS_ID_TOKEN_REQUEST_URL']=url
-            opener=mock.Mock();opener.open.return_value=io.BytesIO(b'{"value":"inert"}')
+            opener=mock.Mock();opener.open.return_value=TokenResponse(b'{"value":"inert"}')
             output=io.StringIO()
             with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
                     mock.patch.object(ci,'_verify_jwt',return_value=IdentityTests().claims()), \
@@ -595,16 +606,15 @@ class RequestUrlPredicateTests(unittest.TestCase):
             self.assertEqual(identity,{'run_id':'1234','sha':'a'*40,'attempt':'1'})
             request=opener.open.call_args.args[0];address=ci.urlsplit(request.full_url)
             self.assertEqual(address.path,'/synthetic/'+PAYLOAD)
-            self.assertEqual(dict(ci.parse_qsl(address.query)),{'keep':'one','dup':'2','audience':ci.AUDIENCE})
+            self.assertEqual(ci.parse_qsl(address.query,keep_blank_values=True),
+                [('keep','one'),('blank',''),('dup','1'),('dup','2'),('audience',ci.AUDIENCE)])
             self.assertEqual(address.fragment,'');self.assertEqual(output.getvalue(),'')
             self.assertTrue(all(ci._request_url_checks(url).values()))
 
-    def test_exact_host_policy_rejects_lookalikes_and_subdomain_confusion(self):
+    def test_documented_namespace_rejects_lookalikes_and_domain_confusion(self):
         host='run-actions-2-azure-eastus.actions.githubusercontent.com'
-        self.assertEqual(ci.REQUEST_HOSTS,frozenset((host,'vstoken.actions.githubusercontent.com',
-            'run-actions-1-azure-eastus.actions.githubusercontent.com')))
-        for authority in (host+'.attacker.invalid','attacker.'+host,
-                          host.replace('eastus','westus'),host.replace('run-actions-2','run-actions-3'),
+        self.assertEqual(ci.REQUEST_DOMAIN,'actions.githubusercontent.com')
+        for authority in (host+'.attacker.invalid','actions.githubusercontent.com',
                           host.replace('githubusercontent','githubusercontenT-attacker'),
                           host+'.',host+'%2eattacker.invalid','',
                           'vstoken.actions.githubusercontent.com.attacker.invalid'):
@@ -624,8 +634,7 @@ class RequestUrlPredicateTests(unittest.TestCase):
 
     def test_run_actions_1_refuses_lookalikes_and_other_url_failures(self):
         host='run-actions-1-azure-eastus.actions.githubusercontent.com'
-        for authority in (host+'.attacker.invalid','attacker.'+host,
-                          host.replace('eastus','westus'),host.replace('run-actions-1','run-actions-3'),
+        for authority in (host+'.attacker.invalid','notactions.githubusercontent.com',
                           host.replace('githubusercontent','githubusercontent-attacker'),
                           host+'.',host+'%2eattacker.invalid','arbitrary.invalid'):
             with self.subTest(authority=authority):
@@ -686,11 +695,12 @@ class RequestUrlPredicateTests(unittest.TestCase):
                 flags=self.refused(url+'?opaque='+PAYLOAD)
                 self.assertTrue(flags['url_parsed']);self.assertFalse(flags[field])
                 for key in ('scheme_allowed','hostname_allowed','username_allowed','password_allowed','port_allowed'):
-                    if key!=field:self.assertTrue(flags[key])
+                    if key!=field and not (field=='password_allowed' and key=='username_allowed'):
+                        self.assertTrue(flags[key])
 
     def test_malformed_urls_distinguish_split_and_port_failures(self):
         flags=self.refused('https://['+PAYLOAD)
-        self.assertFalse(flags['url_parsed']);self.assertFalse(any(flags.values()))
+        self.assertFalse(flags['url_parsed']);self.assertFalse(flags['url_built'])
         for port in (PAYLOAD,'65536','-1'):
             flags=self.refused('https://vstoken.actions.githubusercontent.com:'+port+'/')
             self.assertTrue(flags['url_parsed']);self.assertTrue(flags['hostname_allowed'])
@@ -718,6 +728,117 @@ class RequestUrlPredicateTests(unittest.TestCase):
                 with self.assertRaises(ci.CIDenied) as caught:ci.authenticate(env)
                 self.assertEqual(str(caught.exception),'BR02_CI_IDENTITY')
                 self.assertFalse(ci.active())
+
+
+class EndpointBoundaryTests(unittest.TestCase):
+    def test_ambiguous_urls_fail_before_credentials_or_network(self):
+        host='vstoken.actions.githubusercontent.com'
+        urls=['https://'+host+tail for tail in ('/\nsecret','/\tsecret','/\\secret',
+            '/#fragment','/#','/%xx','/?bad=%FF',':/',':0443/','./')]
+        urls+=['https://@'+host+'/', 'https://:'+PAYLOAD+'@'+host+'/',
+            'https://'+host+'/'+'a'*8192, 'https://\u212a.actions.githubusercontent.com/',
+            'https://bad..actions.githubusercontent.com/',
+            'https://-bad.actions.githubusercontent.com/',
+            'https://'+'a'*64+'.actions.githubusercontent.com/',
+            'https://127.0.0.1/', 'https://[::1]/',
+            'https://'+host+'/?'+'&'.join('a=1' for _ in range(65))]
+        for url in urls:
+            with self.subTest(index=urls.index(url)):
+                RequestUrlPredicateTests().refused(url)
+
+    def test_invalid_request_credentials_never_open_transport(self):
+        for credential in ('',None,123,'a\r\nb','a b','\u212a','a'*16385):
+            env=IdentityDiagnosticProposalTests().env()
+            env['ACTIONS_ID_TOKEN_REQUEST_TOKEN']=credential
+            with mock.patch.object(ci.urllib.request,'build_opener') as opener:
+                IdentityDiagnosticProposalTests().failure('request_environment',env=env)
+            opener.assert_not_called()
+
+    def test_transport_has_verified_tls_no_proxy_no_redirect_and_one_request(self):
+        import ssl
+        opener=mock.Mock();opener.open.return_value=TokenResponse(b'{"value":"inert"}')
+        env=IdentityDiagnosticProposalTests().env()
+        env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://run-actions-3-azure-eastus.actions.githubusercontent.com/inert'
+        with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener) as build, \
+                mock.patch.object(ci,'_verify_jwt',return_value=IdentityTests().claims()), \
+                mock.patch.object(ci.time,'time',return_value=1000):
+            ci._authenticated_identity(env)
+        opener.open.assert_called_once()
+        self.assertEqual(opener.open.call_args.kwargs,{'timeout':10})
+        proxy,tls,redirect=build.call_args.args
+        self.assertEqual(proxy.proxies,{})
+        self.assertEqual(tls._context.verify_mode,ssl.CERT_REQUIRED)
+        self.assertTrue(tls._context.check_hostname)
+        request=opener.open.call_args.args[0]
+        self.assertEqual(request.get_header('Authorization'),'Bearer '+PAYLOAD)
+        for code in (301,302,303,307,308):
+            response=TokenResponse(b'')
+            with self.subTest(code=code),self.assertRaises(ci.CIDenied):
+                redirect.http_error_302(request,response,code,'ignored',
+                    {'location':'https://attacker.invalid/'})
+            self.assertTrue(response.closed)
+
+    def test_http_and_tls_failures_do_not_retry_or_verify(self):
+        import ssl
+        import urllib.error
+        for error in (ssl.SSLCertVerificationError(PAYLOAD),TimeoutError(PAYLOAD),
+                urllib.error.HTTPError('https://inert.invalid',503,PAYLOAD,{},TokenResponse(b''))):
+            opener=mock.Mock();opener.open.side_effect=error
+            with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                    mock.patch.object(ci,'_verify_jwt') as verify,contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.authenticate(IdentityDiagnosticProposalTests().env())
+            opener.open.assert_called_once();verify.assert_not_called()
+            if isinstance(error,urllib.error.HTTPError):self.assertTrue(error.fp.closed)
+            self.assertFalse(ci.active())
+
+    def test_malformed_token_responses_never_reach_verifier(self):
+        for raw in (b'[]',b'null',b'{"value":null}',b'{"value":123}',b'{"value":{}}',
+                    b'{"value":""}',b'{"value":"a b"}',b'{"value":"a\\r\\nb"}',
+                    b'{"value":"\\u212a"}',b'X'*32769):
+            opener=mock.Mock();opener.open.return_value=TokenResponse(raw)
+            with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                    mock.patch.object(ci,'_verify_jwt') as verify,contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.authenticate(IdentityDiagnosticProposalTests().env())
+            verify.assert_not_called();self.assertFalse(ci.active())
+
+    def test_non_success_response_is_refused_and_closed(self):
+        for status in (204,301,302,307,308,401,403,429,500):
+            response=TokenResponse(b'{"value":"inert"}');response.status=status
+            opener=mock.Mock();opener.open.return_value=response
+            with mock.patch.object(ci.urllib.request,'build_opener',return_value=opener), \
+                    mock.patch.object(ci,'_verify_jwt') as verify,contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.authenticate(IdentityDiagnosticProposalTests().env())
+            self.assertTrue(response.closed);verify.assert_not_called()
+            opener.open.assert_called_once()
+
+    def test_rotating_host_does_not_relax_any_signed_claim(self):
+        helper=IdentityDiagnosticProposalTests();env=helper.env()
+        env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://future-region.actions.githubusercontent.com/inert'
+        for field in IdentityTests().claims():
+            claims=IdentityTests().claims();claims.pop(field)
+            with self.subTest(field=field):helper.failure('claim_binding',env=env,claims=claims)
+
+    def test_real_local_rsa_signature_and_jwks_validation(self):
+        import jwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+        other=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+        claims=IdentityTests().claims();now=int(time.time())
+        claims.update(iat=now-1,nbf=now-1,exp=now+120)
+        jwk=json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+        jwk.update(kid='offline-key',alg='RS256',use='sig')
+        # Only JWKS bytes are substituted. PyJWT performs real key selection,
+        # signature, issuer, audience, algorithm and timestamp validation.
+        with mock.patch.object(jwt.PyJWKClient,'fetch_data',return_value={'keys':[jwk]}):
+            good=jwt.encode(claims,key,algorithm='RS256',headers={'kid':'offline-key'})
+            self.assertEqual(ci._verify_jwt(good)['run_id'],'1234')
+            cases=[jwt.encode(claims,other,algorithm='RS256',headers={'kid':'offline-key'}),
+                   jwt.encode(claims,'offline-symmetric-key',algorithm='HS256',headers={'kid':'offline-key'})]
+            for field,value in (('iss','https://attacker.invalid'),('aud','wrong'),('exp',now-1),('nbf',now+60)):
+                altered=dict(claims);altered[field]=value
+                cases.append(jwt.encode(altered,key,algorithm='RS256',headers={'kid':'offline-key'}))
+            for token in cases:
+                with self.assertRaises(jwt.InvalidTokenError):ci._verify_jwt(token)
 
 
 class IntegrationHostnameObservationTests(unittest.TestCase):
@@ -758,9 +879,9 @@ class IntegrationHostnameObservationTests(unittest.TestCase):
 
     def test_observation_never_authorizes_lookalike_or_unknown_host(self):
         helper=IdentityDiagnosticProposalTests()
-        for host in ('run-actions-9-azure-westus.actions.githubusercontent.com',
+        for host in ('arbitrary.invalid',
                      'vstoken.actions.githubusercontent.com.attacker.invalid',
-                     'attacker.run-actions-2-azure-eastus.actions.githubusercontent.com'):
+                     'actions.githubusercontent.com.attacker.invalid'):
             env=helper.env();env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://'+host+'/private?opaque='+PAYLOAD
             with mock.patch.object(ci.urllib.request,'build_opener') as opener:
                 event=helper.failure('request_url',env=env)
