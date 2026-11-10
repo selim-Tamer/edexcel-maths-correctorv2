@@ -257,26 +257,62 @@ def _authenticated_identity(environ):
         raise CIDenied('identity') from None
 
 
-def validate_target(info, identity):
+def _target_diagnostic(stage, reason='refused'):
+    """Fixed failure vocabulary only; no inspect, SQL, identity or DSN values."""
+    stages={'container_shape','container_id','container_image','container_running',
+        'port_binding','network_count','network_address','mount_count','mount_type',
+        'mount_destination','volume_name','identity_binding','container_environment',
+        'inspect_cardinality','ticket_binding','database_name','database_version',
+        'database_address','database_port','database_empty','migration_ticket',
+        'role_attributes','role_membership','approval_binding'}
+    if type(stage) is not str or stage not in stages: stage='unknown'
+    if type(reason) is not str or reason not in {'refused','malformed'}: reason='refused'
     try:
-        if type(info) is not dict or re.fullmatch('[0-9a-f]{64}',info['Id']) is None: deny('target')
-        if info['Config']['Image'] != IMAGE or not info['State']['Running']: deny('target')
+        import sys
+        print('BR02_CI_TARGET_DIAGNOSTIC '+json.dumps({'stage':stage,'reason':reason},sort_keys=True),file=sys.stderr)
+    except Exception: pass
+
+
+def validate_target(info, identity):
+    stage='container_shape'
+    try:
+        if type(info) is not dict: deny('target')
+        stage='container_id'
+        if re.fullmatch('[0-9a-f]{64}',info['Id']) is None: deny('target')
+        stage='container_image'
+        if info['Config']['Image'] != IMAGE: deny('target')
+        stage='container_running'
+        if not info['State']['Running']: deny('target')
+        stage='port_binding'
         bindings = info['NetworkSettings']['Ports']['5432/tcp']
         if bindings != [{'HostIp':'127.0.0.1','HostPort':'55432'}]: deny('target')
+        stage='network_count'
         networks = info['NetworkSettings']['Networks']
         if len(networks)!=1: deny('target')
+        stage='network_address'
         ip = next(iter(networks.values()))['IPAddress']
         import ipaddress
         if not ipaddress.ip_address(ip).is_private or ':' in ip: deny('target')
+        stage='mount_count'
         mounts=info['Mounts']
-        if len(mounts)!=1 or mounts[0]['Type']!='volume' or mounts[0]['Destination']!='/var/lib/postgresql/data': deny('target')
+        if len(mounts)!=1: deny('target')
+        stage='mount_type'
+        if mounts[0]['Type']!='volume': deny('target')
+        stage='mount_destination'
+        if mounts[0]['Destination']!='/var/lib/postgresql/data': deny('target')
+        stage='volume_name'
         volume=mounts[0]['Name']
         if re.fullmatch('[0-9a-f]{64}',volume) is None: deny('target')
+        stage='identity_binding'
         return {'instance':info['Id'],'storage':volume,'server_address':ip,'run_id':identity['run_id'],
                 'sha':identity['sha'],'attempt':identity['attempt'],'repository':REPOSITORY,
                 'workflow':WORKFLOW,'scope':SCOPE,'database':'br02_ci','endpoint':'127.0.0.1:55432'}
-    except CIDenied: raise
-    except Exception: raise CIDenied('target') from None
+    except CIDenied:
+        _target_diagnostic(stage)
+        raise
+    except Exception:
+        _target_diagnostic(stage,'malformed')
+        raise CIDenied('target') from None
 
 
 @dataclass(frozen=True)

@@ -83,35 +83,51 @@ def command(*args):
 
 
 def bootstrap(binding,ticket):
-    ci.require_ticket(ticket,binding)  # before driver, password generation or SQL
-    import psycopg
-    from psycopg import sql
-    import secrets
-    from psycopg.conninfo import make_conninfo
-    initial='host=127.0.0.1 port=55432 dbname=br02_ci user=br02_bootstrap password=bootstrap-ci-only connect_timeout=5'
-    generated={name:secrets.token_urlsafe(32) for name in ('br02_bootstrap','marker_app_login','marker_worker_login','br02_ci_owner')}
-    with psycopg.connect(initial,autocommit=True,options='-c search_path=public -c statement_timeout=15000 -c lock_timeout=3000') as conn:
-        row=conn.execute('select current_database(), version(), inet_server_addr()::text, inet_server_port()').fetchone()
-        if row[0]!='br02_ci' or not row[1].startswith('PostgreSQL 17.11 ') or row[2]!=binding['server_address'] or row[3]!=5432: ci.deny('target')
-        if conn.execute("select count(*) from pg_catalog.pg_tables where schemaname='public'").fetchone()[0]!=0: ci.deny('target')
-        for name in ci.MIGRATIONS:
-            ci.require_ticket(ticket,binding)
-            conn.execute((ROOT/'schema'/name).read_text(encoding='utf8'))
-        conn.execute((ROOT/'tests/br02_pg_ci_setup.sql').read_text(encoding='utf8'))
-        for role,password in generated.items():
-            conn.execute(sql.SQL('ALTER ROLE {} PASSWORD {}').format(sql.Identifier(role),sql.Literal(password)))
-        conn.execute('insert into public.schema_meta(key,value) values (%s,%s)',('br02_synthetic_run_id',binding['run_id']))
-        shapes=conn.execute("select rolname,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication from pg_roles where rolname in ('marker_app_login','marker_worker_login','br02_ci_owner')").fetchall()
-        if len(shapes)!=3 or any(any(row[1:]) for row in shapes): ci.deny('target')
-        elevated=conn.execute("select count(*) from pg_roles p where (p.rolsuper or p.rolbypassrls or p.rolcreatedb or p.rolcreaterole or p.rolreplication) and (pg_has_role('marker_app_login',p.oid,'MEMBER') or pg_has_role('marker_worker_login',p.oid,'MEMBER'))").fetchone()[0]
-        if elevated: ci.deny('target')
-        binding['system_identifier']=str(conn.execute('select system_identifier from pg_control_system()').fetchone()[0])
-        binding['server_version']='17.11'
-        binding['restricted_roles']=[{'name':row[0],'superuser':False,'bypassrls':False,
-                                    'createdb':False,'createrole':False,'replication':False} for row in shapes]
-    return {kind:make_conninfo(host='127.0.0.1',port=55432,dbname='br02_ci',user=role,password=generated[role],
-                              connect_timeout=5,options='-c statement_timeout=15000 -c lock_timeout=3000')
-            for kind,role in [('fixture','br02_bootstrap'),('app','marker_app_login'),('worker','marker_worker_login'),('owner','br02_ci_owner')]}
+    stage='ticket_binding'
+    try:
+        ci.require_ticket(ticket,binding)  # before driver, password generation or SQL
+        import psycopg
+        from psycopg import sql
+        import secrets
+        from psycopg.conninfo import make_conninfo
+        initial='host=127.0.0.1 port=55432 dbname=br02_ci user=br02_bootstrap password=bootstrap-ci-only connect_timeout=5'
+        generated={name:secrets.token_urlsafe(32) for name in ('br02_bootstrap','marker_app_login','marker_worker_login','br02_ci_owner')}
+        with psycopg.connect(initial,autocommit=True,options='-c search_path=public -c statement_timeout=15000 -c lock_timeout=3000') as conn:
+            row=conn.execute('select current_database(), version(), inet_server_addr()::text, inet_server_port()').fetchone()
+            stage='database_name'
+            if row[0]!='br02_ci': ci.deny('target')
+            stage='database_version'
+            if not row[1].startswith('PostgreSQL 17.11 '): ci.deny('target')
+            stage='database_address'
+            if row[2]!=binding['server_address']: ci.deny('target')
+            stage='database_port'
+            if row[3]!=5432: ci.deny('target')
+            stage='database_empty'
+            if conn.execute("select count(*) from pg_catalog.pg_tables where schemaname='public'").fetchone()[0]!=0: ci.deny('target')
+            stage='migration_ticket'
+            for name in ci.MIGRATIONS:
+                ci.require_ticket(ticket,binding)
+                conn.execute((ROOT/'schema'/name).read_text(encoding='utf8'))
+            conn.execute((ROOT/'tests/br02_pg_ci_setup.sql').read_text(encoding='utf8'))
+            for role,password in generated.items():
+                conn.execute(sql.SQL('ALTER ROLE {} PASSWORD {}').format(sql.Identifier(role),sql.Literal(password)))
+            conn.execute('insert into public.schema_meta(key,value) values (%s,%s)',('br02_synthetic_run_id',binding['run_id']))
+            shapes=conn.execute("select rolname,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication from pg_roles where rolname in ('marker_app_login','marker_worker_login','br02_ci_owner')").fetchall()
+            stage='role_attributes'
+            if len(shapes)!=3 or any(any(row[1:]) for row in shapes): ci.deny('target')
+            elevated=conn.execute("select count(*) from pg_roles p where (p.rolsuper or p.rolbypassrls or p.rolcreatedb or p.rolcreaterole or p.rolreplication) and (pg_has_role('marker_app_login',p.oid,'MEMBER') or pg_has_role('marker_worker_login',p.oid,'MEMBER'))").fetchone()[0]
+            stage='role_membership'
+            if elevated: ci.deny('target')
+            binding['system_identifier']=str(conn.execute('select system_identifier from pg_control_system()').fetchone()[0])
+            binding['server_version']='17.11'
+            binding['restricted_roles']=[{'name':row[0],'superuser':False,'bypassrls':False,
+                                        'createdb':False,'createrole':False,'replication':False} for row in shapes]
+        return {kind:make_conninfo(host='127.0.0.1',port=55432,dbname='br02_ci',user=role,password=generated[role],
+                                  connect_timeout=5,options='-c statement_timeout=15000 -c lock_timeout=3000')
+                for kind,role in [('fixture','br02_bootstrap'),('app','marker_app_login'),('worker','marker_worker_login'),('owner','br02_ci_owner')]}
+    except ci.CIDenied as error:
+        if error.code=='target': ci._target_diagnostic(stage)
+        raise
 
 
 def build_suite(modules, inventory):
@@ -302,11 +318,17 @@ def main():
         if command('/usr/bin/git','rev-parse','HEAD').strip()!=identity['sha'] \
                 or command('/usr/bin/git','status','--porcelain','--untracked-files=all').strip(): ci.deny('integrity')
         container=os.environ.get('BR02_CI_CONTAINER','')
-        if len(container)!=64 or any(c not in '0123456789abcdef' for c in container): ci.deny('target')
+        if len(container)!=64 or any(c not in '0123456789abcdef' for c in container):
+            ci._target_diagnostic('container_environment'); ci.deny('target')
         infos=json.loads(command('/usr/bin/docker','inspect',container))
-        if len(infos)!=1 or infos[0]['Id']!=container: ci.deny('target')
+        if len(infos)!=1 or infos[0]['Id']!=container:
+            ci._target_diagnostic('inspect_cardinality'); ci.deny('target')
         binding=ci.validate_target(infos[0],identity)
-        dsns=bootstrap(binding,ticket); approval=ci.make_approval(binding,dsns)
+        dsns=bootstrap(binding,ticket)
+        try: approval=ci.make_approval(binding,dsns)
+        except ci.CIDenied as error:
+            if error.code=='target': ci._target_diagnostic('approval_binding')
+            raise
         import hashlib
         print(json.dumps({'identity':binding,'image':ci.IMAGE,'migrations':[
             {'name':name,'sha256':hashlib.sha256((ROOT/'schema'/name).read_bytes()).hexdigest()}

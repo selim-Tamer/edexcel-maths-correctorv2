@@ -83,6 +83,112 @@ def child_payload(binding=None,**changes):
     return key+hmac.digest(key,raw,'sha256')+raw
 
 
+class TargetDiagnosticTests(unittest.TestCase):
+    def event(self,output,stage,reason='refused'):
+        lines=[line for line in output.getvalue().splitlines() if line.startswith('BR02_CI_TARGET_DIAGNOSTIC ')]
+        self.assertEqual(len(lines),1)
+        self.assertEqual(json.loads(lines[0].split(' ',1)[1]),{'stage':stage,'reason':reason})
+        self.assertNotIn(PAYLOAD,output.getvalue())
+
+    def test_container_predicates_emit_only_fixed_stage_and_keep_refusal(self):
+        cases=[('container_shape',lambda x:None),
+               ('container_id',lambda x:dict(x,Id=PAYLOAD)),
+               ('container_image',lambda x:dict(x,Config={'Image':PAYLOAD})),
+               ('container_running',lambda x:dict(x,State={'Running':False})),
+               ('port_binding',lambda x:dict(x,NetworkSettings={'Ports':{'5432/tcp':[{'HostIp':'0.0.0.0','HostPort':'55432'}]}})),
+               ('network_count',lambda x:dict(x,NetworkSettings={'Ports':x['NetworkSettings']['Ports'],'Networks':{}})),
+               ('network_address',lambda x:dict(x,NetworkSettings={'Ports':x['NetworkSettings']['Ports'],'Networks':{'test':{'IPAddress':'8.8.8.8'}}})),
+               ('mount_count',lambda x:dict(x,Mounts=[])),
+               ('mount_type',lambda x:dict(x,Mounts=[dict(x['Mounts'][0],Type='bind')])),
+               ('mount_destination',lambda x:dict(x,Mounts=[dict(x['Mounts'][0],Destination=PAYLOAD)])),
+               ('volume_name',lambda x:dict(x,Mounts=[dict(x['Mounts'][0],Name=PAYLOAD)]))]
+        for stage,change in cases:
+            output=io.StringIO()
+            with self.subTest(stage=stage),contextlib.redirect_stderr(output):
+                with self.assertRaises(ci.CIDenied) as caught:ci.validate_target(change(TargetTests().info()),{})
+                self.assertEqual(caught.exception.code,'target')
+                self.event(output,stage)
+
+    def test_missing_fields_and_identity_shape_are_sanitized(self):
+        for info,identity,stage in (({'Id':'a'*64}, {},'container_image'),
+                                    (TargetTests().info(),{},'identity_binding')):
+            output=io.StringIO()
+            with self.subTest(stage=stage),contextlib.redirect_stderr(output):
+                with self.assertRaises(ci.CIDenied):ci.validate_target(info,identity)
+                self.event(output,stage,'malformed')
+
+    def test_valid_target_and_binding_emit_nothing(self):
+        output=io.StringIO()
+        with contextlib.redirect_stderr(output):binding=TargetTests().binding()
+        self.assertEqual(binding['database'],'br02_ci');self.assertEqual(output.getvalue(),'')
+
+    def test_failed_log_sink_and_unknown_vocabulary_never_change_denial(self):
+        with mock.patch('builtins.print',side_effect=OSError(PAYLOAD)):
+            with self.assertRaises(ci.CIDenied):ci.validate_target(None,{})
+        output=io.StringIO()
+        with contextlib.redirect_stderr(output):ci._target_diagnostic(PAYLOAD,PAYLOAD)
+        self.event(output,'unknown')
+
+    def bootstrap_probe(self,stage=None):
+        binding=TargetTests().binding();_,ticket=issue_ticket()
+        row=['br02_ci','PostgreSQL 17.11 synthetic','172.18.0.2',5432]
+        for name,index,value in [('database_name',0,PAYLOAD),('database_version',1,PAYLOAD),
+                                 ('database_address',2,'8.8.8.8'),('database_port',3,5433)]:
+            if stage==name:row[index]=value
+        conn=mock.MagicMock();conn.__enter__.return_value=conn
+        def execute(query,*args):
+            cursor=mock.Mock();text=str(query)
+            if text.startswith('select current_database'):cursor.fetchone.return_value=row
+            elif 'pg_catalog.pg_tables' in text:cursor.fetchone.return_value=(1 if stage=='database_empty' else 0,)
+            elif text.startswith('select rolname'):
+                roles=[(name,False,False,False,False,False) for name in ('marker_app_login','marker_worker_login','br02_ci_owner')]
+                if stage=='role_attributes':roles[0]=('marker_app_login',True,False,False,False,False)
+                cursor.fetchall.return_value=roles
+            elif text.startswith('select count(*) from pg_roles'):cursor.fetchone.return_value=(1 if stage=='role_membership' else 0,)
+            elif 'pg_control_system' in text:cursor.fetchone.return_value=('123456',)
+            return cursor
+        conn.execute.side_effect=execute;output=io.StringIO()
+        with mock.patch('psycopg.connect',return_value=conn) as connect, \
+                mock.patch.object(ci.os,'name','posix'),mock.patch.object(ci.os,'geteuid',create=True,return_value=0), \
+                mock.patch('secrets.token_urlsafe',return_value='inert-not-a-password'),contextlib.redirect_stderr(output):
+            if stage:
+                with self.assertRaises(ci.CIDenied) as caught:runner.bootstrap(binding,ticket)
+                self.assertEqual(caught.exception.code,'target');self.event(output,stage)
+            else:
+                dsns=runner.bootstrap(binding,ticket)
+                self.assertEqual(set(dsns),{'fixture','app','worker','owner'})
+                self.assertEqual(output.getvalue(),'')
+            connect.assert_called_once()
+        if stage in ('database_name','database_version','database_address','database_port','database_empty'):
+            self.assertLessEqual(conn.execute.call_count,2)
+        return output
+
+    def test_bootstrap_database_predicates_stop_before_migrations(self):
+        for stage in ('database_name','database_version','database_address','database_port','database_empty'):
+            with self.subTest(stage=stage):self.bootstrap_probe(stage)
+
+    def test_bootstrap_role_predicates_remain_fail_closed_and_success_silent(self):
+        for stage in ('role_attributes','role_membership'):
+            with self.subTest(stage=stage):self.bootstrap_probe(stage)
+        self.bootstrap_probe()
+
+    def test_main_early_target_and_approval_failures_are_classified(self):
+        identity={'run_id':'1234','sha':'a'*40,'attempt':'1'}
+        for stage,container,infos in [('container_environment',PAYLOAD,[]),
+                                      ('inspect_cardinality','a'*64,[]),
+                                      ('approval_binding','a'*64,[TargetTests().info()])]:
+            output=io.StringIO();env={'BR02_CI_CONTAINER':container}
+            with self.subTest(stage=stage),mock.patch.object(runner.sys,'argv',['run_br02_pg_ci.py']), \
+                    mock.patch.object(runner.sys,'platform','linux'),mock.patch.object(runner.os,'name','posix'), \
+                    mock.patch.object(runner.os,'geteuid',create=True,return_value=0),mock.patch.object(runner.os,'environ',env), \
+                    mock.patch.object(ci,'authenticate',return_value=(identity,object())), \
+                    mock.patch.object(runner,'command',side_effect=['a'*40,'',json.dumps(infos)]), \
+                    mock.patch.object(runner,'bootstrap',return_value={}), \
+                    mock.patch.object(ci,'make_approval',side_effect=ci.CIDenied('target')), \
+                    mock.patch.object(runner,'isolated_worker') as worker,contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
+                self.assertEqual(runner.main(),2);worker.assert_not_called();self.event(output,stage)
+
+
 class IdentityTests(unittest.TestCase):
     def claims(self):
         return dict(iss=ci.ISSUER,aud=ci.AUDIENCE,repository=ci.REPOSITORY,repository_id=ci.REPOSITORY_ID,
