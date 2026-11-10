@@ -129,16 +129,26 @@ class TargetDiagnosticTests(unittest.TestCase):
         with contextlib.redirect_stderr(output):ci._target_diagnostic(PAYLOAD,PAYLOAD)
         self.event(output,'unknown')
 
-    def bootstrap_probe(self,stage=None):
+    def bootstrap_probe(self,stage=None,server_address='172.18.0.2'):
         binding=TargetTests().binding();_,ticket=issue_ticket()
-        row=['br02_ci','PostgreSQL 17.11 synthetic','172.18.0.2',5432]
+        row=['br02_ci','PostgreSQL 17.11 synthetic',server_address,5432]
         for name,index,value in [('database_name',0,PAYLOAD),('database_version',1,PAYLOAD),
                                  ('database_address',2,'8.8.8.8'),('database_port',3,5433)]:
-            if stage==name:row[index]=value
+            if stage==name and (index!=2 or server_address=='172.18.0.2'):row[index]=value
         conn=mock.MagicMock();conn.__enter__.return_value=conn
         def execute(query,*args):
             cursor=mock.Mock();text=str(query)
-            if text.startswith('select current_database'):cursor.fetchone.return_value=row
+            if text.startswith('select current_database'):
+                # PostgreSQL's inet-to-text cast always includes the netmask;
+                # host(inet) returns only the address. No database is executed.
+                reported=list(row)
+                if 'inet_server_addr()::text' in text and reported[2] is not None:
+                    import ipaddress
+                    address=ipaddress.ip_address(reported[2])
+                    reported[2]=str(address)+'/'+str(address.max_prefixlen)
+                else:
+                    self.assertIn('host(inet_server_addr())',text)
+                cursor.fetchone.return_value=reported
             elif 'pg_catalog.pg_tables' in text:cursor.fetchone.return_value=(1 if stage=='database_empty' else 0,)
             elif text.startswith('select rolname'):
                 roles=[(name,False,False,False,False,False) for name in ('marker_app_login','marker_worker_login','br02_ci_owner')]
@@ -163,6 +173,31 @@ class TargetDiagnosticTests(unittest.TestCase):
             self.assertLessEqual(conn.execute.call_count,2)
         return output
 
+    def test_realistic_pg_inet_output_accepts_only_exact_bound_ipv4(self):
+        # This fails at database_address under the original ::text query.
+        self.bootstrap_probe()
+
+    def test_unrelated_null_mapped_or_malformed_server_addresses_still_refused(self):
+        for address in ('172.18.0.3','172.19.0.2','127.0.0.1','0.0.0.0','8.8.8.8',
+                        '::1','fd00::2','::ffff:172.18.0.2',None,'',PAYLOAD,
+                        '172.18.0.2/32','172.18.0.2/24','172.018.0.2','172.18.0.2 '):
+            with self.subTest(address_type=type(address).__name__):
+                self.bootstrap_probe('database_address',server_address=address)
+
+    def test_ipv6_and_ambiguous_docker_targets_remain_outside_approved_ipv4_scope(self):
+        for address in ('fd00::2','fd00:0:0:0:0:0:0:2','::ffff:172.18.0.2','::ffff:ac12:2'):
+            info=TargetTests().info()
+            info['NetworkSettings']['Networks']['inert-network']['IPAddress']=address
+            with self.subTest(family='ipv6'),contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.validate_target(info,{})
+        for kind in ('extra_network','wrong_port','wrong_interface'):
+            info=TargetTests().info()
+            if kind=='extra_network':info['NetworkSettings']['Networks']['other']={'IPAddress':'172.19.0.2'}
+            elif kind=='wrong_port':info['NetworkSettings']['Ports']['5432/tcp'][0]['HostPort']='55433'
+            else:info['NetworkSettings']['Ports']['5432/tcp'][0]['HostIp']='0.0.0.0'
+            with self.subTest(kind=kind),contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.validate_target(info,{})
+
     def test_bootstrap_database_predicates_stop_before_migrations(self):
         for stage in ('database_name','database_version','database_address','database_port','database_empty'):
             with self.subTest(stage=stage):self.bootstrap_probe(stage)
@@ -176,6 +211,7 @@ class TargetDiagnosticTests(unittest.TestCase):
         identity={'run_id':'1234','sha':'a'*40,'attempt':'1'}
         for stage,container,infos in [('container_environment',PAYLOAD,[]),
                                       ('inspect_cardinality','a'*64,[]),
+                                      ('inspect_cardinality','a'*64,[dict(TargetTests().info(),Id='b'*64)]),
                                       ('approval_binding','a'*64,[TargetTests().info()])]:
             output=io.StringIO();env={'BR02_CI_CONTAINER':container}
             with self.subTest(stage=stage),mock.patch.object(runner.sys,'argv',['run_br02_pg_ci.py']), \

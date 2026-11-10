@@ -93,7 +93,8 @@ def bootstrap(binding,ticket):
         initial='host=127.0.0.1 port=55432 dbname=br02_ci user=br02_bootstrap password=bootstrap-ci-only connect_timeout=5'
         generated={name:secrets.token_urlsafe(32) for name in ('br02_bootstrap','marker_app_login','marker_worker_login','br02_ci_owner')}
         with psycopg.connect(initial,autocommit=True,options='-c search_path=public -c statement_timeout=15000 -c lock_timeout=3000') as conn:
-            row=conn.execute('select current_database(), version(), inet_server_addr()::text, inet_server_port()').fetchone()
+            # inet::text includes /32; compare the server host to Docker's bare IP.
+            row=conn.execute('select current_database(), version(), host(inet_server_addr()), inet_server_port()').fetchone()
             stage='database_name'
             if row[0]!='br02_ci': ci.deny('target')
             stage='database_version'
