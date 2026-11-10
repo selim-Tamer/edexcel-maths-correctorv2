@@ -4,7 +4,7 @@
 # 6.21.4 fixes the 2026-10-31 advisory set CVE-2026-119203..119209.
 # Pillow 13.0.0 fixes the 12.3.0 advisory set. Kept identical to requirements.txt pins.
 pypdf==6.21.4
-pypdfium2==5.14.0
+pypdfium2==5.15.0
 Pillow==13.0.0
 reportlab==5.0.1
 # Offline deterministic maths verification for investigation/ tests and
