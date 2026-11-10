@@ -146,10 +146,36 @@ def build_suite(modules, inventory):
 
 
 class StrictResult(unittest.TestResult):
-    def __init__(self): super().__init__(); self.outcomes=[]
+    def __init__(self): super().__init__(); self.outcomes=[]; self.diagnostics=[]
+    def _diagnose(self,test,err):
+        # Fixed vocabulary only: never format the exception or its traceback.
+        allowed=(AssertionError,ValueError,TypeError,KeyError,RuntimeError,
+                 TimeoutError,ConnectionError,PermissionError,ci.CIDenied)
+        from audit_store import AuditStoreError
+        from br02_pg_target import TargetRefused
+        allowed=allowed+(AuditStoreError,TargetRefused)
+        category=next((kind.__name__ for kind in allowed if err[0] is kind),'other')
+        phase='unknown';tb=err[2]
+        while tb is not None:
+            name=tb.tb_frame.f_code.co_name
+            if name in ('setUpClass','setUp','tearDownClass','tearDown'):
+                phase={'setUpClass':'class_setup','setUp':'setup',
+                       'tearDownClass':'class_teardown','tearDown':'teardown'}[name]
+                break
+            if name==getattr(test,'_testMethodName',None):phase='execution'
+            tb=tb.tb_next
+        # IDs are emitted separately by the existing exact-inventory runner.
+        # No dynamic name, message, path, locals, SQL or cause is serialized.
+        if len(self.diagnostics)<100:
+            self.diagnostics.append({'outcome_index':len(self.outcomes)-1,
+                                     'phase':phase,'exception':category})
     def addSuccess(self,test): self.outcomes.append((test.id(),'pass'))
-    def addError(self,test,err): self.outcomes.append((test.id(),'error')); self.errors.append((test.id(),'sanitized'))
-    def addFailure(self,test,err): self.outcomes.append((test.id(),'failure')); self.failures.append((test.id(),'sanitized'))
+    def addError(self,test,err):
+        self.outcomes.append((test.id(),'error')); self.errors.append((test.id(),'sanitized'))
+        self._diagnose(test,err)
+    def addFailure(self,test,err):
+        self.outcomes.append((test.id(),'failure')); self.failures.append((test.id(),'sanitized'))
+        self._diagnose(test,err)
     def addSkip(self,test,reason): self.outcomes.append((test.id(),'unexpected_skip')); self.skipped.append((test.id(),'sanitized'))
     def addExpectedFailure(self,test,err): self.addFailure(test,err)
     def addUnexpectedSuccess(self,test): self.failures.append((test.id(),'unexpected_success'))
@@ -199,8 +225,21 @@ def run_tests(binding,dsns):
             with open(os.devnull,'w') as sink,contextlib.redirect_stdout(sink),contextlib.redirect_stderr(sink):
                 # A one-test suite guarantees class connections are closed before
                 # switching fixture roles. Assertions/method bodies are reused.
-                unittest.TestSuite([test]).run(result)
-    print(json.dumps({'tests':result.outcomes,'excluded':EXCLUDED,'passed':result.passed(expected)},separators=(',',':')))
+                # TestSuite finalizes class fixtures, but leaves its previous
+                # class on TestResult. Reusing that result skips setUpClass on
+                # the next one-case suite, retaining an expired fixture approval.
+                case_result=StrictResult()
+                unittest.TestSuite([test]).run(case_result)
+                offset=len(result.outcomes)
+                for detail in case_result.diagnostics:
+                    result.diagnostics.append(dict(detail,outcome_index=offset+detail['outcome_index']))
+                result.outcomes.extend(case_result.outcomes)
+                result.errors.extend(case_result.errors)
+                result.failures.extend(case_result.failures)
+                result.skipped.extend(case_result.skipped)
+    report={'tests':result.outcomes,'excluded':EXCLUDED,'passed':result.passed(expected)}
+    if result.diagnostics:report['failure_diagnostics']=result.diagnostics[:100]
+    print(json.dumps(report,separators=(',',':')))
     return 0 if result.passed(expected) else 1
 
 

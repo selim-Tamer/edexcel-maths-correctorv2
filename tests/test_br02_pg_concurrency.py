@@ -151,8 +151,12 @@ class ConcurrencyOverlapTests(_LiveConcurrencyBase):
         def register(index):
             store = self.new_store()
             try:
-                backend = store._conn.execute(
-                    "select pg_backend_pid()").fetchone()[0]
+                # psycopg starts a transaction even for SELECT. End this owned
+                # observation before the barrier: registration requires an idle
+                # dedicated connection and must own its complete transaction.
+                with store._conn.transaction():
+                    backend = store._conn.execute(
+                        "select pg_backend_pid()").fetchone()[0]
                 barrier.wait()
                 outcomes[index] = (backend,
                                    store.register_with_context(

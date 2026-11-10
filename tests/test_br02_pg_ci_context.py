@@ -1048,6 +1048,143 @@ class IntegrationHostnameObservationTests(unittest.TestCase):
         helper.test_valid_feature_identity_has_no_diagnostic_and_same_return()
 
 
+class IntegrationLifecycleRegressionTests(unittest.TestCase):
+    def test_all_fifty_actual_fixtures_use_current_approval(self):
+        report=self.fixture_probe(runner)
+        self.assertEqual(len(report['tests']),50)
+        self.assertTrue(report['passed'],report.get('failure_diagnostics'))
+
+    @staticmethod
+    def fixture_probe(subject):
+        # Exercise the ACTUAL class/setup/teardown paths and authorization.
+        # Only SQL transport, seed DML and method bodies are inert; this is
+        # fixture-lifecycle evidence, never live integration evidence.
+        import br02_pg_fixtures,psycopg
+        modules={name:importlib.import_module(name) for name in subject.TESTS}
+        def execute(*args,**kwargs):
+            return SimpleNamespace(fetchall=lambda:[('schema_version','1'),('result_context_version','1')],
+                                   fetchone=lambda:('1234',))
+        def connect(*args,**kwargs):
+            return SimpleNamespace(execute=execute,close=lambda:None)
+        def seed(connection,bundle,approval,**kwargs):
+            br02_pg_fixtures.require_seed_approval(approval)
+        output=io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(psycopg,'connect',side_effect=connect))
+            stack.enter_context(mock.patch.object(br02_pg_fixtures,'seed',side_effect=seed))
+            for module_name,classes in subject.TESTS.items():
+                for cls_name,names in classes.items():
+                    cls=getattr(modules[module_name],cls_name)
+                    for name in names:stack.enter_context(mock.patch.object(cls,name,lambda self:None))
+            stack.enter_context(mock.patch.dict(os.environ,{}))
+            context=stack.enter_context(issued_context())
+            stack.enter_context(contextlib.redirect_stdout(output))
+            subject.run_tests(context.binding,{'fixture':'inert-admin','app':'inert-app','worker':'inert-worker','owner':'inert-owner'})
+        return json.loads(output.getvalue())
+
+    def test_failure_diagnostics_are_fixed_bounded_and_phase_aware(self):
+        class Example(unittest.TestCase):
+            def setUp(self):raise ci.CIDenied('context')
+            def test_one(self):pass
+        result=runner.StrictResult()
+        unittest.TestSuite([Example('test_one')]).run(result)
+        self.assertEqual(result.diagnostics,[{'outcome_index':0,'phase':'setup','exception':'CIDenied'}])
+        class Unknown(Exception):pass
+        test=Example('test_one')
+        for _ in range(110):result.addError(test,(Unknown,Unknown(PAYLOAD),None))
+        self.assertEqual(len(result.diagnostics),100)
+        self.assertEqual(result.diagnostics[-1]['exception'],'other')
+        self.assertNotIn(PAYLOAD,json.dumps(result.diagnostics))
+        self.assertFalse(result.passed([test.id()]))
+
+    def test_execution_and_teardown_failures_remain_failures_without_messages(self):
+        class Example(unittest.TestCase):
+            def test_one(self):raise AssertionError(PAYLOAD)
+            def tearDown(self):raise ValueError(PAYLOAD)
+        result=runner.StrictResult()
+        unittest.TestSuite([Example('test_one')]).run(result)
+        self.assertEqual([d['phase'] for d in result.diagnostics],['execution','teardown'])
+        self.assertEqual([d['exception'] for d in result.diagnostics],['AssertionError','ValueError'])
+        self.assertFalse(result.passed([Example('test_one').id()]))
+        self.assertNotIn(PAYLOAD,repr((result.errors,result.failures,result.diagnostics)))
+
+    def test_each_case_reacquires_its_class_approval_before_seeding(self):
+        events=[]
+        class Example(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                cls.approval=ci._current.get().approval
+                events.append('class_setup')
+            @classmethod
+            def tearDownClass(cls):events.append('class_teardown')
+            def setUp(self):
+                ci.authorize(self.approval)
+                events.append('seed')
+            def test_one(self):events.append('one')
+            def test_two(self):events.append('two')
+        inventory={'inert':{'Example':['test_one','test_two']}}
+        module=SimpleNamespace(Example=Example)
+        Example.__module__='inert'
+        output=io.StringIO()
+        with issued_context() as context, \
+                mock.patch.object(runner,'TESTS',inventory), \
+                mock.patch.object(runner.importlib,'import_module',return_value=module), \
+                mock.patch.dict(sys.modules,{'inert':module}), \
+                mock.patch.dict(os.environ,{}),contextlib.redirect_stdout(output):
+            code=runner.run_tests(context.binding,{'fixture':'inert-admin','app':'inert-app','worker':'inert-worker'})
+        self.assertEqual(code,0,(events,output.getvalue()))
+        self.assertEqual(events,['class_setup','seed','one','class_teardown',
+                                 'class_setup','seed','two','class_teardown'])
+        self.assertTrue(json.loads(output.getvalue())['passed'])
+
+    def test_real_concurrency_case_owns_pid_probe_transaction(self):
+        # Real test method and real registration code, deterministic shared
+        # tuple-row transport. Models psycopg implicit BEGIN, not a database.
+        import threading
+        from tests import test_br02_pg_concurrency as live
+        from tests.test_br02_pg_registration import _RegistrationConnection
+        from psycopg.pq import TransactionStatus
+        import postgres_result_store,identity_context,br02_pg_fixtures
+        lock=threading.RLock();anchors={};contexts={};connections=[]
+        class Connection(_RegistrationConnection):
+            def __init__(self):
+                super().__init__();self.anchors=anchors;self.contexts=contexts
+                self.backend=len(connections)+1;connections.append(self)
+            def transaction(self):
+                parent=super().transaction();connection=self
+                class Transaction:
+                    def __enter__(self):
+                        lock.acquire();parent.__enter__()
+                        connection.info.transaction_status=TransactionStatus.INTRANS
+                    def __exit__(self,*exc):
+                        try:return parent.__exit__(*exc)
+                        finally:
+                            connection.info.transaction_status=TransactionStatus.IDLE
+                            lock.release()
+                return Transaction()
+            def execute(self,sql,params=None):
+                if sql.lower()=='select pg_backend_pid()':
+                    self.info.transaction_status=TransactionStatus.INTRANS
+                    return SimpleNamespace(fetchone=lambda:(self.backend,))
+                return super().execute(sql,params)
+        bundle=br02_pg_fixtures.build_bundle('offline-overlap')
+        case=live.ConcurrencyOverlapTests('test_distinct_backends_identical_register_one_creator')
+        case.bundle=bundle
+        def store():
+            return postgres_result_store.PostgresResultStore(Connection(),
+                identity=identity_context.from_verified_subject(bundle.raw_subject,bundle.tenant_id),
+                fresh_completion_denied=False)
+        def count(sql,params):
+            rows=contexts if 'result_context' in sql else anchors
+            return SimpleNamespace(fetchone=lambda:(len(rows),))
+        case.conn=SimpleNamespace(execute=count)
+        with mock.patch.object(case,'new_store',side_effect=store), \
+                mock.patch('runtime_config.is_production_runtime',return_value=False):
+            case.test_distinct_backends_identical_register_one_creator()
+        self.assertEqual(len(anchors),1);self.assertEqual(len(contexts),1)
+        self.assertTrue(all(c.info.transaction_status==TransactionStatus.IDLE for c in connections))
+
+
 def setUpModule():
     global ci,runner,target
     ci=importlib.import_module('tests.br02_pg_ci_context')
