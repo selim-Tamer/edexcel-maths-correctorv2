@@ -579,6 +579,8 @@ class RequestUrlPredicateTests(unittest.TestCase):
     def test_accepted_urls_preserve_existing_origin_path_and_query_behavior(self):
         for authority in ('vstoken.actions.githubusercontent.com',
                           'VSTOKEN.ACTIONS.GITHUBUSERCONTENT.COM:443',
+                          'run-actions-1-azure-eastus.actions.githubusercontent.com',
+                          'RUN-ACTIONS-1-AZURE-EASTUS.ACTIONS.GITHUBUSERCONTENT.COM:443',
                           'run-actions-2-azure-eastus.actions.githubusercontent.com',
                           'RUN-ACTIONS-2-AZURE-EASTUS.ACTIONS.GITHUBUSERCONTENT.COM:443',
                           '@vstoken.actions.githubusercontent.com'):
@@ -599,7 +601,8 @@ class RequestUrlPredicateTests(unittest.TestCase):
 
     def test_exact_host_policy_rejects_lookalikes_and_subdomain_confusion(self):
         host='run-actions-2-azure-eastus.actions.githubusercontent.com'
-        self.assertEqual(ci.REQUEST_HOSTS,frozenset((host,'vstoken.actions.githubusercontent.com')))
+        self.assertEqual(ci.REQUEST_HOSTS,frozenset((host,'vstoken.actions.githubusercontent.com',
+            'run-actions-1-azure-eastus.actions.githubusercontent.com')))
         for authority in (host+'.attacker.invalid','attacker.'+host,
                           host.replace('eastus','westus'),host.replace('run-actions-2','run-actions-3'),
                           host.replace('githubusercontent','githubusercontenT-attacker'),
@@ -618,6 +621,39 @@ class RequestUrlPredicateTests(unittest.TestCase):
                           ('https://'+host+':invalid/','port_parsed'),
                           ('https://['+host,'url_parsed')):
             with self.subTest(field=field):self.assertFalse(self.refused(url)[field])
+
+    def test_run_actions_1_refuses_lookalikes_and_other_url_failures(self):
+        host='run-actions-1-azure-eastus.actions.githubusercontent.com'
+        for authority in (host+'.attacker.invalid','attacker.'+host,
+                          host.replace('eastus','westus'),host.replace('run-actions-1','run-actions-3'),
+                          host.replace('githubusercontent','githubusercontent-attacker'),
+                          host+'.',host+'%2eattacker.invalid','arbitrary.invalid'):
+            with self.subTest(authority=authority):
+                self.assertFalse(self.refused('https://'+authority+'/')['hostname_allowed'])
+        for url,field in (('http://'+host+'/','scheme_allowed'),
+                          ('https://'+PAYLOAD+'@'+host+'/','username_allowed'),
+                          ('https://:'+PAYLOAD+'@'+host+'/','password_allowed'),
+                          ('https://'+host+':8443/','port_allowed'),
+                          ('https://'+host+':bad/','port_parsed'),
+                          ('https://['+host,'url_parsed')):
+            with self.subTest(field=field):self.assertFalse(self.refused(url)[field])
+        for name,field in (('parse_qsl','query_parsed'),('urlencode','audience_query_built'),('urlunsplit','url_built')):
+            with self.subTest(operation=name),mock.patch.object(ci,name,side_effect=ValueError(PAYLOAD)):
+                flags=self.refused('https://'+host+'/?opaque='+PAYLOAD)
+                self.assertTrue(flags['hostname_allowed']);self.assertFalse(flags[field])
+
+    def test_run_actions_1_does_not_bypass_signed_identity_or_claim_binding(self):
+        import jwt
+        helper=IdentityDiagnosticProposalTests();env=helper.env()
+        env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://run-actions-1-azure-eastus.actions.githubusercontent.com/inert'
+        for kind,label in ((jwt.InvalidSignatureError,'signature'),(jwt.InvalidIssuerError,'issuer'),
+                           (jwt.InvalidAudienceError,'audience')):
+            with self.subTest(reason=label):
+                self.assertEqual(helper.failure('jwt_verification',env=env,error=kind(PAYLOAD))['reason'],label)
+        for field in ('iss','aud','repository','repository_id','repository_owner_id','actor_id','event_name',
+                      'ref','workflow_ref','workflow_sha','sha','run_id','run_attempt','runner_environment','repository_visibility'):
+            claims=IdentityTests().claims();claims[field]=PAYLOAD
+            with self.subTest(claim=field):helper.failure('claim_binding',env=env,claims=claims)
 
     def test_verified_host_preserves_query_construction_failure_refusals(self):
         for name,field in (('parse_qsl','query_parsed'),('urlencode','audience_query_built'),('urlunsplit','url_built')):

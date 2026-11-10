@@ -24,6 +24,7 @@ WORKFLOW = REPOSITORY + '/.github/workflows/br02-postgres-integration.yml@' + RE
 ISSUER = 'https://token.actions.githubusercontent.com'
 AUDIENCE = 'omnigrade-br02-isolated-ci'
 REQUEST_HOSTS = frozenset(('vstoken.actions.githubusercontent.com',
+    'run-actions-1-azure-eastus.actions.githubusercontent.com',
     'run-actions-2-azure-eastus.actions.githubusercontent.com'))
 IMAGE = 'postgres:17.11-alpine@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac'
 ROOT = Path(__file__).resolve().parents[1]
