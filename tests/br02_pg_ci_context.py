@@ -100,6 +100,44 @@ def _request_url_checks(value):
     return checks
 
 
+def _request_hostname_observation(value):
+    """Failure-only DNS observation, never endpoint authorization or I/O."""
+    result=dict.fromkeys(('value_is_string','value_nonempty','input_length_valid',
+        'input_clean','url_parsed','scheme_https','authority_dns_form',
+        'userinfo_absent','port_valid','fragment_absent','hostname_present',
+        'hostname_length_valid','hostname_syntax_valid','hostname_emitted'),False)
+    if type(value) is not str: return result
+    result['value_is_string']=True
+    result['value_nonempty']=bool(value)
+    result['input_length_valid']=0<len(value)<=8192
+    if not result['input_length_valid']: return result
+    result['input_clean']=not any(ord(c)<=32 or ord(c)==127 or c=='\\' for c in value)
+    if not result['input_clean']: return result
+    try:
+        address=urlsplit(value)
+        result['url_parsed']=True
+        result['scheme_https']=address.scheme=='https'
+        result['authority_dns_form']=address.netloc.isascii() and not any(c in address.netloc for c in '[]%')
+        result['userinfo_absent']=address.username is None and address.password is None
+        result['fragment_absent']=not bool(address.fragment)
+        hostname=address.hostname
+        result['hostname_present']=bool(hostname)
+        try: result['port_valid']=address.port in (None,443)
+        except ValueError: pass
+        if not hostname: return result
+        hostname=hostname.lower()
+        result['hostname_length_valid']=0<len(hostname)<=253
+        labels=hostname.split('.')
+        result['hostname_syntax_valid']=(hostname.isascii() and len(labels)>=2
+            and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) is not None for label in labels)
+            and re.search(r'[a-z]',labels[-1]) is not None)
+        if all(flag for key,flag in result.items() if key!='hostname_emitted'):
+            result['hostname']=hostname
+            result['hostname_emitted']=True
+    except Exception: pass
+    return result
+
+
 def _identity_diagnostic(stage, error=None, claims=None, expected=None, request_url=None):
     # Fixed vocabulary only: never stringify exceptions, tokens or claims.
     allowed={'environment','request_url','request_environment','token_acquisition',
@@ -124,7 +162,9 @@ def _identity_diagnostic(stage, error=None, claims=None, expected=None, request_
     # This mirrors policy for diagnostics only and cannot affect issuance.
     try:
         event={'stage':stage,'reason':reason}
-        if stage=='request_url': event['url_checks']=_request_url_checks(request_url)
+        if stage=='request_url':
+            event['url_checks']=_request_url_checks(request_url)
+            event['hostname_observation']=_request_hostname_observation(request_url)
         if stage=='claim_binding' and type(claims) is dict and type(expected) is dict:
             fixed={'iss':ISSUER,'aud':AUDIENCE,'repository':REPOSITORY,'repository_id':REPOSITORY_ID,
                    'repository_owner_id':OWNER_ID,'actor_id':OWNER_ID,'event_name':'workflow_dispatch',

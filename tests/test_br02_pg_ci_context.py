@@ -495,7 +495,7 @@ class IdentityDiagnosticProposalTests(unittest.TestCase):
         event=json.loads(output.getvalue().split('BR02_CI_IDENTITY_DIAGNOSTIC ',1)[1])
         self.assertEqual(event['stage'],stage)
         self.assertEqual(set(event),{'stage','reason','checks'} if stage=='claim_binding' else
-                         {'stage','reason','url_checks'} if stage=='request_url' else {'stage','reason'})
+                         {'stage','reason','url_checks','hostname_observation'} if stage=='request_url' else {'stage','reason'})
         self.assertNotIn(PAYLOAD,output.getvalue()+str(caught.exception))
         self.assertNotIn('synthetic.jwt.token',output.getvalue())
         self.assertFalse(ci.active())
@@ -568,7 +568,7 @@ class RequestUrlPredicateTests(unittest.TestCase):
         self.assertEqual(str(caught.exception),'BR02_CI_IDENTITY')
         opener.assert_not_called();verify.assert_not_called()
         event=json.loads(output.getvalue().split('BR02_CI_IDENTITY_DIAGNOSTIC ',1)[1])
-        self.assertEqual(set(event),{'stage','reason','url_checks'})
+        self.assertEqual(set(event),{'stage','reason','url_checks','hostname_observation'})
         self.assertEqual(event['stage'],'request_url')
         self.assertEqual(set(event['url_checks']),self.fields)
         self.assertTrue(all(type(v) is bool for v in event['url_checks'].values()))
@@ -682,6 +682,71 @@ class RequestUrlPredicateTests(unittest.TestCase):
                 with self.assertRaises(ci.CIDenied) as caught:ci.authenticate(env)
                 self.assertEqual(str(caught.exception),'BR02_CI_IDENTITY')
                 self.assertFalse(ci.active())
+
+
+class IntegrationHostnameObservationTests(unittest.TestCase):
+    def observe(self,value):
+        result=ci._request_hostname_observation(value)
+        self.assertTrue(all(type(v) is bool for k,v in result.items() if k!='hostname'))
+        return result
+
+    def test_valid_hostname_is_normalized_without_path_query_or_token(self):
+        host='run-actions-9-azure-westus.actions.githubusercontent.com'
+        result=self.observe('https://'+host.upper()+':443/private/'+PAYLOAD+'?opaque='+PAYLOAD)
+        self.assertEqual(result['hostname'],host)
+        self.assertTrue(result['hostname_emitted'])
+        self.assertNotIn(PAYLOAD,json.dumps(result))
+        self.assertNotIn('https:',json.dumps(result))
+        self.assertNotIn('private',json.dumps(result))
+
+    def test_missing_empty_and_hostless_values_are_distinct(self):
+        missing=self.observe(None);empty=self.observe('');hostless=self.observe('https:///private?opaque='+PAYLOAD)
+        self.assertFalse(missing['value_is_string'])
+        self.assertTrue(empty['value_is_string']);self.assertFalse(empty['value_nonempty'])
+        self.assertTrue(hostless['url_parsed']);self.assertFalse(hostless['hostname_present'])
+        for result in (missing,empty,hostless):self.assertNotIn('hostname',result)
+
+    def test_suspicious_and_malformed_values_never_emit_hostname(self):
+        for value in (123,'https://[broken','https://trusted.invalid:bad/',
+                      'http://trusted.invalid/','https://user:secret@trusted.invalid/',
+                      'https://@trusted.invalid/','https://trusted.invalid:8443/',
+                      'https://trusted.invalid/#fragment','https://trusted.invalid/\nsecret',
+                      'https://trusted.invalid/\\secret','https://'+'a'*64+'.invalid/',
+                      'https://'+'a.'*130+'invalid/','https://127.0.0.1/',
+                      'https://[::1]/','https://[v1.foo]/','https://trusted%2einvalid/',
+                      'https://-bad.invalid/','https://bad..invalid/','https://trusted.invalid./',
+                      'https://\u212a.invalid/','https://trusted.invalid/'+'x'*8192):
+            with self.subTest(value_type=type(value).__name__):
+                result=self.observe(value)
+                self.assertFalse(result['hostname_emitted']);self.assertNotIn('hostname',result)
+
+    def test_observation_never_authorizes_lookalike_or_unknown_host(self):
+        helper=IdentityDiagnosticProposalTests()
+        for host in ('run-actions-9-azure-westus.actions.githubusercontent.com',
+                     'vstoken.actions.githubusercontent.com.attacker.invalid',
+                     'attacker.run-actions-2-azure-eastus.actions.githubusercontent.com'):
+            env=helper.env();env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://'+host+'/private?opaque='+PAYLOAD
+            with mock.patch.object(ci.urllib.request,'build_opener') as opener:
+                event=helper.failure('request_url',env=env)
+            opener.assert_not_called()
+            self.assertEqual(event['hostname_observation']['hostname'],host)
+            self.assertFalse(event['url_checks']['hostname_allowed'])
+
+    def test_observation_failure_does_not_change_denial(self):
+        env=IdentityDiagnosticProposalTests().env();env['ACTIONS_ID_TOKEN_REQUEST_URL']='https://attacker.invalid/'
+        for name in ('_request_hostname_observation','_request_url_checks'):
+            with mock.patch.object(ci,name,side_effect=ValueError(PAYLOAD)), \
+                    mock.patch.object(ci.urllib.request,'build_opener') as opener,contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ci.CIDenied):ci.authenticate(env)
+            opener.assert_not_called();self.assertFalse(ci.active())
+
+    def test_only_request_url_failures_include_hostname_observation(self):
+        helper=IdentityDiagnosticProposalTests()
+        event=helper.failure('request_url',env={'GITHUB_ACTIONS':'true','GITHUB_SHA':'a'*40,'BR02_CI_APPROVED_SHA':'a'*40})
+        self.assertFalse(event['hostname_observation']['value_is_string'])
+        self.assertEqual(event['reason'],'missing_field')
+        self.assertNotIn('hostname_observation',helper.failure('token_acquisition'))
+        helper.test_valid_feature_identity_has_no_diagnostic_and_same_return()
 
 
 def setUpModule():
