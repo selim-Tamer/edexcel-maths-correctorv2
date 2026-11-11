@@ -47,6 +47,14 @@ from typing import Any, Optional
 import audit_store
 import br02_pg_target as target
 
+# Preserve one approval type for the parent runner's historical spelling and
+# the fresh child's package import, without expanding the child's search path.
+import sys as _ci_sys
+_ci_sys.modules.setdefault('br02_pg_fixtures', _ci_sys.modules[__name__])
+_ci_sys.modules.setdefault('tests.br02_pg_fixtures', _ci_sys.modules[__name__])
+if 'tests' in _ci_sys.modules:
+    setattr(_ci_sys.modules['tests'], 'br02_pg_fixtures', _ci_sys.modules[__name__])
+
 
 # Transaction status of a psycopg connection that no other party is using.
 _IDLE_TRANSACTION_STATUS = 0

@@ -372,7 +372,7 @@ def _check_approval(approval,binding):
 
 def make_approval(binding, dsns):
     import br02_pg_target as target
-    import br02_pg_fixtures as fixtures
+    from tests import br02_pg_fixtures as fixtures
     record,_=target.synthetic_approved_manifest()
     record.update(instance=binding['instance'],storage=binding['storage'],loopback_endpoint=binding['endpoint'],
         database=binding['database'],run_id=binding['run_id'],role_inventory=['marker_app_login','marker_worker_login'],

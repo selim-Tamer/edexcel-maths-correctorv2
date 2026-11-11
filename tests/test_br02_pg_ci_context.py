@@ -1513,6 +1513,83 @@ class ChildModuleEntrypointRegressionTests(unittest.TestCase):
         self.assertEqual(process.wait.call_count,2)
 
 
+class ChildAuthorizationImportRegressionTests(unittest.TestCase):
+    """Use child-equivalent root-only discovery, not the runner's tests path."""
+
+    @contextlib.contextmanager
+    def fresh_fixture_imports(self):
+        package=importlib.import_module('tests')
+        names=('br02_pg_fixtures','tests.br02_pg_fixtures')
+        previous_path=list(sys.path)
+        previous_attr=getattr(package,'br02_pg_fixtures',None)
+        previous_context=ci._current.get()
+        try:
+            with mock.patch.dict(sys.modules):
+                for name in names:sys.modules.pop(name,None)
+                if hasattr(package,'br02_pg_fixtures'):delattr(package,'br02_pg_fixtures')
+                sys.path[:]=[str(ROOT)]+[p for p in sys.path if Path(p or '.').resolve()!=ROOT/'tests']
+                yield
+        finally:
+            sys.path[:]=previous_path
+            ci._current.set(previous_context)
+            if previous_attr is None:
+                if hasattr(package,'br02_pg_fixtures'):delattr(package,'br02_pg_fixtures')
+            else:setattr(package,'br02_pg_fixtures',previous_attr)
+
+    def test_fresh_root_only_child_adopts_and_passes_target_gate(self):
+        with self.fresh_fixture_imports():
+            with child_native(child_payload()) as closed:ci.adopt_child(child_env())
+            closed.assert_called_once_with(17)
+            target.authorize_execution(None)
+            context=ci._current.get()
+            self.assertTrue(context.child)
+            self.assertEqual(context.approval.app_dsn,'inert-app')
+            self.assertEqual(context.approval.worker_dsn,'')
+            self.assertEqual(context.approval.target_dsn,'bootstrap-not-forwarded')
+            with self.assertRaises(ci.CIDenied):ci.child_transport(context.approval)
+            with self.assertRaises(ci.CIDenied):
+                with ci.fixture_context(context.approval):pass
+
+    def test_fresh_root_only_module_reaches_next_startup_stage(self):
+        case=ChildModuleEntrypointRegressionTests()
+        with self.fresh_fixture_imports():
+            code,build,server,sentinel=case.execute_module(authorized=True)
+            self.assertEqual(code,0)
+            build.assert_called_once()
+            server.run.assert_called_once_with(sentinel,host='127.0.0.1',port=8123,
+                                              log_level='warning',access_log=False)
+
+    def test_fixture_import_spellings_share_approval_type_in_both_orders(self):
+        for first in ('br02_pg_fixtures','tests.br02_pg_fixtures'):
+            with self.subTest(first=first),self.fresh_fixture_imports():
+                if first=='br02_pg_fixtures':sys.path.insert(0,str(ROOT/'tests'))
+                original=importlib.import_module(first)
+                package=importlib.import_module('tests.br02_pg_fixtures')
+                legacy=importlib.import_module('br02_pg_fixtures')
+                self.assertIs(original,package);self.assertIs(package,legacy)
+                approval=ci.make_approval(TargetTests().binding(),
+                    {'fixture':'inert-admin','app':'inert-app','worker':'inert-worker'})
+                self.assertIs(type(approval),legacy.SeedApproval)
+                with mock.patch.object(target,'authorize_execution') as gate:
+                    self.assertIs(legacy.require_seed_approval(approval),approval)
+                    gate.assert_called_once_with(approval)
+
+    def test_root_only_negative_capabilities_still_fail_closed(self):
+        cases=[({},child_payload(),{}),
+               (child_env(),b'X'*100,{}),
+               (child_env(BR02_CI_SHA='b'*40),child_payload(),{}),
+               (child_env(),child_payload(expires=time.monotonic()-1),{}),
+               (child_env(),child_payload(),{'uid':60001}),
+               (child_env(),child_payload(),{'access':os.O_RDWR})]
+        wrong=TargetTests().binding();wrong['scope']='stage2'
+        cases.append((child_env(),child_payload(wrong),{}))
+        for env,payload,attrs in cases:
+            with self.subTest(attrs=attrs),self.fresh_fixture_imports():
+                with child_native(payload,**attrs),self.assertRaises(ci.CIDenied):ci.adopt_child(env)
+                self.assertFalse(ci.active())
+                with self.assertRaises(target.TargetRefused):target.authorize_execution(None)
+
+
 def setUpModule():
     global ci,runner,target
     ci=importlib.import_module('tests.br02_pg_ci_context')
