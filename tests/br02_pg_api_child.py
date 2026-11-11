@@ -465,3 +465,7 @@ def launch_child(child_environ: dict, argv, timeout_seconds: float, *,
         target.EXECUTION_NOT_AUTHORIZED,
         "generic external argv execution is refused; use run_child_server "
         "(owned, internally constructed argv, bounded lifecycle)")
+
+
+if __name__ == "__main__":
+    raise SystemExit(child_main())

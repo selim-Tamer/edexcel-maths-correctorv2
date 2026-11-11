@@ -1380,6 +1380,139 @@ class RemainingIntegrationRegressionTests(unittest.TestCase):
         self.assertEqual(sum('aclexplode' in sql for sql in seen),4)
 
 
+class ChildModuleEntrypointRegressionTests(unittest.TestCase):
+    """Execute the actual module entrypoint; mock only OS/DB/server edges."""
+
+    def execute_module(self, *, authorized=False, application_error=False,
+                       invalid_capability=False, port='8123'):
+        import runpy
+        from tests import br02_pg_api_child as child
+        from api.app import create_app  # import before mocking socket/native OS metadata
+        # A stand-in socket type prevents mutation of the strict harness's
+        # network blocks. No socket or HTTP listener is created here.
+        class Socket:
+            def connect(self,*args):raise AssertionError('network forbidden')
+            def connect_ex(self,*args):raise AssertionError('network forbidden')
+            def sendto(self,*args):raise AssertionError('network forbidden')
+        socket_module=SimpleNamespace(socket=Socket)
+        server=SimpleNamespace(run=mock.Mock())
+        sentinel=object();output=io.StringIO();previous=ci._current.get()
+        env={'AI_MARKER_RUNTIME':'production','AI_MARKER_PG_DSN':'inert-app'}
+        if authorized or invalid_capability:env.update(child_env())
+        original_adopt=ci.adopt_child
+        def adopt(environ):
+            with child_native(b'bad' if invalid_capability else child_payload()):
+                return original_adopt(environ)
+        try:
+            with contextlib.ExitStack() as stack:
+                if authorized or invalid_capability:
+                    stack.enter_context(mock.patch.object(ci,'adopt_child',side_effect=adopt))
+                stack.enter_context(mock.patch.dict(os.environ,env,clear=True))
+                stack.enter_context(mock.patch.object(sys,'argv',[
+                    str(ROOT/'tests/br02_pg_api_child.py'),'--serve','--port',port]))
+                stack.enter_context(mock.patch.dict(sys.modules,{'socket':socket_module,'uvicorn':server}))
+                build=stack.enter_context(mock.patch('api.app.create_app',
+                    side_effect=ValueError(PAYLOAD) if application_error else None,
+                    return_value=sentinel))
+                stack.enter_context(contextlib.redirect_stderr(output))
+                stack.enter_context(contextlib.redirect_stdout(output))
+                with self.assertRaises(SystemExit) as caught:
+                    runpy.run_path(str(ROOT/'tests/br02_pg_api_child.py'),run_name='__main__')
+                code=caught.exception.code
+                self.assertNotIn(PAYLOAD,output.getvalue())
+                if authorized and not invalid_capability and port=='8123':
+                    self.assertTrue(ci.active())
+                    self.assertTrue(ci._current.get().child)
+                    self.assertEqual(ci._current.get().approval.target_dsn,'bootstrap-not-forwarded')
+                    with self.assertRaises(ci.CIDenied):ci.child_transport(ci._current.get().approval)
+                return code,build,server,sentinel
+        finally:ci._current.set(previous)
+
+    def test_module_invocation_refuses_without_child_capability(self):
+        code,build,server,_=self.execute_module()
+        self.assertEqual(code,3);build.assert_not_called();server.run.assert_not_called()
+
+    def test_module_invocation_adopts_restricted_child_and_serves(self):
+        code,build,server,sentinel=self.execute_module(authorized=True)
+        self.assertEqual(code,0)
+        self.assertEqual(build.call_args.kwargs['allowed_origins'],['https://127.0.0.1:8123'])
+        self.assertIsNone(build.call_args.kwargs['engine'])
+        server.run.assert_called_once_with(sentinel,host='127.0.0.1',port=8123,
+                                          log_level='warning',access_log=False)
+
+    def test_module_invocation_preserves_application_failure_exit(self):
+        code,build,server,_=self.execute_module(authorized=True,application_error=True)
+        self.assertEqual(code,71);build.assert_called_once();server.run.assert_not_called()
+
+    def test_invalid_capability_and_arguments_do_not_start_server(self):
+        code,build,server,_=self.execute_module(invalid_capability=True)
+        self.assertEqual(code,3);build.assert_not_called();server.run.assert_not_called()
+        code,build,server,_=self.execute_module(authorized=True,port='0')
+        self.assertEqual(code,2);build.assert_not_called();server.run.assert_not_called()
+
+    def test_importing_child_module_does_not_execute_entrypoint(self):
+        import runpy
+        from tests import br02_pg_api_child as child
+        with mock.patch.object(child.target,'authorize_execution',side_effect=AssertionError('unexpected authorization')):
+            module=runpy.run_path(str(ROOT/'tests/br02_pg_api_child.py'),run_name='offline_child_import')
+        self.assertTrue(callable(module['child_main']))
+
+    def test_parent_requires_http_readiness_and_cleans_up_on_timeout(self):
+        from tests import br02_pg_api_child as child
+        import socket,subprocess
+        for status in (200,503):
+            process=mock.Mock(returncode=None);process.poll.return_value=None
+            clock=mock.Mock(return_value=time.monotonic())
+            def elapsed(_seconds):clock.return_value+=16
+            def waited(**kwargs):
+                process.returncode=0;process.poll.return_value=0;return 0
+            process.wait.side_effect=waited
+            probe=mock.Mock();probe.getsockname.return_value=('127.0.0.1',8123)
+            stream=mock.Mock();stream.fileno.return_value=17
+            with issued_context() as context, \
+                    mock.patch.object(socket,'socket',return_value=probe), \
+                    mock.patch.object(ci,'child_transport',return_value=(stream,{'BR02_CI_FD':'17'})), \
+                    mock.patch.object(subprocess,'Popen',return_value=process), \
+                    mock.patch.object(child._ChildHandle,'request',return_value=(status,{},b'{"status":"ok"}')), \
+                    mock.patch.object(time,'monotonic',clock), \
+                    mock.patch.object(time,'sleep',side_effect=elapsed):
+                if status==200:
+                    handle=child.run_child_server(context.approval)
+                    process.terminate.assert_not_called()
+                    handle.stop()
+                else:
+                    with self.assertRaises(TimeoutError):child.run_child_server(context.approval)
+                process.terminate.assert_called_once();process.wait.assert_called_once_with(timeout=5)
+                stream.close.assert_called_once();probe.close.assert_called_once()
+
+    def test_parent_zero_unknown_and_signal_exit_still_fail_before_readiness(self):
+        from tests import br02_pg_api_child as child
+        import socket,subprocess
+        for code in (0,1,2,255,-15,3,71):
+            process=mock.Mock(returncode=code);process.poll.return_value=code
+            probe=mock.Mock();probe.getsockname.return_value=('127.0.0.1',8123)
+            stream=mock.Mock();stream.fileno.return_value=17
+            with issued_context() as context, \
+                    mock.patch.object(socket,'socket',return_value=probe), \
+                    mock.patch.object(ci,'child_transport',return_value=(stream,{'BR02_CI_FD':'17'})), \
+                    mock.patch.object(subprocess,'Popen',return_value=process), \
+                    mock.patch.object(child._ChildHandle,'request') as request:
+                with self.assertRaises(RuntimeError) as caught:child.run_child_server(context.approval)
+                self.assertEqual(caught.exception.br02_child_stage,child.CHILD_FAILURE_STAGES.get(code,'child_ready'))
+                self.assertEqual(process.returncode,code)
+                request.assert_not_called();stream.close.assert_called_once()
+
+    def test_owned_shutdown_kills_and_waits_after_terminate_timeout(self):
+        from tests import br02_pg_api_child as child
+        import subprocess
+        process=mock.Mock(returncode=-9);process.poll.return_value=None
+        process.wait.side_effect=[subprocess.TimeoutExpired('synthetic-child',5),-9]
+        handle=child._ChildHandle(process,8123,1)
+        self.assertEqual(handle.stop(),-9)
+        process.terminate.assert_called_once();process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count,2)
+
+
 def setUpModule():
     global ci,runner,target
     ci=importlib.import_module('tests.br02_pg_ci_context')
